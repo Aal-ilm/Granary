@@ -37,7 +37,10 @@ echo "GRANARY_ADMIN_TOKEN=$(openssl rand -hex 24)" > .env   # protects admin act
 docker compose up -d --build
 ```
 
-Then open `http://localhost:8080/`. The Repositories page has ready-to-paste
+If port 8080 is already in use on the host, add `GRANARY_PORT=8081` (or any
+free port) to `.env` and run the command again.
+
+Then open `http://localhost:8080/` (or the port you chose). The Repositories page has ready-to-paste
 client configuration using the address you reached it on.
 
 Without compose:
