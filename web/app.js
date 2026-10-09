@@ -19,7 +19,7 @@ const REPO_IDS = Object.keys(REPOS);
 const chip = (repo) => `<span class="fmt ${esc(repo)}">${esc(REPOS[repo]?.label ?? repo)}</span>`;
 
 function bytes(n) {
-  if (n == null) return '–';
+  if (n == null) return '-';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   let v = n;
   let i = 0;
@@ -374,10 +374,10 @@ async function renderOverview({ isCurrent }) {
         <div class="upstreams">${upstreams}</div>
       </div>
       <dl class="panel facts">
-        <div class="fact"><dt>Served from cache</dt><dd class="num">${hitRate == null ? '–' : hitRate + '%'}<small>${esc(count(hits))} of ${esc(count(served))} file requests since start</small></dd></div>
+        <div class="fact"><dt>Served from cache</dt><dd class="num">${hitRate == null ? '-' : hitRate + '%'}<small>${esc(count(hits))} of ${esc(count(served))} file requests since start</small></dd></div>
         <div class="fact"><dt>Fetched from upstream</dt><dd class="num">${esc(count(d.stats.file_downloads))}<small>new files since start</small></dd></div>
         <div class="fact"><dt>Metadata refreshes</dt><dd class="num">${esc(count(d.stats.meta_refreshes))}<small>${d.stats.meta_stale_served ? esc(count(d.stats.meta_stale_served)) + ' served stale while upstream was down' : 'none served stale'}</small></dd></div>
-        <div class="fact"><dt>Disk</dt><dd class="num">${disk ? esc(bytes(disk.free)) + ' free' : '–'}<small>${disk ? 'of ' + esc(bytes(disk.total)) : 'unknown'}</small>
+        <div class="fact"><dt>Disk</dt><dd class="num">${disk ? esc(bytes(disk.free)) + ' free' : '-'}<small>${disk ? 'of ' + esc(bytes(disk.total)) : 'unknown'}</small>
           ${disk ? `<div class="meter ${usedPct > 95 ? 'full' : usedPct > 85 ? 'high' : ''}" role="img" aria-label="${Math.round(usedPct)}% of disk used"><span data-pct="${usedPct.toFixed(1)}"></span></div>` : ''}</dd></div>
         <div class="fact"><dt>Running for</dt><dd>${esc(duration(d.uptime_secs))}<small>version ${esc(d.version)}</small></dd></div>
       </dl>
@@ -514,7 +514,7 @@ async function renderBrowse({ params, query, isCurrent }) {
   const to = d.offset + d.items.length;
   const pages = Math.max(1, Math.ceil(d.total / PAGE_SIZE));
   const pager = d.total > PAGE_SIZE
-    ? `<div class="pager"><span>${esc(count(from))}–${esc(count(to))} of ${esc(count(d.total))}</span>
+    ? `<div class="pager"><span>${esc(count(from))} to ${esc(count(to))} of ${esc(count(d.total))}</span>
         <span class="page-actions">
           <button class="small" data-page="${page - 1}" ${page <= 1 ? 'disabled' : ''}>Previous</button>
           <button class="small" data-page="${page + 1}" ${page >= pages ? 'disabled' : ''}>Next</button>
@@ -832,7 +832,7 @@ async function renderTasks({ isCurrent }) {
           <td class="nowrap">${schedule}</td>
           <td>${timeTag(t.last_run)}${t.last_duration_ms != null ? `<div class="muted num nowrap">took ${t.last_duration_ms < 1000 ? t.last_duration_ms + ' ms' : (t.last_duration_ms / 1000).toFixed(1) + ' s'}</div>` : ''}</td>
           <td>${result}</td>
-          <td>${t.next_run ? timeTag(t.next_run) : '<span class="muted">–</span>'}</td>
+          <td>${t.next_run ? timeTag(t.next_run) : '<span class="muted">-</span>'}</td>
           <td class="actions"><button class="small" data-run-task="${t.id}" data-name="${esc(t.name)}" ${t.running ? 'disabled' : ''}>Run now</button></td>
         </tr>`;
       })
