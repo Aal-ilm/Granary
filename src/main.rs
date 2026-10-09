@@ -1,8 +1,11 @@
 //! Granary: a small, self-hostable caching proxy for package registries.
 
+mod admin;
 mod config;
 mod error;
 mod formats;
+mod inventory;
+mod logbuf;
 mod store;
 mod ui;
 mod util;
@@ -10,20 +13,25 @@ mod util;
 use std::sync::Arc;
 
 use axum::{Router, routing::get};
-use tracing_subscriber::EnvFilter;
+use tracing::Level;
+use tracing_subscriber::{
+    EnvFilter, Layer, filter::Targets, layer::SubscriberExt, util::SubscriberInitExt,
+};
 
-use crate::{config::Config, store::Store};
+use crate::{admin::Admin, config::Config, logbuf::LogBuffer, store::Store};
 
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Arc<Config>,
     pub store: Arc<Store>,
+    pub admin: Arc<Admin>,
 }
 
 pub fn app(state: AppState) -> Router {
     Router::new()
-        .route("/", get(ui::index))
         .route("/healthz", get(|| async { "ok\n" }))
+        .merge(ui::router())
+        .merge(admin::api::router())
         .merge(formats::cargo::router())
         .merge(formats::npm::router())
         .merge(formats::pypi::router())
@@ -57,14 +65,22 @@ fn main() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn run() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("granary=info")),
+    // Logs go to stdout (filtered by RUST_LOG) and, at info level and above,
+    // into an in-memory buffer shown on the web UI's Logs page.
+    let logs = LogBuffer::default();
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("granary=info"));
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(env_filter))
+        .with(
+            logs.clone()
+                .with_filter(Targets::new().with_target("granary", Level::INFO)),
         )
         .init();
 
     let cfg = Config::from_env()?;
     let store = Store::new(cfg.data_dir.clone(), cfg.meta_ttl).await?;
+    let admin = Admin::new(&cfg.data_dir, logs).await?;
     tracing::info!(
         data_dir = %store.root().display(),
         meta_ttl_secs = cfg.meta_ttl.as_secs(),
@@ -74,13 +90,24 @@ async fn run() -> anyhow::Result<()> {
     );
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
+    if cfg.admin_token.is_none() {
+        tracing::warn!(
+            "GRANARY_ADMIN_TOKEN is not set: anyone who can reach the web UI can delete cached packages"
+        );
+    }
     let state = AppState {
         cfg: Arc::new(cfg),
         store: Arc::new(store),
+        admin: Arc::new(admin),
     };
-    axum::serve(listener, app(state))
+    admin::spawn_scheduler(state.clone());
+    axum::serve(listener, app(state.clone()))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    // Keep download history from the last few seconds before shutdown.
+    if let Err(e) = state.store.flush_access().await {
+        tracing::warn!("could not save download history: {e}");
+    }
     Ok(())
 }
 

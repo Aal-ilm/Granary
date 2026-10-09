@@ -23,6 +23,9 @@ pub struct Config {
     pub npm_upstream: String,
     pub pypi_index: String,
     pub pypi_files: String,
+    /// When set, deleting, cleanup and other changes made through the web UI
+    /// or API require this token. Browsing is always allowed.
+    pub admin_token: Option<String>,
 }
 
 fn var(key: &str, default: &str) -> String {
@@ -61,6 +64,10 @@ impl Config {
             npm_upstream: url_var("GRANARY_NPM_UPSTREAM", "https://registry.npmjs.org"),
             pypi_index: url_var("GRANARY_PYPI_INDEX", "https://pypi.org/simple"),
             pypi_files: url_var("GRANARY_PYPI_FILES", "https://files.pythonhosted.org"),
+            admin_token: std::env::var("GRANARY_ADMIN_TOKEN")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         })
     }
 }

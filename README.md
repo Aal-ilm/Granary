@@ -15,6 +15,11 @@ once, then served from your own disk after that.
 - **Safe by design.** Clients still verify every download against the
   registry's own checksums (Cargo's `cksum`, npm's `integrity`, pip's
   `sha256`), so the cache can't silently serve tampered files.
+- **Web UI built in.** Browse and search what's cached, delete packages, set
+  cleanup rules, watch tasks, check upstream health and read logs. It's served
+  by the same binary and never loads anything from the internet.
+
+![Granary overview page](docs/overview.png)
 
 | Ecosystem | Status | Client path |
 |---|---|---|
@@ -28,11 +33,12 @@ once, then served from your own disk after that.
 ## Quick start
 
 ```sh
+echo "GRANARY_ADMIN_TOKEN=$(openssl rand -hex 24)" > .env   # protects admin actions
 docker compose up -d --build
 ```
 
-Then open `http://localhost:8080/`. The status page shows cache activity and
-ready-to-paste client configuration using the address you reached it on.
+Then open `http://localhost:8080/`. The Repositories page has ready-to-paste
+client configuration using the address you reached it on.
 
 Without compose:
 
@@ -74,6 +80,29 @@ registry=http://HOST:8080/npm/
 index-url = http://HOST:8080/pypi/simple/
 ```
 
+## Web UI
+
+| Page | What it's for |
+|---|---|
+| Overview | Disk use per repository, cache hit rate, upstream status, recently cached packages |
+| Repositories | Each proxy's URL, upstream, size and status, client setup snippets, and **Invalidate cache** to force fresh metadata |
+| Browse | Every cached package, filterable and sortable by size, versions, cache date and last download; the sidebar search covers all repositories |
+| Package detail | Each cached version and file, with download and delete |
+| Cleanup | Delete packages nobody has downloaded in *N* days, per repository, with a dry-run preview and an optional daily schedule |
+| Tasks | Scheduled jobs (cleanup, upstream checks, saving download history) with last run, result and **Run now** |
+| System | Upstream reachability and latency, disk space, and the active configuration |
+| Logs | Recent server events, filterable by level and text |
+
+**Protecting admin actions.** Browsing is open to anyone who can reach
+Granary. Deleting packages, invalidating caches, saving cleanup rules and
+running tasks require the token in `GRANARY_ADMIN_TOKEN` when it is set; the UI
+asks for it once and keeps it in that browser. Without a token, anyone on the
+network can make those changes, and the UI says so. The same rules apply to the
+JSON API under `/api/`, which also requires an `X-Granary-Request` header on
+every change so other websites can't trigger them from your browser.
+
+![System page in dark mode](docs/system-dark.png)
+
 ## Configuration
 
 All settings are environment variables.
@@ -84,6 +113,7 @@ All settings are environment variables.
 | `GRANARY_DATA_DIR` | `/data` in Docker, `./data` otherwise | Where the cache lives |
 | `GRANARY_PUBLIC_URL` | *(from request headers)* | Fixed external URL, e.g. `https://granary.lan`. Set it when clients reach Granary through a reverse proxy that doesn't send `X-Forwarded-Host` / `X-Forwarded-Proto` |
 | `GRANARY_META_TTL_SECS` | `300` | How long index/metadata responses are fresh before revalidation |
+| `GRANARY_ADMIN_TOKEN` | *(unset)* | Token required for deletes, cleanup and other changes in the UI and API. Strongly recommended |
 | `GRANARY_CARGO_INDEX` | `https://index.crates.io` | Upstream sparse index |
 | `GRANARY_CARGO_DL` | `https://static.crates.io/crates/{crate}/{version}/download` | Upstream crate download template |
 | `GRANARY_NPM_UPSTREAM` | `https://registry.npmjs.org` | Upstream npm registry |
@@ -117,28 +147,32 @@ place, so a crash never leaves a half-written package in the cache.
 /data
 ├── files/{cargo,npm,pypi}/…   immutable package files
 ├── meta/{cargo,npm,pypi}/…    cached metadata (*.body + *.json info)
+├── state/                     cleanup settings and last-download times
 └── tmp/                       in-progress downloads (cleared at startup)
 ```
 
-Deleting anything under `/data` is safe; it will be re-fetched on demand.
+Deleting anything under `files/` or `meta/` is safe; it will be re-fetched on
+demand. Last-download times start being recorded when you first run a version
+with the web UI; cleanup treats older files as last used on the day they were
+cached.
 
 ## Current limitations
 
 - **Read-only.** There is no `cargo publish` / `npm publish` / `twine upload`
   yet; npm write requests are refused.
-- **No authentication.** Run it on a trusted network, or put it behind a
-  reverse proxy that handles auth and TLS.
-- **No automatic cleanup.** The cache grows until you prune it. Removing
-  files you no longer need is safe.
+- **One shared admin token, no user accounts.** Package downloads are not
+  authenticated, so run Granary on a trusted network or behind a reverse proxy
+  that handles auth and TLS.
+- **Single instance.** Granary stores everything on one local volume and isn't
+  designed for running several replicas against shared storage.
 
 ## Roadmap
 
-1. Cleanup policies (evict files not requested in N days)
-2. Docker / OCI registry proxy, including Docker Hub's token auth
-3. Hosted repositories: publish your own crates, npm packages and wheels
-4. Debian / apt proxy
-5. Access tokens and per-repository permissions
-6. Prometheus metrics
+1. Docker / OCI registry proxy, including Docker Hub's token auth
+2. Hosted repositories: publish your own crates, npm packages and wheels
+3. Debian / apt proxy
+4. User accounts and per-repository permissions
+5. Prometheus metrics
 
 ## Development
 

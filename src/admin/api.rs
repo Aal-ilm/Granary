@@ -1,0 +1,689 @@
+//! JSON API used by the web UI. Reads are open; anything that changes or
+//! deletes data requires the `X-Granary-Request` header (which blocks
+//! cross-site form posts) and, if configured, the admin token.
+
+use std::{cmp::Ordering, collections::BTreeMap, sync::atomic::Ordering as AtomicOrdering};
+
+use axum::{
+    Json, Router,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{delete, get, post},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use super::{CleanupPolicy, check_upstreams, cleanup, disk_info, run_task};
+use crate::{
+    AppState,
+    error::{AppError, AppResult},
+    inventory::{self, Asset, REPOS},
+    store::{dir_size, now_secs},
+    util::base_url,
+};
+
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/api/auth", get(auth_status))
+        .route("/api/overview", get(overview))
+        .route("/api/repos", get(repos))
+        .route("/api/repos/{repo}/invalidate", post(invalidate))
+        .route("/api/components", get(components))
+        .route("/api/component", get(component).delete(delete_component))
+        .route("/api/asset", delete(delete_asset))
+        .route("/api/cleanup", get(cleanup_get).put(cleanup_put))
+        .route("/api/cleanup/preview", post(cleanup_preview))
+        .route("/api/cleanup/run", post(cleanup_run))
+        .route("/api/tasks", get(tasks))
+        .route("/api/tasks/{id}/run", post(task_run))
+        .route("/api/system", get(system))
+        .route("/api/system/check", post(system_check))
+        .route("/api/logs", get(logs))
+}
+
+// -------------------------------------------------------------------- auth
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn token_valid(st: &AppState, headers: &HeaderMap) -> bool {
+    let Some(expected) = &st.cfg.admin_token else {
+        return true;
+    };
+    let given = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim);
+    given.is_some_and(|g| constant_time_eq(g.as_bytes(), expected.as_bytes()))
+}
+
+/// Guard for every request that changes data.
+fn require_admin(st: &AppState, headers: &HeaderMap) -> AppResult<()> {
+    if !headers.contains_key("x-granary-request") {
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "missing X-Granary-Request header",
+        ));
+    }
+    if !token_valid(st, headers) {
+        return Err(AppError::new(
+            StatusCode::UNAUTHORIZED,
+            "an admin token is required for this action",
+        ));
+    }
+    Ok(())
+}
+
+async fn auth_status(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
+    Json(json!({
+        "required": st.cfg.admin_token.is_some(),
+        "valid": token_valid(&st, &headers),
+    }))
+}
+
+fn repo_id(s: &str) -> AppResult<&'static str> {
+    REPOS
+        .iter()
+        .find(|r| **r == s)
+        .copied()
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, format!("no repository named {s:?}")))
+}
+
+// ---------------------------------------------------------------- overview
+
+#[derive(Serialize)]
+struct RepoUsage {
+    repo: &'static str,
+    packages: usize,
+    files: usize,
+    size: u64,
+    meta_size: u64,
+}
+
+async fn usage(st: &AppState, inv: &[Asset]) -> Vec<RepoUsage> {
+    let meta_dirs: Vec<_> = REPOS.iter().map(|r| st.store.meta_dir(r)).collect();
+    let meta_sizes = tokio::task::spawn_blocking(move || {
+        meta_dirs.iter().map(|d| dir_size(d)).collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_else(|_| vec![0; REPOS.len()]);
+
+    REPOS
+        .iter()
+        .zip(meta_sizes)
+        .map(|(repo, meta_size)| {
+            let assets: Vec<&Asset> = inv.iter().filter(|a| a.repo == *repo).collect();
+            let packages: std::collections::HashSet<&str> =
+                assets.iter().map(|a| a.package.as_str()).collect();
+            RepoUsage {
+                repo,
+                packages: packages.len(),
+                files: assets.len(),
+                size: assets.iter().map(|a| a.size).sum(),
+                meta_size,
+            }
+        })
+        .collect()
+}
+
+async fn overview(State(st): State<AppState>) -> Json<Value> {
+    let inv = st.admin.inventory(&st.store).await;
+    let repos = usage(&st, &inv).await;
+    let mut recent: Vec<&Asset> = inv.iter().collect();
+    recent.sort_by_key(|a| std::cmp::Reverse(a.cached_at));
+    recent.truncate(8);
+
+    let s = &st.store.stats;
+    let n = |a: &std::sync::atomic::AtomicU64| a.load(AtomicOrdering::Relaxed);
+    let disk = {
+        let dir = st.store.root().to_path_buf();
+        tokio::task::spawn_blocking(move || disk_info(&dir))
+            .await
+            .ok()
+            .flatten()
+    };
+    let health = st.admin.health.lock().unwrap().clone();
+
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_secs": now_secs().saturating_sub(st.admin.started_at),
+        "repos": repos,
+        "stats": {
+            "file_hits": n(&s.file_hits),
+            "file_downloads": n(&s.file_misses),
+            "meta_hits": n(&s.meta_hits),
+            "meta_refreshes": n(&s.meta_refreshes),
+            "meta_stale_served": n(&s.meta_stale_served),
+        },
+        "disk": disk,
+        "health": health,
+        "recent": recent,
+        "auth_required": st.cfg.admin_token.is_some(),
+    }))
+}
+
+// ------------------------------------------------------------ repositories
+
+async fn repos(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
+    let base = base_url(&st.cfg, &headers);
+    let inv = st.admin.inventory(&st.store).await;
+    let usage = usage(&st, &inv).await;
+    let health = st.admin.health.lock().unwrap().clone();
+    let cfg = &st.cfg;
+
+    let list: Vec<Value> = usage
+        .into_iter()
+        .map(|u| {
+            let h = health.iter().find(|h| h.repo == u.repo);
+            let (name, format, path, upstream, setup) = match u.repo {
+                "cargo" => (
+                    "crates.io",
+                    "Cargo",
+                    "/cargo/",
+                    vec![
+                        json!({"label": "Index", "url": cfg.cargo_index}),
+                        json!({"label": "Downloads", "url": cfg.cargo_dl}),
+                    ],
+                    json!({
+                        "file": "~/.cargo/config.toml",
+                        "snippet": format!("[source.crates-io]\nreplace-with = \"granary\"\n\n[source.granary]\nregistry = \"sparse+{base}/cargo/\""),
+                    }),
+                ),
+                "npm" => (
+                    "registry.npmjs.org",
+                    "npm",
+                    "/npm/",
+                    vec![json!({"label": "Registry", "url": cfg.npm_upstream})],
+                    json!({
+                        "file": "~/.npmrc or a project .npmrc",
+                        "snippet": format!("registry={base}/npm/"),
+                    }),
+                ),
+                _ => (
+                    "pypi.org",
+                    "PyPI",
+                    "/pypi/simple/",
+                    vec![
+                        json!({"label": "Index", "url": cfg.pypi_index}),
+                        json!({"label": "Files", "url": cfg.pypi_files}),
+                    ],
+                    json!({
+                        "file": "pip.conf (or UV_INDEX_URL for uv)",
+                        "snippet": format!("[global]\nindex-url = {base}/pypi/simple/"),
+                    }),
+                ),
+            };
+            json!({
+                "id": u.repo,
+                "name": name,
+                "format": format,
+                "kind": "proxy",
+                "url": format!("{base}{path}"),
+                "upstream": upstream,
+                "setup": setup,
+                "packages": u.packages,
+                "files": u.files,
+                "size": u.size,
+                "meta_size": u.meta_size,
+                "health": h,
+            })
+        })
+        .collect();
+    Json(json!({ "base_url": base, "repos": list }))
+}
+
+async fn invalidate(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(repo): Path<String>,
+) -> AppResult<Json<Value>> {
+    require_admin(&st, &headers)?;
+    let repo = repo_id(&repo)?;
+    let freed = st.store.invalidate_meta(repo).await?;
+    tracing::info!("{repo}: metadata cache invalidated");
+    Ok(Json(json!({ "freed": freed })))
+}
+
+// -------------------------------------------------------- browse & search
+
+#[derive(Deserialize)]
+struct ListQuery {
+    repo: Option<String>,
+    q: Option<String>,
+    sort: Option<String>,
+    order: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+async fn components(
+    State(st): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> AppResult<Json<Value>> {
+    let repo = match q.repo.as_deref().filter(|r| !r.is_empty()) {
+        Some(r) => Some(repo_id(r)?),
+        None => None,
+    };
+    let needle = q.q.unwrap_or_default().trim().to_lowercase();
+    let inv = st.admin.inventory(&st.store).await;
+    let filtered: Vec<Asset> = inv
+        .iter()
+        .filter(|a| repo.is_none_or(|r| a.repo == r))
+        .filter(|a| needle.is_empty() || a.package.to_lowercase().contains(&needle))
+        .cloned()
+        .collect();
+    let mut items = inventory::group(&filtered);
+
+    let desc = q.order.as_deref() == Some("desc");
+    match q.sort.as_deref() {
+        Some("size") => items.sort_by_key(|c| c.size),
+        Some("versions") => items.sort_by_key(|c| c.versions),
+        Some("cached") => items.sort_by_key(|c| c.latest_cached),
+        Some("used") => items.sort_by_key(|c| c.last_access.unwrap_or(0)),
+        _ => {
+            // Exact matches first when searching, then alphabetical.
+            items.sort_by(|a, b| {
+                let ea = a.name.to_lowercase() == needle;
+                let eb = b.name.to_lowercase() == needle;
+                eb.cmp(&ea)
+                    .then_with(|| a.name.cmp(&b.name))
+                    .then_with(|| a.repo.cmp(b.repo))
+            });
+        }
+    }
+    if desc {
+        items.reverse();
+    }
+
+    let total = items.len();
+    let offset = q.offset.unwrap_or(0).min(total);
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let page: Vec<_> = items.into_iter().skip(offset).take(limit).collect();
+    Ok(Json(
+        json!({ "total": total, "offset": offset, "items": page }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct ComponentQuery {
+    repo: String,
+    name: String,
+}
+
+/// Order versions naturally: numeric runs compare as numbers.
+fn version_cmp(a: &str, b: &str) -> Ordering {
+    fn chunks(s: &str) -> Vec<(bool, &str)> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        let bytes = s.as_bytes();
+        for i in 1..=bytes.len() {
+            if i == bytes.len() || bytes[i].is_ascii_digit() != bytes[start].is_ascii_digit() {
+                out.push((bytes[start].is_ascii_digit(), &s[start..i]));
+                start = i;
+            }
+        }
+        out
+    }
+    let (ca, cb) = (chunks(a), chunks(b));
+    for (x, y) in ca.iter().zip(cb.iter()) {
+        let ord = match (x, y) {
+            ((true, x), (true, y)) => x
+                .trim_start_matches('0')
+                .len()
+                .cmp(&y.trim_start_matches('0').len())
+                .then_with(|| x.trim_start_matches('0').cmp(y.trim_start_matches('0'))),
+            ((_, x), (_, y)) => x.cmp(y),
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    // Same prefix: a trailing `-pre` part (1.0.0-rc.1) ranks below the release.
+    let common = ca.len().min(cb.len());
+    let pre = |c: &[(bool, &str)]| c.get(common).is_some_and(|(_, s)| s.starts_with('-'));
+    match (pre(&ca), pre(&cb)) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => ca.len().cmp(&cb.len()),
+    }
+}
+
+fn upstream_page(st: &AppState, repo: &str, name: &str) -> Option<(String, String)> {
+    let cfg = &st.cfg;
+    match repo {
+        "cargo" if cfg.cargo_index == "https://index.crates.io" => Some((
+            "crates.io".into(),
+            format!("https://crates.io/crates/{name}"),
+        )),
+        "npm" if cfg.npm_upstream == "https://registry.npmjs.org" => Some((
+            "npmjs.com".into(),
+            format!("https://www.npmjs.com/package/{name}"),
+        )),
+        "pypi" if cfg.pypi_index == "https://pypi.org/simple" => Some((
+            "pypi.org".into(),
+            format!("https://pypi.org/project/{name}/"),
+        )),
+        _ => None,
+    }
+}
+
+async fn component(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ComponentQuery>,
+) -> AppResult<Json<Value>> {
+    let repo = repo_id(&q.repo)?;
+    let inv = st.admin.inventory(&st.store).await;
+    let assets: Vec<&Asset> = inv
+        .iter()
+        .filter(|a| a.repo == repo && a.package == q.name)
+        .collect();
+    if assets.is_empty() {
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            format!("{} is not cached in {repo}", q.name),
+        ));
+    }
+
+    let mut by_version: BTreeMap<&str, Vec<&Asset>> = BTreeMap::new();
+    for a in &assets {
+        by_version.entry(a.version.as_str()).or_default().push(a);
+    }
+    let base = base_url(&st.cfg, &headers);
+    let mut versions: Vec<Value> = by_version
+        .into_iter()
+        .map(|(v, files)| {
+            let files_json: Vec<Value> = files
+                .iter()
+                .map(|a| {
+                    let download = match repo {
+                        "cargo" => format!("{base}/cargo/dl/{}/{v}", a.package),
+                        "npm" => format!("{base}/npm/{}", a.path),
+                        _ => format!("{base}/pypi/files/{}", a.path),
+                    };
+                    json!({
+                        "file_name": a.file_name,
+                        "path": a.path,
+                        "size": a.size,
+                        "cached_at": a.cached_at,
+                        "last_access": a.last_access,
+                        "download": download,
+                    })
+                })
+                .collect();
+            json!({
+                "version": v,
+                "size": files.iter().map(|a| a.size).sum::<u64>(),
+                "cached_at": files.iter().map(|a| a.cached_at).max(),
+                "last_access": files.iter().filter_map(|a| a.last_access).max(),
+                "files": files_json,
+            })
+        })
+        .collect();
+    versions.sort_by(|a, b| {
+        version_cmp(
+            b["version"].as_str().unwrap_or(""),
+            a["version"].as_str().unwrap_or(""),
+        )
+    });
+
+    let upstream = upstream_page(&st, repo, &q.name);
+    Ok(Json(json!({
+        "repo": repo,
+        "name": q.name,
+        "size": assets.iter().map(|a| a.size).sum::<u64>(),
+        "files": assets.len(),
+        "versions": versions,
+        "upstream": upstream.map(|(label, url)| json!({"label": label, "url": url})),
+    })))
+}
+
+async fn delete_component(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ComponentQuery>,
+) -> AppResult<Json<Value>> {
+    require_admin(&st, &headers)?;
+    let repo = repo_id(&q.repo)?;
+    let inv = st.admin.inventory(&st.store).await;
+    let paths: Vec<String> = inv
+        .iter()
+        .filter(|a| a.repo == repo && a.package == q.name)
+        .map(|a| a.path.clone())
+        .collect();
+    if paths.is_empty() {
+        return Err(AppError::not_found());
+    }
+    let (mut files, mut bytes) = (0, 0);
+    for p in &paths {
+        if let Ok(freed) = st.store.delete_file(repo, p).await {
+            files += 1;
+            bytes += freed;
+        }
+    }
+    if let Some(key) = inventory::meta_key(repo, &q.name) {
+        bytes += st.store.delete_meta(repo, &key).await.unwrap_or(0);
+    }
+    st.admin.invalidate_inventory();
+    let _ = st.store.flush_access().await;
+    tracing::info!("{repo}: deleted {} ({files} files)", q.name);
+    Ok(Json(json!({ "files": files, "bytes": bytes })))
+}
+
+#[derive(Deserialize)]
+struct AssetQuery {
+    repo: String,
+    path: String,
+}
+
+async fn delete_asset(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<AssetQuery>,
+) -> AppResult<Json<Value>> {
+    require_admin(&st, &headers)?;
+    let repo = repo_id(&q.repo)?;
+    let freed = st.store.delete_file(repo, &q.path).await?;
+    st.admin.invalidate_inventory();
+    let _ = st.store.flush_access().await;
+    tracing::info!("{repo}: deleted {}", q.path);
+    Ok(Json(json!({ "files": 1, "bytes": freed })))
+}
+
+// ----------------------------------------------------------------- cleanup
+
+async fn cleanup_get(State(st): State<AppState>) -> Json<Value> {
+    let s = st.admin.settings.lock().unwrap().clone();
+    Json(json!({ "policy": s.cleanup, "last_run": s.last_cleanup }))
+}
+
+fn validate_policy(p: &CleanupPolicy) -> AppResult<()> {
+    if !(1..=3650).contains(&p.unused_days) {
+        return Err(AppError::bad_request(
+            "unused_days must be between 1 and 3650",
+        ));
+    }
+    if p.repos.is_empty() {
+        return Err(AppError::bad_request("choose at least one repository"));
+    }
+    for r in &p.repos {
+        repo_id(r)?;
+    }
+    Ok(())
+}
+
+async fn cleanup_put(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(policy): Json<CleanupPolicy>,
+) -> AppResult<Json<Value>> {
+    require_admin(&st, &headers)?;
+    validate_policy(&policy)?;
+    st.admin.settings.lock().unwrap().cleanup = policy.clone();
+    st.admin.save_settings().await?;
+    st.admin.sync_cleanup_task();
+    tracing::info!(
+        "cleanup policy saved: {} after {} days",
+        if policy.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        policy.unused_days
+    );
+    Ok(Json(json!({ "policy": policy })))
+}
+
+async fn cleanup_preview(
+    State(st): State<AppState>,
+    body: Option<Json<CleanupPolicy>>,
+) -> AppResult<Json<Value>> {
+    let policy = match body {
+        Some(Json(p)) => {
+            validate_policy(&p)?;
+            p
+        }
+        None => st.admin.settings.lock().unwrap().cleanup.clone(),
+    };
+    Ok(Json(json!(cleanup(&st, &policy, true).await)))
+}
+
+async fn cleanup_run(State(st): State<AppState>, headers: HeaderMap) -> AppResult<Response> {
+    require_admin(&st, &headers)?;
+    if !run_task(&st, "cleanup").await {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "cleanup is already running",
+        ));
+    }
+    let last = st.admin.settings.lock().unwrap().last_cleanup.clone();
+    Ok(Json(json!(last)).into_response())
+}
+
+// ------------------------------------------------------------------- tasks
+
+async fn tasks(State(st): State<AppState>) -> Json<Value> {
+    Json(json!({ "tasks": *st.admin.tasks.lock().unwrap() }))
+}
+
+async fn task_run(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> AppResult<Response> {
+    require_admin(&st, &headers)?;
+    let known = st
+        .admin
+        .tasks
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|t| t.id == id)
+        .map(|t| (t.id, t.running));
+    let Some((id, running)) = known else {
+        return Err(AppError::not_found());
+    };
+    if running {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "task is already running",
+        ));
+    }
+    tokio::spawn(async move {
+        run_task(&st, id).await;
+    });
+    Ok((StatusCode::ACCEPTED, Json(json!({ "started": true }))).into_response())
+}
+
+// ------------------------------------------------------------------ system
+
+async fn system(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
+    let cfg = &st.cfg;
+    let disk = {
+        let dir = st.store.root().to_path_buf();
+        tokio::task::spawn_blocking(move || disk_info(&dir))
+            .await
+            .ok()
+            .flatten()
+    };
+    let data_dir = std::fs::canonicalize(&cfg.data_dir).unwrap_or_else(|_| cfg.data_dir.clone());
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "started_at": st.admin.started_at,
+        "uptime_secs": now_secs().saturating_sub(st.admin.started_at),
+        "disk": disk,
+        "health": *st.admin.health.lock().unwrap(),
+        "config": [
+            {"key": "GRANARY_LISTEN", "label": "Listen address", "value": cfg.listen},
+            {"key": "GRANARY_PUBLIC_URL", "label": "Public URL", "value": cfg.public_url.clone().unwrap_or_else(|| format!("{} (from request)", base_url(cfg, &headers)))},
+            {"key": "GRANARY_DATA_DIR", "label": "Data directory", "value": data_dir.display().to_string()},
+            {"key": "GRANARY_META_TTL_SECS", "label": "Metadata freshness", "value": format!("{} seconds", cfg.meta_ttl.as_secs())},
+            {"key": "GRANARY_ADMIN_TOKEN", "label": "Admin token", "value": if cfg.admin_token.is_some() { "Set" } else { "Not set (anyone on the network can delete)" }},
+            {"key": "GRANARY_CARGO_INDEX", "label": "Cargo index", "value": cfg.cargo_index},
+            {"key": "GRANARY_CARGO_DL", "label": "Cargo downloads", "value": cfg.cargo_dl},
+            {"key": "GRANARY_NPM_UPSTREAM", "label": "npm registry", "value": cfg.npm_upstream},
+            {"key": "GRANARY_PYPI_INDEX", "label": "PyPI index", "value": cfg.pypi_index},
+            {"key": "GRANARY_PYPI_FILES", "label": "PyPI files", "value": cfg.pypi_files},
+        ],
+    }))
+}
+
+async fn system_check(State(st): State<AppState>, headers: HeaderMap) -> AppResult<Json<Value>> {
+    require_admin(&st, &headers)?;
+    Ok(Json(json!({ "health": check_upstreams(&st).await })))
+}
+
+// -------------------------------------------------------------------- logs
+
+#[derive(Deserialize)]
+struct LogQuery {
+    level: Option<String>,
+    q: Option<String>,
+}
+
+async fn logs(State(st): State<AppState>, Query(q): Query<LogQuery>) -> Json<Value> {
+    let rank = |l: &str| match l {
+        "ERROR" | "error" => 0,
+        "WARN" | "warn" => 1,
+        "INFO" | "info" => 2,
+        "DEBUG" | "debug" => 3,
+        _ => 4,
+    };
+    let max = q.level.as_deref().map_or(4, rank);
+    let needle = q.q.unwrap_or_default().to_lowercase();
+    let entries: Vec<_> = st
+        .admin
+        .logs
+        .entries()
+        .into_iter()
+        .filter(|e| rank(e.level) <= max)
+        .filter(|e| needle.is_empty() || e.message.to_lowercase().contains(&needle))
+        .take(500)
+        .collect();
+    Json(json!({ "entries": entries }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn natural_version_order() {
+        let mut v = vec!["1.10.0", "1.2.0", "1.9.3", "0.9", "1.10.0-rc.1"];
+        v.sort_by(|a, b| version_cmp(b, a));
+        assert_eq!(v[0], "1.10.0");
+        assert_eq!(v[1], "1.10.0-rc.1");
+        assert_eq!(v[2], "1.9.3");
+        assert_eq!(v.last(), Some(&"0.9"));
+    }
+
+    #[test]
+    fn token_compare() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+    }
+}

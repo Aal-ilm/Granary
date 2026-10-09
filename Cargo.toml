@@ -13,6 +13,7 @@ anyhow = "1.0.104"
 axum = "0.8.9"
 bytes = "1.12.1"
 futures-util = "0.3.34"
+libc = "0.2.190"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream", "http2", "gzip", "brotli"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

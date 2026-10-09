@@ -18,7 +18,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -59,6 +59,9 @@ pub struct Store {
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     tmp_counter: AtomicU64,
     pub stats: Stats,
+    /// Last time each cached file was served, keyed by `ns/rel`.
+    access: Mutex<HashMap<String, u64>>,
+    access_dirty: AtomicBool,
 }
 
 /// A metadata document, as stored from upstream (before any URL rewriting).
@@ -75,7 +78,7 @@ struct MetaInfo {
     last_modified: Option<String>,
 }
 
-fn now_secs() -> u64 {
+pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -106,6 +109,11 @@ impl Store {
             .no_brotli()
             .build()?;
 
+        let access = match tokio::fs::read(root.join("state/access.json")).await {
+            Ok(raw) => serde_json::from_slice(&raw).unwrap_or_default(),
+            Err(_) => HashMap::new(),
+        };
+
         Ok(Self {
             root,
             meta_client,
@@ -114,6 +122,8 @@ impl Store {
             locks: Mutex::new(HashMap::new()),
             tmp_counter: AtomicU64::new(0),
             stats: Stats::default(),
+            access: Mutex::new(access),
+            access_dirty: AtomicBool::new(false),
         })
     }
 
@@ -182,6 +192,7 @@ impl Store {
         if tokio::fs::try_exists(&path).await? {
             self.stats.file_hits.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(ns, rel, "file hit");
+            self.touch(ns, rel);
             return serve_file(&path, content_type).await;
         }
 
@@ -193,11 +204,12 @@ impl Store {
                 return Ok(());
             }
             self.stats.file_misses.fetch_add(1, Ordering::Relaxed);
-            tracing::info!(ns, rel, "file miss, fetching {url}");
+            tracing::info!("{ns}: downloading {rel} from upstream");
             self.download(url, &path).await
         })
         .await?;
 
+        self.touch(ns, rel);
         serve_file(&path, content_type).await
     }
 
@@ -380,6 +392,162 @@ impl Store {
             body,
             content_type: info.content_type,
         })
+    }
+}
+
+// ------------------------------------------------------------ management
+
+impl Store {
+    pub fn files_dir(&self, ns: &str) -> PathBuf {
+        self.root.join("files").join(ns)
+    }
+
+    pub fn meta_dir(&self, ns: &str) -> PathBuf {
+        self.root.join("meta").join(ns)
+    }
+
+    /// Record that a cached file was just served.
+    pub fn touch(&self, ns: &str, rel: &str) {
+        self.access
+            .lock()
+            .unwrap()
+            .insert(format!("{ns}/{rel}"), now_secs());
+        self.access_dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// When a cached file was last served, if ever since tracking began.
+    pub fn last_access(&self, ns: &str, rel: &str) -> Option<u64> {
+        self.access
+            .lock()
+            .unwrap()
+            .get(&format!("{ns}/{rel}"))
+            .copied()
+    }
+
+    /// Snapshot of all access times (cheaper than per-file lookups for scans).
+    pub fn access_snapshot(&self) -> HashMap<String, u64> {
+        self.access.lock().unwrap().clone()
+    }
+
+    /// Persist access times if they changed. Returns whether anything was written.
+    pub async fn flush_access(&self) -> std::io::Result<bool> {
+        if !self.access_dirty.swap(false, Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let data = serde_json::to_vec(&*self.access.lock().unwrap()).unwrap();
+        if let Err(e) = self
+            .write_atomic(&self.root.join("state/access.json"), &data)
+            .await
+        {
+            self.access_dirty.store(true, Ordering::Relaxed);
+            return Err(e);
+        }
+        Ok(true)
+    }
+
+    /// Delete one cached file (and a PyPI `.metadata` companion). Returns bytes freed.
+    pub async fn delete_file(&self, ns: &str, rel: &str) -> AppResult<u64> {
+        let path = self.files_dir(ns).join(safe_rel_path(rel)?);
+        let mut freed = 0;
+        for (p, key) in [
+            (path.clone(), rel.to_string()),
+            (
+                PathBuf::from(format!("{}.metadata", path.display())),
+                format!("{rel}.metadata"),
+            ),
+        ] {
+            if let Ok(meta) = tokio::fs::metadata(&p).await {
+                tokio::fs::remove_file(&p).await?;
+                freed += meta.len();
+                self.access.lock().unwrap().remove(&format!("{ns}/{key}"));
+                self.access_dirty.store(true, Ordering::Relaxed);
+            }
+        }
+        if freed == 0 {
+            return Err(AppError::not_found());
+        }
+        remove_empty_parents(&path, &self.files_dir(ns)).await;
+        Ok(freed)
+    }
+
+    /// Delete every cached variant of one metadata document. Returns bytes freed.
+    pub async fn delete_meta(&self, ns: &str, rel: &str) -> AppResult<u64> {
+        let base = self.meta_dir(ns).join(safe_rel_path(rel)?);
+        let (Some(dir), Some(name)) = (base.parent(), base.file_name()) else {
+            return Ok(0);
+        };
+        let prefix = format!("{}.", name.to_string_lossy());
+        let mut freed = 0;
+        let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
+            return Ok(0);
+        };
+        while let Some(e) = rd.next_entry().await? {
+            let fname = e.file_name().to_string_lossy().to_string();
+            // Variant files are named `<name>.<variant>.body|json`, where the
+            // variant itself contains no dot.
+            let is_variant = fname.strip_prefix(&prefix).is_some_and(|rest| {
+                ["body", "json"].iter().any(|ext| {
+                    rest.strip_suffix(&format!(".{ext}"))
+                        .is_some_and(|v| !v.is_empty() && !v.contains('.'))
+                })
+            });
+            if is_variant {
+                freed += e.metadata().await.map(|m| m.len()).unwrap_or(0);
+                tokio::fs::remove_file(e.path()).await?;
+            }
+        }
+        Ok(freed)
+    }
+
+    /// Drop all cached metadata for a repository, forcing a refresh from
+    /// upstream on the next request (Nexus calls this "invalidate cache").
+    /// Cached files are kept. Returns bytes freed.
+    pub async fn invalidate_meta(&self, ns: &str) -> std::io::Result<u64> {
+        let dir = self.meta_dir(ns);
+        let freed = tokio::task::spawn_blocking({
+            let dir = dir.clone();
+            move || dir_size(&dir)
+        })
+        .await
+        .unwrap_or(0);
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => Ok(freed),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Total size of all files under `dir` (blocking).
+pub fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push(e.path()),
+                Ok(t) if t.is_file() => total += e.metadata().map(|m| m.len()).unwrap_or(0),
+                _ => {}
+            }
+        }
+    }
+    total
+}
+
+/// Remove now-empty directories between `path` and `stop` (exclusive).
+async fn remove_empty_parents(path: &Path, stop: &Path) {
+    let mut cur = path.parent();
+    while let Some(dir) = cur {
+        if dir == stop || !dir.starts_with(stop) {
+            break;
+        }
+        if tokio::fs::remove_dir(dir).await.is_err() {
+            break; // not empty, or already gone
+        }
+        cur = dir.parent();
     }
 }
 

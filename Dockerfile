@@ -9,6 +9,7 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs \
     && rm -rf src
 
 COPY src ./src
+COPY web ./web
 RUN touch src/main.rs && cargo build --release --locked
 
 # ---- runtime ----

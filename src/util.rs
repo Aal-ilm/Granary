@@ -100,6 +100,7 @@ mod tests {
             npm_upstream: "https://registry.npmjs.org".into(),
             pypi_index: "https://pypi.org/simple".into(),
             pypi_files: "https://files.pythonhosted.org".into(),
+            admin_token: None,
         }
     }
 }
