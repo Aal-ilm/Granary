@@ -284,5 +284,9 @@ RUST_LOG=granary=debug cargo run
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 [MIT license](LICENSE-MIT) at your option.
 
+The web UI bundles the Saira Condensed typeface (SemiBold, Latin subset),
+licensed under the [SIL Open Font License 1.1](web/fonts/OFL.txt). It is
+served by Granary itself; the UI never loads fonts from the internet.
+
 Granary is an independent project and is not affiliated with Sonatype, JFrog,
 the Rust Foundation, npm, Inc. or the Python Software Foundation.

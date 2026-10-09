@@ -135,7 +135,7 @@ function showShell() {
 
 const authCard = (inner) => `
   <div class="auth-card panel">
-    <div class="auth-brand"><img src="/ui/icon.svg" alt=""><span>Granary</span></div>
+    <div class="auth-brand"><img src="/ui/granary-logo.svg" alt="" width="136" height="136"><span>Granary</span></div>
     ${inner}
   </div>`;
 
@@ -420,7 +420,7 @@ async function renderOverview({ isCurrent }) {
       const share = total ? (r.size / total) * 100 : 0;
       const fill = r.size ? Math.max(4, share) : 0;
       return `
-      <a class="silo-col" href="#/browse/${r.repo}" aria-label="${esc(REPOS[r.repo].label)}: ${esc(bytes(r.size))}, ${esc(plural(r.packages, 'package'))}">
+      <a class="silo-col ${esc(r.repo)}" href="#/browse/${esc(r.repo)}" aria-label="${esc(REPOS[r.repo].label)}: ${esc(bytes(r.size))}, ${esc(plural(r.packages, 'package'))}">
         <div class="silo"><div class="grain" data-fill="${fill.toFixed(1)}"></div></div>
         <div class="silo-label">
           ${chip(r.repo)}

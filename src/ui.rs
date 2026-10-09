@@ -14,10 +14,13 @@ use crate::AppState;
 const INDEX: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const APP_CSS: &str = include_str!("../web/app.css");
-const ICON: &str = include_str!("../web/icon.svg");
+const LOGO: &str = include_str!("../web/granary-logo.svg");
+const ICON: &str = include_str!("../web/granary-icon.svg");
+// Saira Condensed (SIL Open Font License, see web/fonts/OFL.txt), for headings.
+const HEADING_FONT: &[u8] = include_bytes!("../web/fonts/saira-condensed-600.woff2");
 
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
-                   img-src 'self' data:; connect-src 'self'; base-uri 'none'; \
+                   img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; \
                    form-action 'self'; frame-ancestors 'none'";
 
 pub fn router() -> Router<AppState> {
@@ -31,7 +34,12 @@ pub fn router() -> Router<AppState> {
             "/ui/app.css",
             get(|| asset(APP_CSS, "text/css; charset=utf-8")),
         )
-        .route("/ui/icon.svg", get(|| asset(ICON, "image/svg+xml")))
+        .route("/ui/granary-logo.svg", get(|| asset(LOGO, "image/svg+xml")))
+        .route("/ui/granary-icon.svg", get(|| asset(ICON, "image/svg+xml")))
+        .route(
+            "/ui/fonts/saira-condensed-600.woff2",
+            get(|| asset(HEADING_FONT, "font/woff2")),
+        )
 }
 
 async fn index() -> Response {
@@ -49,7 +57,7 @@ async fn index() -> Response {
         .into_response()
 }
 
-async fn asset(body: &'static str, content_type: &'static str) -> Response {
+async fn asset(body: impl IntoResponse, content_type: &'static str) -> Response {
     (
         [
             (header::CONTENT_TYPE, content_type),
