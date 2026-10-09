@@ -100,7 +100,11 @@ mod tests {
             npm_upstream: "https://registry.npmjs.org".into(),
             pypi_index: "https://pypi.org/simple".into(),
             pypi_files: "https://files.pythonhosted.org".into(),
-            admin_token: None,
+            admin_user: "admin".into(),
+            admin_password: None,
+            client_auth: true,
+            cookie_secure: false,
+            session_idle: std::time::Duration::from_secs(3600),
         }
     }
 }

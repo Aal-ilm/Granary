@@ -18,6 +18,11 @@ once, then served from your own disk after that.
 - **Web UI built in.** Browse and search what's cached, delete packages, set
   cleanup rules, watch tasks, check upstream health and read logs. It's served
   by the same binary and never loads anything from the internet.
+- **Accounts built in.** Sign-in with admin and viewer roles, two-factor
+  codes, and per-machine access tokens for Cargo, npm and pip. Built on the
+  open-source axum-login, tower-sessions, password-auth (Argon2id) and
+  totp-rs libraries, stored in a local SQLite file. No external identity
+  service is needed.
 
 ![Granary overview page](docs/overview.png)
 
@@ -33,23 +38,18 @@ once, then served from your own disk after that.
 ## Quick start
 
 ```sh
-echo "GRANARY_ADMIN_TOKEN=$(openssl rand -hex 24)" > .env   # protects admin actions
 docker compose up -d --build
+docker compose logs granary            # shows the first admin password once
+docker compose port granary 8080       # shows the port, e.g. 0.0.0.0:32768
 ```
 
-Docker gives Granary a free port on the host. See which one with:
-
-```sh
-docker compose port granary 8080      # prints e.g. 0.0.0.0:32768
-```
-
-Then open that address in a browser.
+Open that address in a browser and sign in as `admin` with the password from
+the log. Granary asks you to choose your own password straight away.
 
 The automatic port can change when the container is recreated or the host
 reboots, and every client config contains the URL. Once Granary is set up the
 way you like, pin the port it was given by changing the `ports:` entry in
-`docker-compose.yml` from `"8080"` to `"32768:8080"` (using your port). The Repositories page has ready-to-paste
-client configuration using the address you reached it on.
+`docker-compose.yml` from `"8080"` to `"32768:8080"` (using your port).
 
 Without compose:
 
@@ -66,30 +66,39 @@ cargo run --release      # caches into ./data, listens on 0.0.0.0:8080
 
 ## Client setup
 
-Replace `HOST` with the address of your Granary server.
+Package downloads need an access token. In the web UI, open **Access
+tokens**, create one per machine, and Granary shows the token once along with
+ready-to-paste configuration that includes it. By hand, with `HOST` as your
+Granary address and `TOKEN` as the token:
 
-**Cargo** (`~/.cargo/config.toml`):
+**Cargo** (`~/.cargo/config.toml`), then run `cargo login --registry granary`
+and paste the token:
 
 ```toml
+[registries.granary]
+index = "sparse+http://HOST/cargo/"
+credential-provider = "cargo:token"
+
 [source.crates-io]
 replace-with = "granary"
-
-[source.granary]
-registry = "sparse+http://HOST:8080/cargo/"
 ```
 
 **npm / pnpm / yarn** (`~/.npmrc` or a project `.npmrc`):
 
 ```ini
-registry=http://HOST:8080/npm/
+registry=http://HOST/npm/
+//HOST/npm/:_authToken=TOKEN
 ```
 
-**pip** (`pip.conf`) or **uv** (`UV_INDEX_URL=http://HOST:8080/pypi/simple/`):
+**pip** (`pip.conf`) or **uv** (`UV_INDEX_URL`):
 
 ```ini
 [global]
-index-url = http://HOST:8080/pypi/simple/
+index-url = http://__token__:TOKEN@HOST/pypi/simple/
 ```
+
+To let anyone on your network download without a token, set
+`GRANARY_CLIENT_AUTH=off`; the configuration then needs only the URLs.
 
 ## Web UI
 
@@ -102,15 +111,45 @@ index-url = http://HOST:8080/pypi/simple/
 | Cleanup | Delete packages nobody has downloaded in *N* days, per repository, with a dry-run preview and an optional daily schedule |
 | Tasks | Scheduled jobs (cleanup, upstream checks, saving download history) with last run, result and **Run now** |
 | System | Upstream reachability and latency, disk space, and the active configuration |
-| Logs | Recent server events, filterable by level and text |
+| Logs | Recent server events, filterable by level and text (admins only) |
+| Access tokens | Create and revoke tokens for package managers, with ready-made client configuration |
+| Users | Add people as admins or viewers, reset passwords, turn off two-factor, disable or delete accounts (admins only) |
+| Account | Change your password and set up two-factor authentication |
 
-**Protecting admin actions.** Browsing is open to anyone who can reach
-Granary. Deleting packages, invalidating caches, saving cleanup rules and
-running tasks require the token in `GRANARY_ADMIN_TOKEN` when it is set; the UI
-asks for it once and keeps it in that browser. Without a token, anyone on the
-network can make those changes, and the UI says so. The same rules apply to the
-JSON API under `/api/`, which also requires an `X-Granary-Request` header on
-every change so other websites can't trigger them from your browser.
+## Sign-in and security
+
+- **Roles.** Admins can delete packages, change cleanup rules, run tasks,
+  invalidate caches and manage users. Viewers can browse and create their own
+  access tokens. The server enforces this; hidden buttons are a convenience.
+- **First admin.** On first start Granary creates `admin` with a random
+  password, printed once to the container log (never to the in-app log view).
+  Set `GRANARY_ADMIN_PASSWORD` to choose it instead. New users and resets get a
+  temporary password that must be changed at first sign-in.
+- **Passwords** are hashed with Argon2id and must be at least 12 characters.
+  Changing a password signs out the account's other sessions.
+- **Two-factor authentication** uses standard 6-digit codes (TOTP) from any
+  authenticator app. A code can't be used twice.
+- **Lockout.** Five wrong passwords or codes for one account within 15 minutes
+  lock it for 15 minutes. Wrong usernames and wrong passwords get the same
+  response and take the same time.
+- **Sessions** are HttpOnly, `SameSite=Strict` cookies that expire after
+  `GRANARY_SESSION_HOURS` of inactivity, stored in the local database so a
+  restart doesn't sign anyone out. They are marked `Secure` when
+  `GRANARY_PUBLIC_URL` is `https://`. Every change through the API also needs
+  an `X-Granary-Request` header, so other websites can't trigger actions from
+  your browser.
+- **Access tokens** are only shown when created. Granary stores a SHA-256
+  hash, so a copy of the database can't be used to download packages.
+  Disabling an account stops its tokens too.
+- **Locked out?** Reset a password from the server, optionally turning off
+  two-factor:
+
+  ```sh
+  docker compose exec granary granary reset-password admin --disable-2fa
+  ```
+
+Granary never contacts anything except the upstream registries it caches.
+There are no update checks, analytics, fonts or avatars from outside services.
 
 ![System page in dark mode](docs/system-dark.png)
 
@@ -124,7 +163,11 @@ All settings are environment variables.
 | `GRANARY_DATA_DIR` | `/data` in Docker, `./data` otherwise | Where the cache lives |
 | `GRANARY_PUBLIC_URL` | *(from request headers)* | Fixed external URL, e.g. `https://granary.lan`. Set it when clients reach Granary through a reverse proxy that doesn't send `X-Forwarded-Host` / `X-Forwarded-Proto` |
 | `GRANARY_META_TTL_SECS` | `300` | How long index/metadata responses are fresh before revalidation |
-| `GRANARY_ADMIN_TOKEN` | *(unset)* | Token required for deletes, cleanup and other changes in the UI and API. Strongly recommended |
+| `GRANARY_CLIENT_AUTH` | `required` | `required`: package downloads need an access token or a signed-in session. `off`: anyone who can reach Granary can download |
+| `GRANARY_ADMIN_USER` | `admin` | Username of the first admin, created when there are no users |
+| `GRANARY_ADMIN_PASSWORD` | *(generated)* | That admin's password (12+ characters). Only used on first start |
+| `GRANARY_SESSION_HOURS` | `12` | Sign people out after this many hours of inactivity |
+| `GRANARY_COOKIE_SECURE` | `true` if the public URL is HTTPS | Send the session cookie over HTTPS only |
 | `GRANARY_CARGO_INDEX` | `https://index.crates.io` | Upstream sparse index |
 | `GRANARY_CARGO_DL` | `https://static.crates.io/crates/{crate}/{version}/download` | Upstream crate download template |
 | `GRANARY_NPM_UPSTREAM` | `https://registry.npmjs.org` | Upstream npm registry |
@@ -158,11 +201,13 @@ place, so a crash never leaves a half-written package in the cache.
 /data
 ├── files/{cargo,npm,pypi}/…   immutable package files
 ├── meta/{cargo,npm,pypi}/…    cached metadata (*.body + *.json info)
-├── state/                     cleanup settings and last-download times
+├── state/                     users, tokens and sessions (granary.db),
+│                              cleanup settings, last-download times
 └── tmp/                       in-progress downloads (cleared at startup)
 ```
 
-Deleting anything under `files/` or `meta/` is safe; it will be re-fetched on
+Back up `state/`: it holds your accounts. Deleting anything under `files/` or
+`meta/` is safe; it will be re-fetched on
 demand. Last-download times start being recorded when you first run a version
 with the web UI; cleanup treats older files as last used on the day they were
 cached.
@@ -171,9 +216,9 @@ cached.
 
 - **Read-only.** There is no `cargo publish` / `npm publish` / `twine upload`
   yet; npm write requests are refused.
-- **One shared admin token, no user accounts.** Package downloads are not
-  authenticated, so run Granary on a trusted network or behind a reverse proxy
-  that handles auth and TLS.
+- **No single sign-on yet.** Accounts live in Granary itself; LDAP and OpenID
+  Connect aren't supported. Granary serves plain HTTP, so put it behind a
+  reverse proxy with TLS if it's reachable from untrusted networks.
 - **Single instance.** Granary stores everything on one local volume and isn't
   designed for running several replicas against shared storage.
 
@@ -182,7 +227,7 @@ cached.
 1. Docker / OCI registry proxy, including Docker Hub's token auth
 2. Hosted repositories: publish your own crates, npm packages and wheels
 3. Debian / apt proxy
-4. User accounts and per-repository permissions
+4. Optional OpenID Connect sign-in and per-repository permissions
 5. Prometheus metrics
 
 ## Development

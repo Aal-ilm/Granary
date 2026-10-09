@@ -64,27 +64,7 @@ const icons = {
   chevron: '<svg viewBox="0 0 10 10" aria-hidden="true"><path d="M3 1.5 6.5 5 3 8.5" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>',
 };
 
-// ------------------------------------------------------------ token & api
-
-const tokenStore = {
-  get() {
-    try {
-      return localStorage.getItem('granary.token') || '';
-    } catch {
-      return '';
-    }
-  },
-  set(v) {
-    try {
-      if (v) localStorage.setItem('granary.token', v);
-      else localStorage.removeItem('granary.token');
-    } catch {
-      /* storage unavailable: token lasts for this page only */
-    }
-    memoryToken = v;
-  },
-};
-let memoryToken = tokenStore.get();
+// ---------------------------------------------------------- session & api
 
 class ApiError extends Error {
   constructor(status, message) {
@@ -93,101 +73,188 @@ class ApiError extends Error {
   }
 }
 
+/** The signed-in user and server settings, from /api/auth/me. */
+let me = null;
+const isAdmin = () => me?.user?.role === 'admin';
+
 async function api(path, { method = 'GET', body } = {}) {
   const headers = { Accept: 'application/json' };
   if (method !== 'GET') headers['X-Granary-Request'] = '1';
-  if (memoryToken) headers.Authorization = 'Bearer ' + memoryToken;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   let res;
   try {
-    res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+    res = await fetch(path, {
+      method,
+      headers,
+      credentials: 'same-origin',
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
   } catch {
     throw new ApiError(0, 'Granary is not responding. Check that the server is running.');
   }
   if (!res.ok) {
     const text = (await res.text()).trim();
-    throw new ApiError(res.status, text ? text[0].toUpperCase() + text.slice(1) + '.' : `Request failed (HTTP ${res.status}).`);
+    const message = text ? text[0].toUpperCase() + text.slice(1) + '.' : `Request failed (HTTP ${res.status}).`;
+    if (res.status === 401 && !path.startsWith('/api/auth/') && me) showSignIn('Your session ended. Sign in again.');
+    if (res.status === 403 && /change your password/i.test(text)) showPasswordChange();
+    throw new ApiError(res.status, message);
   }
   return res.status === 204 ? null : res.json();
 }
 
-/** Run a change; if the server wants a token, ask for it once and retry. */
-async function act(fn) {
-  try {
-    return await fn();
-  } catch (e) {
-    if (e.status === 401 && (await askToken())) return await fn();
-    throw e;
-  }
+/** Kept as a seam for actions that change data. */
+const act = (fn) => fn();
+
+// ----------------------------------------------------------- sign-in screens
+
+function stopPage() {
+  cleanups.forEach((fn) => fn());
+  cleanups = [];
+  navToken++;
 }
 
-let auth = { required: false, valid: true };
-
-async function refreshAuth() {
-  try {
-    auth = await api('/api/auth');
-  } catch {
-    /* leave as is */
-  }
-  renderAccess();
+function hideShell() {
+  stopPage();
+  $('.shell').classList.add('hidden');
+  $('#auth').classList.remove('hidden');
 }
 
-function renderAccess() {
-  const el = $('#access');
-  if (!auth.required) {
-    el.innerHTML = '<span class="dot warn"></span><span>No admin token set</span>';
-    el.title = 'Anyone who can reach Granary can delete cached packages. Set GRANARY_ADMIN_TOKEN to require a token.';
-  } else if (auth.valid && memoryToken) {
-    el.innerHTML = '<span class="dot ok"></span><span>Admin unlocked</span> <button class="link" data-access="lock">Lock</button>';
-    el.title = '';
-  } else {
-    el.innerHTML = '<span class="dot"></span><span>Read-only</span> <button class="link" data-access="unlock">Unlock</button>';
-    el.title = 'Enter the admin token to delete packages or run tasks.';
-  }
+function showShell() {
+  $('#auth').classList.add('hidden');
+  $('#auth').innerHTML = '';
+  $('.shell').classList.remove('hidden');
+  document.body.dataset.role = me.user.role;
+  $('#userbox').innerHTML = `
+    <div><strong>${esc(me.user.username)}</strong> <span class="muted">${me.user.role === 'admin' ? 'Admin' : 'Viewer'}</span></div>
+    <div class="userlinks"><a href="#/account">Account</a><button class="link" data-signout>Sign out</button></div>`;
 }
 
-function askToken() {
-  const dlg = $('#token-dialog');
-  const input = $('#token-input');
-  const err = $('#token-err');
-  input.value = '';
-  err.classList.add('hidden');
-  dlg.showModal();
-  input.focus();
-  return new Promise((resolve) => {
-    const form = $('#token-form');
-    const onSubmit = async (e) => {
-      if (e.submitter && e.submitter.value !== 'ok') return;
-      e.preventDefault();
-      const candidate = input.value.trim();
-      if (!candidate) return;
-      const prev = memoryToken;
-      memoryToken = candidate;
-      let ok = false;
-      try {
-        ok = (await api('/api/auth')).valid;
-      } catch {
-        ok = false;
+const authCard = (inner) => `
+  <div class="auth-card panel">
+    <div class="auth-brand"><img src="/ui/icon.svg" alt=""><span>Granary</span></div>
+    ${inner}
+  </div>`;
+
+function showError(el, message) {
+  el.textContent = message;
+  el.classList.toggle('hidden', !message);
+}
+
+function showSignIn(notice = '') {
+  me = null;
+  hideShell();
+  $('#auth').innerHTML = authCard(`
+    <h1>Sign in</h1>
+    ${notice ? `<p class="auth-note">${esc(notice)}</p>` : ''}
+    <form id="signin" class="stack" novalidate>
+      <div class="field"><label for="si-user">Username</label>
+        <input id="si-user" type="text" autocomplete="username" autocapitalize="off" spellcheck="false"></div>
+      <div class="field"><label for="si-pass">Password</label>
+        <input id="si-pass" type="password" autocomplete="current-password"></div>
+      <div class="field hidden" id="si-code-row"><label for="si-code">Two-factor code</label>
+        <input id="si-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="9">
+        <p class="help">Enter the 6-digit code from your authenticator app.</p></div>
+      <p class="err hidden" id="si-err" role="alert"></p>
+      <button class="primary wide" type="submit">Sign in</button>
+    </form>`);
+  const form = $('#signin');
+  const err = $('#si-err');
+  $('#si-user').focus();
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const username = $('#si-user').value.trim();
+    const password = $('#si-pass').value;
+    const codeRow = $('#si-code-row');
+    const code = codeRow.classList.contains('hidden') ? undefined : $('#si-code').value.trim();
+    if (!username || !password) return showError(err, 'Enter your username and password.');
+    if (code !== undefined && !code) return showError(err, 'Enter the code from your authenticator app.');
+    const button = form.querySelector('button[type="submit"]');
+    button.disabled = true;
+    try {
+      const r = await api('/api/auth/login', { method: 'POST', body: { username, password, code } });
+      if (r.status === 'totp_required') {
+        showError(err, '');
+        codeRow.classList.remove('hidden');
+        $('#si-code').focus();
+        return;
       }
-      if (ok) {
-        tokenStore.set(candidate);
-        auth = { required: true, valid: true };
-        renderAccess();
-        dlg.close('ok');
-      } else {
-        memoryToken = prev;
-        err.classList.remove('hidden');
-        input.select();
-      }
-    };
-    const onClose = () => {
-      form.removeEventListener('submit', onSubmit);
-      resolve(dlg.returnValue === 'ok');
-    };
-    form.addEventListener('submit', onSubmit);
-    dlg.addEventListener('close', onClose, { once: true });
+      me = await api('/api/auth/me');
+      enter();
+    } catch (ex) {
+      showError(err, ex.message);
+      if (code !== undefined) $('#si-code').select();
+    } finally {
+      button.disabled = false;
+    }
   });
 }
+
+const passwordFields = (prefix, currentLabel) => `
+  <div class="field"><label for="${prefix}-current">${esc(currentLabel)}</label>
+    <input id="${prefix}-current" type="password" autocomplete="current-password"></div>
+  <div class="field"><label for="${prefix}-new">New password</label>
+    <input id="${prefix}-new" type="password" autocomplete="new-password">
+    <p class="help">At least ${esc(me?.min_password_length ?? 12)} characters. A few unrelated words make a strong, memorable password.</p></div>
+  <div class="field"><label for="${prefix}-confirm">Repeat new password</label>
+    <input id="${prefix}-confirm" type="password" autocomplete="new-password"></div>`;
+
+function bindPasswordForm(form, prefix, onDone) {
+  const err = $(`#${prefix}-err`, form);
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const current = $(`#${prefix}-current`, form).value;
+    const next = $(`#${prefix}-new`, form).value;
+    if (!current) return showError(err, 'Enter your current password.');
+    if (next.length < (me?.min_password_length ?? 12)) return showError(err, `Use at least ${me?.min_password_length ?? 12} characters.`);
+    if (next !== $(`#${prefix}-confirm`, form).value) return showError(err, 'The new passwords don’t match.');
+    try {
+      const r = await api('/api/account/password', { method: 'POST', body: { current, new: next } });
+      me.user = r.user;
+      form.reset();
+      showError(err, '');
+      onDone();
+    } catch (ex) {
+      showError(err, ex.message);
+    }
+  });
+}
+
+function showPasswordChange() {
+  hideShell();
+  $('#auth').innerHTML = authCard(`
+    <h1>Choose a new password</h1>
+    <p class="auth-note">You signed in with a temporary password. Choose your own to continue.</p>
+    <form id="pw-form" class="stack" novalidate>
+      ${passwordFields('fp', 'Temporary password')}
+      <p class="err hidden" id="fp-err" role="alert"></p>
+      <button class="primary wide" type="submit">Save password</button>
+    </form>
+    <button class="link signout-link" data-signout>Sign out</button>`);
+  $('#fp-current').focus();
+  bindPasswordForm($('#pw-form'), 'fp', () => {
+    toast('Password saved');
+    enter();
+  });
+}
+
+function enter() {
+  if (me.user.must_change_password) return showPasswordChange();
+  showShell();
+  route();
+}
+
+async function signOut() {
+  try {
+    await api('/api/auth/logout', { method: 'POST' });
+  } catch {
+    /* signed out either way */
+  }
+  showSignIn('You signed out.');
+}
+
+/** Show a one-time secret (password or token) with a copy button. */
+const reveal = (value) => `
+  <div class="reveal"><code>${esc(value)}</code><button class="small" type="button" data-copy="${esc(value)}">Copy</button></div>`;
 
 function confirmAction({ title, body, ok }) {
   const dlg = $('#confirm-dialog');
@@ -270,9 +337,13 @@ const routes = [
   [/^\/tasks$/, 'tasks', renderTasks],
   [/^\/system$/, 'system', renderSystem],
   [/^\/logs$/, 'logs', renderLogs],
+  [/^\/account$/, 'account', renderAccount],
+  [/^\/tokens$/, 'tokens', renderTokens],
+  [/^\/users$/, 'users', renderUsers],
 ];
 
 async function route() {
+  if (!me) return;
   cleanups.forEach((fn) => fn());
   cleanups = [];
   const token = ++navToken;
@@ -414,7 +485,7 @@ async function renderRepos({ isCurrent }) {
           </div>
           <div class="page-actions">
             <a class="btn" href="#/browse/${r.id}">Browse</a>
-            <button data-invalidate="${r.id}" data-name="${esc(r.name)}">Invalidate cache</button>
+            <button class="admin-only" data-invalidate="${r.id}" data-name="${esc(r.name)}">Invalidate cache</button>
           </div>
         </div>
         <dl class="repo-grid">
@@ -427,7 +498,8 @@ async function renderRepos({ isCurrent }) {
         <details class="setup">
           <summary>Client setup</summary>
           <div class="snippet"><pre>${esc(r.setup.snippet)}</pre><button class="small" data-copy="${esc(r.setup.snippet)}">Copy</button></div>
-          <div class="snippet-file">Add to ${esc(r.setup.file)}</div>
+          <div class="snippet-file">Add to ${esc(r.setup.file)}${d.client_auth ? '. Replace YOUR_TOKEN with a token from <a href="#/tokens">Access tokens</a>.' : ''}</div>
+          ${r.setup.after ? `<div class="snippet-file">${esc(r.setup.after)}</div>` : ''}
         </details>
       </article>`;
     })
@@ -440,8 +512,6 @@ async function renderRepos({ isCurrent }) {
     <div class="panel">${blocks}</div>`);
 
   view().addEventListener('click', async (e) => {
-    const copy = e.target.closest('[data-copy]');
-    if (copy) return copyText(copy.dataset.copy, copy);
     const inv = e.target.closest('[data-invalidate]');
     if (!inv) return;
     const ok = await confirmAction({
@@ -599,7 +669,7 @@ async function renderComponent({ params, isCurrent }) {
       const single = v.files.length === 1 ? v.files[0] : null;
       const actions = single
         ? `<a class="btn small" href="${esc(single.download)}" download>Download</a>
-           <button class="small danger" data-delete-file="${esc(single.path)}" data-label="${esc(single.file_name)}">Delete</button>`
+           <button class="small danger admin-only" data-delete-file="${esc(single.path)}" data-label="${esc(single.file_name)}">Delete</button>`
         : '';
       const versionCell = single
         ? `<span class="mono">${esc(v.version)}</span>`
@@ -614,7 +684,7 @@ async function renderComponent({ params, isCurrent }) {
                 <td class="hide-sm">${timeTag(f.cached_at)}</td>
                 <td>${timeTag(f.last_access)}</td>
                 <td class="actions"><a class="btn small" href="${esc(f.download)}" download>Download</a>
-                  <button class="small danger" data-delete-file="${esc(f.path)}" data-label="${esc(f.file_name)}">Delete</button></td>
+                  <button class="small danger admin-only" data-delete-file="${esc(f.path)}" data-label="${esc(f.file_name)}">Delete</button></td>
               </tr>`
             )
             .join('')}</tbody></table></td></tr>`;
@@ -641,7 +711,7 @@ async function renderComponent({ params, isCurrent }) {
           ${d.upstream ? `<a href="${esc(d.upstream.url)}" target="_blank" rel="noopener noreferrer">View on ${esc(d.upstream.label)}</a>` : ''}
         </div>
       </div>
-      <div class="page-actions"><button class="danger" data-delete-package>Delete package</button></div>
+      <div class="page-actions admin-only"><button class="danger" data-delete-package>Delete package</button></div>
     </div>
     <div class="panel table-wrap"><table>
       <thead><tr><th>Version</th><th class="r">Files</th><th class="r">Size</th><th class="hide-sm">Cached</th><th>Last downloaded</th><th class="r"><span class="sr-only">Actions</span></th></tr></thead>
@@ -707,7 +777,6 @@ async function renderCleanup({ isCurrent }) {
     <div class="page-head">
       <div><h1>Cleanup</h1><p>Remove packages your builds no longer use. Anything removed is downloaded again if a client asks for it later.</p></div>
     </div>
-    ${auth.required ? '' : `<div class="banner"><span class="dot warn"></span><span>Anyone who can reach this page can delete cached packages. Set <code>GRANARY_ADMIN_TOKEN</code> to require a token.</span></div>`}
     <form class="panel panel-pad" id="policy" novalidate>
       <div class="form-grid">
         <div class="label">Schedule</div>
@@ -727,9 +796,9 @@ async function renderCleanup({ isCurrent }) {
       </div>
       <p class="err hidden" id="policy-err" role="alert"></p>
       <div class="form-actions">
-        <button class="primary" type="submit">Save policy</button>
+        <button class="primary admin-only" type="submit">Save policy</button>
         <button type="button" data-preview>Preview</button>
-        <button type="button" class="danger" data-run>Run cleanup now</button>
+        <button type="button" class="danger admin-only" data-run>Run cleanup now</button>
       </div>
       <div id="cleanup-result"></div>
     </form>
@@ -833,7 +902,7 @@ async function renderTasks({ isCurrent }) {
           <td>${timeTag(t.last_run)}${t.last_duration_ms != null ? `<div class="muted num nowrap">took ${t.last_duration_ms < 1000 ? t.last_duration_ms + ' ms' : (t.last_duration_ms / 1000).toFixed(1) + ' s'}</div>` : ''}</td>
           <td>${result}</td>
           <td>${t.next_run ? timeTag(t.next_run) : '<span class="muted">-</span>'}</td>
-          <td class="actions"><button class="small" data-run-task="${t.id}" data-name="${esc(t.name)}" ${t.running ? 'disabled' : ''}>Run now</button></td>
+          <td class="actions"><button class="small admin-only" data-run-task="${t.id}" data-name="${esc(t.name)}" ${t.running ? 'disabled' : ''}>Run now</button></td>
         </tr>`;
       })
       .join('');
@@ -896,7 +965,7 @@ async function renderSystem({ isCurrent }) {
   setView(`
     <div class="page-head">
       <div><h1>System</h1><p>Granary ${esc(d.version)}, running for ${esc(duration(d.uptime_secs))}.</p></div>
-      <div class="page-actions"><button data-check>Check upstreams now</button></div>
+      <div class="page-actions admin-only"><button data-check>Check upstreams now</button></div>
     </div>
     <section>
       <h2>Upstream registries</h2>
@@ -987,11 +1056,330 @@ async function renderLogs({ query, isCurrent }) {
   onLeave(() => clearInterval(timer));
 }
 
+// ----------------------------------------------------------------- account
+
+async function renderAccount({ isCurrent }) {
+  me = await api('/api/auth/me');
+  if (!isCurrent()) return;
+  const u = me.user;
+  setView(`
+    <div class="page-head"><div><h1>Account</h1><p>Signed in as <strong>${esc(u.username)}</strong>, ${u.role === 'admin' ? 'an admin' : 'a viewer'}.</p></div></div>
+    <section>
+      <h2>Password</h2>
+      <form class="panel panel-pad narrow stack" id="acct-pw" novalidate>
+        ${passwordFields('ap', 'Current password')}
+        <p class="err hidden" id="ap-err" role="alert"></p>
+        <div><button class="primary" type="submit">Change password</button></div>
+      </form>
+    </section>
+    <section>
+      <h2>Two-factor authentication</h2>
+      <div class="panel panel-pad narrow" id="tfa"></div>
+    </section>`);
+
+  bindPasswordForm($('#acct-pw'), 'ap', () => toast('Password changed. Other devices were signed out.'));
+
+  const tfa = $('#tfa');
+  const drawOff = () => {
+    tfa.innerHTML = `
+      <p class="status"><span class="dot"></span>Off</p>
+      <p class="muted">Ask for a code from an authenticator app (such as Aegis, 2FAS or Bitwarden) whenever you sign in.</p>
+      <button data-tfa-setup>Set up two-factor</button>`;
+  };
+  const drawOn = () => {
+    tfa.innerHTML = `
+      <p class="status"><span class="dot ok"></span>On</p>
+      <p class="muted">You enter a code from your authenticator app each time you sign in.</p>
+      <form class="stack" id="tfa-off" novalidate>
+        <div class="field"><label for="tfa-pw">Password</label><input id="tfa-pw" type="password" autocomplete="current-password"></div>
+        <p class="err hidden" id="tfa-off-err" role="alert"></p>
+        <div><button class="danger" type="submit">Turn off two-factor</button></div>
+      </form>`;
+    $('#tfa-off').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try {
+        await api('/api/account/2fa/disable', { method: 'POST', body: { password: $('#tfa-pw').value } });
+        toast('Two-factor authentication turned off');
+        drawOff();
+      } catch (ex) {
+        showError($('#tfa-off-err'), ex.message);
+      }
+    });
+  };
+  (u.totp_enabled ? drawOn : drawOff)();
+
+  tfa.addEventListener('click', async (e) => {
+    if (!e.target.closest('[data-tfa-setup]')) return;
+    try {
+      const r = await api('/api/account/2fa/setup', { method: 'POST' });
+      tfa.innerHTML = `
+        <p>Scan this code with your authenticator app, then enter the 6-digit code it shows.</p>
+        <div class="tfa-setup">
+          <img class="qr" src="${esc(r.qr)}" alt="QR code for your authenticator app">
+          <div class="stack">
+            <div class="field"><span class="label">Or enter this key by hand</span>${reveal(r.secret)}</div>
+            <form class="stack" id="tfa-on" novalidate>
+              <div class="field"><label for="tfa-code">Code from the app</label>
+                <input id="tfa-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="9"></div>
+              <p class="err hidden" id="tfa-on-err" role="alert"></p>
+              <div><button class="primary" type="submit">Turn on two-factor</button></div>
+            </form>
+          </div>
+        </div>`;
+      $('#tfa-code').focus();
+      $('#tfa-on').addEventListener('submit', async (ev) => {
+        ev.preventDefault();
+        try {
+          await api('/api/account/2fa/enable', { method: 'POST', body: { code: $('#tfa-code').value } });
+          toast('Two-factor authentication is on');
+          drawOn();
+        } catch (ex) {
+          showError($('#tfa-on-err'), ex.message);
+        }
+      });
+    } catch (ex) {
+      toast(ex.message, 'error');
+    }
+  });
+}
+
+// ------------------------------------------------------------ access tokens
+
+const EXPIRY_OPTIONS = [
+  ['90', '90 days'],
+  ['30', '30 days'],
+  ['365', '1 year'],
+  ['0', 'Never'],
+];
+
+function expiryText(t) {
+  if (!t.expires_at) return '<span class="muted">Never</span>';
+  if (t.expires_at * 1000 < Date.now()) return '<span class="status"><span class="dot bad"></span>Expired</span>';
+  return timeTag(t.expires_at);
+}
+
+async function renderTokens({ query, isCurrent }) {
+  const all = isAdmin() && query.get('all') === '1';
+  const [d, repos] = await Promise.all([api('/api/tokens' + (all ? '?all=true' : '')), api('/api/repos')]);
+  if (!isCurrent()) return;
+
+  const tokenRows = (tokens) => tokens
+    .map(
+      (t) => `<tr>
+        <td><strong>${esc(t.name)}</strong></td>
+        ${all ? `<td>${esc(t.username)}</td>` : ''}
+        <td class="mono">${esc(t.hint)}</td>
+        <td>${timeTag(t.created_at)}</td>
+        <td>${timeTag(t.last_used)}</td>
+        <td>${expiryText(t)}</td>
+        <td class="actions"><button class="small danger" data-revoke="${t.id}" data-name="${esc(t.name)}">Revoke</button></td>
+      </tr>`
+    )
+    .join('');
+  const tokenList = (tokens) => tokens.length
+    ? `<div class="table-wrap"><table><thead><tr><th>Name</th>${all ? '<th>Owner</th>' : ''}<th>Token</th><th>Created</th><th>Last used</th><th>Expires</th><th class="r"><span class="sr-only">Actions</span></th></tr></thead><tbody>${tokenRows(tokens)}</tbody></table></div>`
+    : '<div class="empty"><strong>No tokens yet</strong>Create one above for each machine that installs packages.</div>';
+
+  setView(`
+    <div class="page-head">
+      <div><h1>Access tokens</h1>
+      <p>Cargo, npm and pip use a token to download through Granary. Make one per machine so you can revoke it on its own.</p></div>
+      ${isAdmin() ? `<div class="page-actions"><nav class="seg" aria-label="Whose tokens">
+        <a href="#/tokens" aria-current="${!all}">Mine</a><a href="#/tokens?all=1" aria-current="${all}">Everyone's</a></nav></div>` : ''}
+    </div>
+    ${me.client_auth ? '' : `<div class="banner"><span class="dot warn"></span><span>Package downloads don't need a token right now, because <code>GRANARY_CLIENT_AUTH</code> is off.</span></div>`}
+    <form class="panel panel-pad" id="new-token" novalidate>
+      <div class="inline-form">
+        <div class="field grow"><label for="tk-name">Name</label><input id="tk-name" type="text" maxlength="80" placeholder="e.g. build server, work laptop"></div>
+        <div class="field"><label for="tk-exp">Expires</label><select id="tk-exp">${EXPIRY_OPTIONS.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select></div>
+        <div class="field"><span class="label">&nbsp;</span><button class="primary" type="submit">Create token</button></div>
+      </div>
+      <p class="err hidden" id="tk-err" role="alert"></p>
+      <div id="tk-result"></div>
+    </form>
+    <section>
+      <h2>${all ? 'All tokens' : 'Your tokens'}</h2>
+      <div class="panel" id="tk-list">${tokenList(d.tokens)}</div>
+    </section>`);
+
+  $('#new-token').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const name = $('#tk-name').value.trim();
+    if (!name) return showError($('#tk-err'), 'Give the token a name so you can recognise it later.');
+    try {
+      const r = await api('/api/tokens', { method: 'POST', body: { name, expires_days: Number($('#tk-exp').value) } });
+      showError($('#tk-err'), '');
+      const snippets = repos.repos
+        .map((repo) => {
+          const snippet = repo.setup.snippet.replaceAll('YOUR_TOKEN', r.token);
+          const after = repo.setup.after ? `<p class="snippet-file">${esc(repo.setup.after)}</p>` : '';
+          return `<div class="setup-block"><div class="snippet-file">${chip(repo.id)} Add to ${esc(repo.setup.file)}</div>
+            <div class="snippet"><pre>${esc(snippet)}</pre><button class="small" type="button" data-copy="${esc(snippet)}">Copy</button></div>${after}</div>`;
+        })
+        .join('');
+      $('#tk-result').innerHTML = `
+        <div class="result">
+          <strong>Copy this token now. Granary only shows it once.</strong>
+          ${reveal(r.token)}
+          <details class="setup" open><summary>Client setup with this token</summary>${snippets}</details>
+        </div>`;
+      $('#tk-name').value = '';
+      const fresh = await api('/api/tokens' + (all ? '?all=true' : ''));
+      $('#tk-list').innerHTML = tokenList(fresh.tokens);
+    } catch (ex) {
+      showError($('#tk-err'), ex.message);
+    }
+  });
+
+  view().addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-revoke]');
+    if (!b) return;
+    const ok = await confirmAction({
+      title: `Revoke ${b.dataset.name}?`,
+      body: 'Anything using this token stops being able to download packages right away.',
+      ok: 'Revoke token',
+    });
+    if (!ok) return;
+    try {
+      await api(`/api/tokens/${b.dataset.revoke}`, { method: 'DELETE' });
+      toast(`Revoked ${b.dataset.name}`);
+      route();
+    } catch (ex) {
+      toast(ex.message, 'error');
+    }
+  });
+}
+
+// -------------------------------------------------------------------- users
+
+async function renderUsers({ isCurrent }) {
+  const d = await api('/api/users');
+  if (!isCurrent()) return;
+  const rows = d.users
+    .map((u) => {
+      const self = u.id === me.user.id;
+      return `<tr>
+        <td><strong>${esc(u.username)}</strong>${self ? ' <span class="muted">(you)</span>' : ''}</td>
+        <td><label class="sr-only" for="role-${u.id}">Role for ${esc(u.username)}</label>
+          <select id="role-${u.id}" data-role-for="${u.id}" data-name="${esc(u.username)}">
+            <option value="admin" ${u.role === 'admin' ? 'selected' : ''}>Admin</option>
+            <option value="viewer" ${u.role === 'viewer' ? 'selected' : ''}>Viewer</option>
+          </select></td>
+        <td>${u.totp_enabled ? '<span class="status"><span class="dot ok"></span>On</span>' : '<span class="muted">Off</span>'}</td>
+        <td>${timeTag(u.last_login)}</td>
+        <td class="r num">${esc(count(u.tokens))}</td>
+        <td>${u.disabled ? '<span class="status"><span class="dot bad"></span>Disabled</span>' : u.must_change_password ? '<span class="status"><span class="dot warn"></span>Temporary password</span>' : '<span class="status"><span class="dot ok"></span>Active</span>'}</td>
+        <td class="actions">
+          <button class="small" data-user-action="reset-password" data-id="${u.id}" data-name="${esc(u.username)}">Reset password</button>
+          ${u.totp_enabled ? `<button class="small" data-user-action="reset-2fa" data-id="${u.id}" data-name="${esc(u.username)}">Turn off 2FA</button>` : ''}
+          ${self ? '' : `<button class="small" data-user-action="${u.disabled ? 'enable' : 'disable'}" data-id="${u.id}" data-name="${esc(u.username)}">${u.disabled ? 'Enable' : 'Disable'}</button>
+          <button class="small danger" data-user-action="delete" data-id="${u.id}" data-name="${esc(u.username)}">Delete</button>`}
+        </td>
+      </tr>`;
+    })
+    .join('');
+
+  setView(`
+    <div class="page-head"><div><h1>Users</h1><p>Admins can delete packages, change settings and manage users. Viewers can browse and make their own access tokens.</p></div></div>
+    <form class="panel panel-pad" id="new-user" novalidate>
+      <div class="inline-form">
+        <div class="field grow"><label for="nu-name">Username</label><input id="nu-name" type="text" autocapitalize="off" spellcheck="false" maxlength="64"></div>
+        <div class="field"><label for="nu-role">Role</label><select id="nu-role"><option value="viewer">Viewer</option><option value="admin">Admin</option></select></div>
+        <div class="field"><span class="label">&nbsp;</span><button class="primary" type="submit">Add user</button></div>
+      </div>
+      <p class="err hidden" id="nu-err" role="alert"></p>
+      <div id="nu-result"></div>
+    </form>
+    <section>
+      <div class="panel table-wrap"><table>
+        <thead><tr><th>User</th><th>Role</th><th>Two-factor</th><th>Last sign-in</th><th class="r">Tokens</th><th>Status</th><th class="r"><span class="sr-only">Actions</span></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+    </section>`);
+
+  const showTemp = (name, password) => {
+    $('#nu-result').innerHTML = `<div class="result"><strong>Give ${esc(name)} this temporary password.</strong>
+      <p class="muted">They'll choose their own the first time they sign in. Granary only shows it once.</p>${reveal(password)}</div>`;
+    $('#nu-result').scrollIntoView({ block: 'nearest' });
+  };
+
+  $('#new-user').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const username = $('#nu-name').value.trim();
+    if (!username) return showError($('#nu-err'), 'Enter a username.');
+    try {
+      const r = await api('/api/users', { method: 'POST', body: { username, role: $('#nu-role').value } });
+      showError($('#nu-err'), '');
+      await renderUsers({ isCurrent });
+      showTemp(r.username, r.password);
+    } catch (ex) {
+      showError($('#nu-err'), ex.message);
+    }
+  });
+
+  view().addEventListener('change', async (e) => {
+    const sel = e.target.closest('[data-role-for]');
+    if (!sel) return;
+    try {
+      await api(`/api/users/${sel.dataset.roleFor}`, { method: 'PATCH', body: { role: sel.value } });
+      toast(`${sel.dataset.name} is now ${sel.value === 'admin' ? 'an admin' : 'a viewer'}`);
+      if (Number(sel.dataset.roleFor) === me.user.id) {
+        me = await api('/api/auth/me');
+        showShell();
+      }
+      route();
+    } catch (ex) {
+      toast(ex.message, 'error');
+      route();
+    }
+  });
+
+  view().addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-user-action]');
+    if (!b) return;
+    const { id, name } = b.dataset;
+    const action = b.dataset.userAction;
+    const prompts = {
+      'reset-password': [`Reset ${name}'s password?`, 'Their current password stops working and Granary shows you a temporary one to give them.', 'Reset password'],
+      'reset-2fa': [`Turn off two-factor for ${name}?`, 'Use this if they lost their authenticator app. They can set it up again from their account page.', 'Turn off 2FA'],
+      disable: [`Disable ${name}?`, 'They are signed out and their access tokens stop working until you enable the account again.', 'Disable account'],
+      delete: [`Delete ${name}?`, 'This removes the account and all of its access tokens. It can’t be undone.', 'Delete user'],
+    };
+    if (prompts[action]) {
+      const [title, body, ok] = prompts[action];
+      if (!(await confirmAction({ title, body, ok }))) return;
+    }
+    try {
+      if (action === 'reset-password') {
+        const r = await api(`/api/users/${id}/reset-password`, { method: 'POST' });
+        showTemp(r.username, r.password);
+        return;
+      }
+      if (action === 'reset-2fa') await api(`/api/users/${id}/reset-2fa`, { method: 'POST' });
+      if (action === 'disable' || action === 'enable') await api(`/api/users/${id}`, { method: 'PATCH', body: { disabled: action === 'disable' } });
+      if (action === 'delete') await api(`/api/users/${id}`, { method: 'DELETE' });
+      const done = { 'reset-2fa': 'Turned off two-factor for', disable: 'Disabled', enable: 'Enabled', delete: 'Deleted' };
+      toast(`${done[action]} ${name}`);
+      route();
+    } catch (ex) {
+      toast(ex.message, 'error');
+    }
+  });
+}
+
 // -------------------------------------------------------------------- boot
 
-window.addEventListener('hashchange', route);
+window.addEventListener('hashchange', () => {
+  if (me && !me.user.must_change_password) route();
+});
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('click', (e) => {
+  if (e.target.closest('[data-signout]')) signOut();
+  const copy = e.target.closest('[data-copy]');
+  if (copy) copyText(copy.dataset.copy, copy);
+});
+
+document.addEventListener('DOMContentLoaded', async () => {
   $('#search-form').addEventListener('submit', (e) => {
     e.preventDefault();
     const q = $('#global-search').value.trim();
@@ -1000,28 +1388,22 @@ document.addEventListener('DOMContentLoaded', () => {
     location.hash = '#/browse' + (q ? '?' + qs : '');
   });
 
-  $('#token-cancel').addEventListener('click', () => $('#token-dialog').close('cancel'));
-
-  $('#access').addEventListener('click', async (e) => {
-    const b = e.target.closest('[data-access]');
-    if (!b) return;
-    if (b.dataset.access === 'lock') {
-      tokenStore.set('');
-      await refreshAuth();
-      toast('Admin locked in this browser');
-    } else if (await askToken()) {
-      toast('Admin unlocked');
-    }
-  });
-
   document.addEventListener('keydown', (e) => {
     const typing = /^(input|textarea|select)$/i.test(document.activeElement?.tagName || '');
-    if (e.key === '/' && !typing && !e.metaKey && !e.ctrlKey && !$('dialog[open]')) {
+    if (e.key === '/' && me && !typing && !e.metaKey && !e.ctrlKey && !$('dialog[open]')) {
       e.preventDefault();
       $('#global-search').focus();
     }
   });
 
-  refreshAuth();
-  route();
+  try {
+    me = await api('/api/auth/me');
+    enter();
+  } catch (e) {
+    if (e.status === 401) showSignIn();
+    else {
+      $('#auth').classList.remove('hidden');
+      $('#auth').innerHTML = authCard(`<h1>Granary is unavailable</h1><p class="auth-note">${esc(e.message)}</p>`);
+    }
+  }
 });

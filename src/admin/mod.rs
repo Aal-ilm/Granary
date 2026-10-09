@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AppState,
+    auth::SqliteSessionStore,
     config::Config,
     inventory::{self, Asset, REPOS},
     logbuf::LogBuffer,
@@ -233,6 +234,13 @@ impl Admin {
                 "Writes the last-downloaded time of each package to disk.",
                 30,
                 30,
+            ),
+            task(
+                "sessions",
+                "Remove expired sign-ins",
+                "Deletes sessions that have timed out.",
+                3600,
+                60,
             ),
         ];
         Ok(Self {
@@ -498,6 +506,10 @@ fn short_error(e: &reqwest::Error) -> String {
 
 /// Run one task now. Returns false if it was already running or is unknown.
 pub async fn run_task(st: &AppState, id: &str) -> bool {
+    run_task_with(st, id, None).await
+}
+
+async fn run_task_with(st: &AppState, id: &str, sessions: Option<&SqliteSessionStore>) -> bool {
     {
         let mut tasks = st.admin.tasks.lock().unwrap();
         let Some(t) = tasks.iter_mut().find(|t| t.id == id) else {
@@ -531,6 +543,15 @@ pub async fn run_task(st: &AppState, id: &str) -> bool {
                 format!("{up} of {} upstreams reachable", r.len()),
             )
         }
+        "sessions" => {
+            let store = sessions
+                .cloned()
+                .unwrap_or_else(|| SqliteSessionStore::new(st.auth.db.clone()));
+            match store.delete_expired().await {
+                Ok(n) => (true, format!("Removed {n} expired sign-ins")),
+                Err(e) => (false, format!("Could not clean up sessions: {e}")),
+            }
+        }
         "flush" => match st.store.flush_access().await {
             Ok(true) => (true, "Saved".into()),
             Ok(false) => (true, "Nothing new to save".into()),
@@ -552,7 +573,7 @@ pub async fn run_task(st: &AppState, id: &str) -> bool {
 }
 
 /// Background loop that runs due tasks.
-pub fn spawn_scheduler(st: AppState) {
+pub fn spawn_scheduler(st: AppState, sessions: SqliteSessionStore) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         loop {
@@ -569,8 +590,9 @@ pub fn spawn_scheduler(st: AppState) {
                 .collect();
             for id in due {
                 let st = st.clone();
+                let sessions = sessions.clone();
                 tokio::spawn(async move {
-                    run_task(&st, id).await;
+                    run_task_with(&st, id, Some(&sessions)).await;
                 });
             }
         }

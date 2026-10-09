@@ -1,13 +1,13 @@
-//! JSON API used by the web UI. Reads are open; anything that changes or
-//! deletes data requires the `X-Granary-Request` header (which blocks
-//! cross-site form posts) and, if configured, the admin token.
+//! JSON API used by the web UI. Every route needs a signed-in session
+//! (enforced by `auth::api_guard`); anything that changes or deletes data
+//! also needs the admin role.
 
 use std::{cmp::Ordering, collections::BTreeMap, sync::atomic::Ordering as AtomicOrdering};
 
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{CleanupPolicy, check_upstreams, cleanup, disk_info, run_task};
+use crate::auth::{AuthSession, require_admin};
 use crate::{
     AppState,
     error::{AppError, AppResult},
@@ -25,7 +26,6 @@ use crate::{
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/auth", get(auth_status))
         .route("/api/overview", get(overview))
         .route("/api/repos", get(repos))
         .route("/api/repos/{repo}/invalidate", post(invalidate))
@@ -43,46 +43,6 @@ pub fn router() -> Router<AppState> {
 }
 
 // -------------------------------------------------------------------- auth
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-fn token_valid(st: &AppState, headers: &HeaderMap) -> bool {
-    let Some(expected) = &st.cfg.admin_token else {
-        return true;
-    };
-    let given = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim);
-    given.is_some_and(|g| constant_time_eq(g.as_bytes(), expected.as_bytes()))
-}
-
-/// Guard for every request that changes data.
-fn require_admin(st: &AppState, headers: &HeaderMap) -> AppResult<()> {
-    if !headers.contains_key("x-granary-request") {
-        return Err(AppError::new(
-            StatusCode::FORBIDDEN,
-            "missing X-Granary-Request header",
-        ));
-    }
-    if !token_valid(st, headers) {
-        return Err(AppError::new(
-            StatusCode::UNAUTHORIZED,
-            "an admin token is required for this action",
-        ));
-    }
-    Ok(())
-}
-
-async fn auth_status(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
-    Json(json!({
-        "required": st.cfg.admin_token.is_some(),
-        "valid": token_valid(&st, &headers),
-    }))
-}
 
 fn repo_id(s: &str) -> AppResult<&'static str> {
     REPOS
@@ -161,7 +121,6 @@ async fn overview(State(st): State<AppState>) -> Json<Value> {
         "disk": disk,
         "health": health,
         "recent": recent,
-        "auth_required": st.cfg.admin_token.is_some(),
     }))
 }
 
@@ -169,6 +128,9 @@ async fn overview(State(st): State<AppState>) -> Json<Value> {
 
 async fn repos(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
     let base = base_url(&st.cfg, &headers);
+    let (scheme, host) = base.split_once("://").unwrap_or(("http", &base));
+    let (scheme, host) = (scheme.to_string(), host.to_string());
+    let auth = st.cfg.client_auth;
     let inv = st.admin.inventory(&st.store).await;
     let usage = usage(&st, &inv).await;
     let health = st.admin.health.lock().unwrap().clone();
@@ -187,10 +149,18 @@ async fn repos(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
                         json!({"label": "Index", "url": cfg.cargo_index}),
                         json!({"label": "Downloads", "url": cfg.cargo_dl}),
                     ],
-                    json!({
-                        "file": "~/.cargo/config.toml",
-                        "snippet": format!("[source.crates-io]\nreplace-with = \"granary\"\n\n[source.granary]\nregistry = \"sparse+{base}/cargo/\""),
-                    }),
+                    if auth {
+                        json!({
+                            "file": "~/.cargo/config.toml",
+                            "snippet": format!("[registries.granary]\nindex = \"sparse+{base}/cargo/\"\ncredential-provider = \"cargo:token\"\n\n[source.crates-io]\nreplace-with = \"granary\""),
+                            "after": "Then run cargo login --registry granary and paste your token.",
+                        })
+                    } else {
+                        json!({
+                            "file": "~/.cargo/config.toml",
+                            "snippet": format!("[source.crates-io]\nreplace-with = \"granary\"\n\n[source.granary]\nregistry = \"sparse+{base}/cargo/\""),
+                        })
+                    },
                 ),
                 "npm" => (
                     "registry.npmjs.org",
@@ -199,7 +169,11 @@ async fn repos(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
                     vec![json!({"label": "Registry", "url": cfg.npm_upstream})],
                     json!({
                         "file": "~/.npmrc or a project .npmrc",
-                        "snippet": format!("registry={base}/npm/"),
+                        "snippet": if auth {
+                            format!("registry={base}/npm/\n//{host}/npm/:_authToken=YOUR_TOKEN")
+                        } else {
+                            format!("registry={base}/npm/")
+                        },
                     }),
                 ),
                 _ => (
@@ -212,7 +186,11 @@ async fn repos(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
                     ],
                     json!({
                         "file": "pip.conf (or UV_INDEX_URL for uv)",
-                        "snippet": format!("[global]\nindex-url = {base}/pypi/simple/"),
+                        "snippet": if auth {
+                            format!("[global]\nindex-url = {scheme}://__token__:YOUR_TOKEN@{host}/pypi/simple/")
+                        } else {
+                            format!("[global]\nindex-url = {base}/pypi/simple/")
+                        },
                     }),
                 ),
             };
@@ -232,15 +210,15 @@ async fn repos(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
             })
         })
         .collect();
-    Json(json!({ "base_url": base, "repos": list }))
+    Json(json!({ "base_url": base, "client_auth": auth, "repos": list }))
 }
 
 async fn invalidate(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    auth: AuthSession,
     Path(repo): Path<String>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&st, &headers)?;
+    require_admin(&auth)?;
     let repo = repo_id(&repo)?;
     let freed = st.store.invalidate_meta(repo).await?;
     tracing::info!("{repo}: metadata cache invalidated");
@@ -443,10 +421,10 @@ async fn component(
 
 async fn delete_component(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    auth: AuthSession,
     Query(q): Query<ComponentQuery>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&st, &headers)?;
+    require_admin(&auth)?;
     let repo = repo_id(&q.repo)?;
     let inv = st.admin.inventory(&st.store).await;
     let paths: Vec<String> = inv
@@ -481,10 +459,10 @@ struct AssetQuery {
 
 async fn delete_asset(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    auth: AuthSession,
     Query(q): Query<AssetQuery>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&st, &headers)?;
+    require_admin(&auth)?;
     let repo = repo_id(&q.repo)?;
     let freed = st.store.delete_file(repo, &q.path).await?;
     st.admin.invalidate_inventory();
@@ -517,10 +495,10 @@ fn validate_policy(p: &CleanupPolicy) -> AppResult<()> {
 
 async fn cleanup_put(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    auth: AuthSession,
     Json(policy): Json<CleanupPolicy>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&st, &headers)?;
+    require_admin(&auth)?;
     validate_policy(&policy)?;
     st.admin.settings.lock().unwrap().cleanup = policy.clone();
     st.admin.save_settings().await?;
@@ -551,8 +529,8 @@ async fn cleanup_preview(
     Ok(Json(json!(cleanup(&st, &policy, true).await)))
 }
 
-async fn cleanup_run(State(st): State<AppState>, headers: HeaderMap) -> AppResult<Response> {
-    require_admin(&st, &headers)?;
+async fn cleanup_run(State(st): State<AppState>, auth: AuthSession) -> AppResult<Response> {
+    require_admin(&auth)?;
     if !run_task(&st, "cleanup").await {
         return Err(AppError::new(
             StatusCode::CONFLICT,
@@ -571,10 +549,10 @@ async fn tasks(State(st): State<AppState>) -> Json<Value> {
 
 async fn task_run(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    auth: AuthSession,
     Path(id): Path<String>,
 ) -> AppResult<Response> {
-    require_admin(&st, &headers)?;
+    require_admin(&auth)?;
     let known = st
         .admin
         .tasks
@@ -621,7 +599,9 @@ async fn system(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
             {"key": "GRANARY_PUBLIC_URL", "label": "Public URL", "value": cfg.public_url.clone().unwrap_or_else(|| format!("{} (from request)", base_url(cfg, &headers)))},
             {"key": "GRANARY_DATA_DIR", "label": "Data directory", "value": data_dir.display().to_string()},
             {"key": "GRANARY_META_TTL_SECS", "label": "Metadata freshness", "value": format!("{} seconds", cfg.meta_ttl.as_secs())},
-            {"key": "GRANARY_ADMIN_TOKEN", "label": "Admin token", "value": if cfg.admin_token.is_some() { "Set" } else { "Not set (anyone on the network can delete)" }},
+            {"key": "GRANARY_CLIENT_AUTH", "label": "Package downloads", "value": if cfg.client_auth { "Need an access token" } else { "Open to anyone who can reach Granary" }},
+            {"key": "GRANARY_SESSION_HOURS", "label": "Sign out after inactivity", "value": format!("{} hours", cfg.session_idle.as_secs() / 3600)},
+            {"key": "GRANARY_COOKIE_SECURE", "label": "HTTPS-only session cookie", "value": if cfg.cookie_secure { "Yes" } else { "No" }},
             {"key": "GRANARY_CARGO_INDEX", "label": "Cargo index", "value": cfg.cargo_index},
             {"key": "GRANARY_CARGO_DL", "label": "Cargo downloads", "value": cfg.cargo_dl},
             {"key": "GRANARY_NPM_UPSTREAM", "label": "npm registry", "value": cfg.npm_upstream},
@@ -631,8 +611,8 @@ async fn system(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
     }))
 }
 
-async fn system_check(State(st): State<AppState>, headers: HeaderMap) -> AppResult<Json<Value>> {
-    require_admin(&st, &headers)?;
+async fn system_check(State(st): State<AppState>, auth: AuthSession) -> AppResult<Json<Value>> {
+    require_admin(&auth)?;
     Ok(Json(json!({ "health": check_upstreams(&st).await })))
 }
 
@@ -644,7 +624,12 @@ struct LogQuery {
     q: Option<String>,
 }
 
-async fn logs(State(st): State<AppState>, Query(q): Query<LogQuery>) -> Json<Value> {
+async fn logs(
+    State(st): State<AppState>,
+    auth: AuthSession,
+    Query(q): Query<LogQuery>,
+) -> AppResult<Json<Value>> {
+    require_admin(&auth)?;
     let rank = |l: &str| match l {
         "ERROR" | "error" => 0,
         "WARN" | "warn" => 1,
@@ -663,7 +648,7 @@ async fn logs(State(st): State<AppState>, Query(q): Query<LogQuery>) -> Json<Val
         .filter(|e| needle.is_empty() || e.message.to_lowercase().contains(&needle))
         .take(500)
         .collect();
-    Json(json!({ "entries": entries }))
+    Ok(Json(json!({ "entries": entries })))
 }
 
 #[cfg(test)]
@@ -678,12 +663,5 @@ mod tests {
         assert_eq!(v[1], "1.10.0-rc.1");
         assert_eq!(v[2], "1.9.3");
         assert_eq!(v.last(), Some(&"0.9"));
-    }
-
-    #[test]
-    fn token_compare() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"abcd"));
     }
 }

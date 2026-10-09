@@ -15,10 +15,12 @@ services:
       # Set this when Granary sits behind a reverse proxy or is reached by a
       # name other than the one clients put in their config.
       # GRANARY_PUBLIC_URL: "https://granary.example.lan"
-      # Protects deleting packages and running cleanup from the web UI.
-      # Put GRANARY_ADMIN_TOKEN=... in a .env file next to this one
-      # (generate with: openssl rand -hex 24). Left empty, admin is open.
-      GRANARY_ADMIN_TOKEN: "${GRANARY_ADMIN_TOKEN:-}"
+      # The first admin's password is generated and printed to this
+      # container's log on first start. To choose it instead, put
+      # GRANARY_ADMIN_PASSWORD=... in a .env file next to this one.
+      GRANARY_ADMIN_PASSWORD: "${GRANARY_ADMIN_PASSWORD:-}"
+      # "required": package downloads need an access token. "off": open.
+      GRANARY_CLIENT_AUTH: "required"
       GRANARY_META_TTL_SECS: "300"
       RUST_LOG: "granary=info"
 

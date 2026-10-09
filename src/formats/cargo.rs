@@ -35,8 +35,11 @@ pub fn router() -> Router<AppState> {
 
 async fn config_json(State(st): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let base = base_url(&st.cfg, &headers);
+    // With client authentication on, Cargo sends the registry token on
+    // every request (RFC 3139 `auth-required`).
     Json(serde_json::json!({
         "dl": format!("{base}/cargo/dl/{{crate}}/{{version}}"),
+        "auth-required": st.cfg.client_auth,
     }))
 }
 

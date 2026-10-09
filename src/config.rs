@@ -23,9 +23,16 @@ pub struct Config {
     pub npm_upstream: String,
     pub pypi_index: String,
     pub pypi_files: String,
-    /// When set, deleting, cleanup and other changes made through the web UI
-    /// or API require this token. Browsing is always allowed.
-    pub admin_token: Option<String>,
+    /// Username for the first admin account, created when no users exist.
+    pub admin_user: String,
+    /// Password for that account. When unset, one is generated and printed once.
+    pub admin_password: Option<String>,
+    /// Require an access token (or a signed-in session) for package downloads.
+    pub client_auth: bool,
+    /// Mark the session cookie `Secure` (HTTPS only).
+    pub cookie_secure: bool,
+    /// Sign users out after this much inactivity.
+    pub session_idle: Duration,
 }
 
 fn var(key: &str, default: &str) -> String {
@@ -51,6 +58,10 @@ impl Config {
             .map(|s| s.trim().trim_end_matches('/').to_string())
             .filter(|s| !s.is_empty());
 
+        let public_url_https = public_url
+            .as_deref()
+            .is_some_and(|u| u.starts_with("https://"));
+
         Ok(Self {
             listen: var("GRANARY_LISTEN", "0.0.0.0:8080"),
             data_dir: var("GRANARY_DATA_DIR", "./data").into(),
@@ -64,10 +75,32 @@ impl Config {
             npm_upstream: url_var("GRANARY_NPM_UPSTREAM", "https://registry.npmjs.org"),
             pypi_index: url_var("GRANARY_PYPI_INDEX", "https://pypi.org/simple"),
             pypi_files: url_var("GRANARY_PYPI_FILES", "https://files.pythonhosted.org"),
-            admin_token: std::env::var("GRANARY_ADMIN_TOKEN")
+            admin_user: var("GRANARY_ADMIN_USER", "admin"),
+            admin_password: std::env::var("GRANARY_ADMIN_PASSWORD")
                 .ok()
-                .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
+            client_auth: match var("GRANARY_CLIENT_AUTH", "required")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "required" | "on" | "true" => true,
+                "off" | "false" | "none" => false,
+                other => anyhow::bail!(
+                    "GRANARY_CLIENT_AUTH must be \"required\" or \"off\", not {other:?}"
+                ),
+            },
+            cookie_secure: match std::env::var("GRANARY_COOKIE_SECURE").ok().as_deref() {
+                Some("true") | Some("1") => true,
+                Some("false") | Some("0") => false,
+                _ => public_url_https,
+            },
+            session_idle: Duration::from_secs(
+                var("GRANARY_SESSION_HOURS", "12")
+                    .parse::<u64>()
+                    .context("GRANARY_SESSION_HOURS must be a whole number of hours")?
+                    .clamp(1, 24 * 30)
+                    * 3600,
+            ),
         })
     }
 }

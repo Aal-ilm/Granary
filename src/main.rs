@@ -1,6 +1,7 @@
 //! Granary: a small, self-hostable caching proxy for package registries.
 
 mod admin;
+mod auth;
 mod config;
 mod error;
 mod formats;
@@ -10,32 +11,65 @@ mod store;
 mod ui;
 mod util;
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
-use axum::{Router, routing::get};
+use axum::{Router, middleware, routing::get};
+use axum_login::AuthManagerLayerBuilder;
+use tower_sessions::{Expiry, SessionManagerLayer, cookie::SameSite};
 use tracing::Level;
 use tracing_subscriber::{
     EnvFilter, Layer, filter::Targets, layer::SubscriberExt, util::SubscriberInitExt,
 };
 
-use crate::{admin::Admin, config::Config, logbuf::LogBuffer, store::Store};
+use crate::{
+    admin::Admin,
+    auth::{Backend, SqliteSessionStore},
+    config::Config,
+    logbuf::LogBuffer,
+    store::Store,
+};
 
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Arc<Config>,
     pub store: Arc<Store>,
     pub admin: Arc<Admin>,
+    pub auth: Backend,
 }
 
-pub fn app(state: AppState) -> Router {
-    Router::new()
-        .route("/healthz", get(|| async { "ok\n" }))
-        .merge(ui::router())
-        .merge(admin::api::router())
+pub fn app(state: AppState, sessions: SqliteSessionStore) -> Router {
+    // Package downloads: access token or signed-in session (if required).
+    let packages = Router::new()
         .merge(formats::cargo::router())
         .merge(formats::npm::router())
         .merge(formats::pypi::router())
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::client_guard,
+        ));
+
+    // JSON API for the web UI: signed-in session for everything but sign-in.
+    let api = Router::new()
+        .merge(admin::api::router())
+        .merge(auth::api::router())
+        .route_layer(middleware::from_fn(auth::api_guard));
+
+    let idle = state.cfg.session_idle.as_secs() as i64;
+    let session_layer = SessionManagerLayer::new(sessions)
+        .with_name("granary_session")
+        .with_http_only(true)
+        .with_same_site(SameSite::Strict)
+        .with_secure(state.cfg.cookie_secure)
+        .with_expiry(Expiry::OnInactivity(time::Duration::seconds(idle)));
+    let auth_layer = AuthManagerLayerBuilder::new(state.auth.clone(), session_layer).build();
+
+    Router::new()
+        .route("/healthz", get(|| async { "ok\n" }))
+        .merge(ui::router())
+        .merge(api)
+        .merge(packages)
         .with_state(state)
+        .layer(auth_layer)
 }
 
 /// `granary healthcheck`: exit 0 if the local server answers `/healthz`.
@@ -57,10 +91,26 @@ fn healthcheck() -> ! {
 }
 
 fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
-        healthcheck();
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("healthcheck") => healthcheck(),
+        Some("reset-password") => {
+            let Some(user) = args.get(2) else {
+                anyhow::bail!("usage: granary reset-password <username> [--disable-2fa]");
+            };
+            let disable_2fa = args.iter().any(|a| a == "--disable-2fa");
+            let cfg = Config::from_env()?;
+            tokio::runtime::Runtime::new()?.block_on(auth::reset_password_cli(
+                &cfg.data_dir,
+                user,
+                disable_2fa,
+            ))
+        }
+        Some(other) => anyhow::bail!(
+            "unknown command {other:?}. Commands: healthcheck, reset-password <username> [--disable-2fa]"
+        ),
+        None => run(),
     }
-    run()
 }
 
 #[tokio::main]
@@ -81,6 +131,21 @@ async fn run() -> anyhow::Result<()> {
     let cfg = Config::from_env()?;
     let store = Store::new(cfg.data_dir.clone(), cfg.meta_ttl).await?;
     let admin = Admin::new(&cfg.data_dir, logs).await?;
+
+    let db = auth::open_db(&cfg.data_dir).await?;
+    if let Some(password) =
+        auth::ensure_admin(&db, &cfg.admin_user, cfg.admin_password.as_deref()).await?
+    {
+        // Printed straight to the container log, never to the in-app log view.
+        println!();
+        println!("  Granary created an admin account.");
+        println!("    Username: {}", cfg.admin_user);
+        println!("    Password: {password}");
+        println!("  Sign in and you'll be asked to choose a new password.");
+        println!();
+    }
+    let sessions = SqliteSessionStore::new(db.clone());
+    let backend = Backend::new(db).await?;
     tracing::info!(
         data_dir = %store.root().display(),
         meta_ttl_secs = cfg.meta_ttl.as_secs(),
@@ -90,18 +155,20 @@ async fn run() -> anyhow::Result<()> {
     );
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
-    if cfg.admin_token.is_none() {
+    if !cfg.client_auth {
         tracing::warn!(
-            "GRANARY_ADMIN_TOKEN is not set: anyone who can reach the web UI can delete cached packages"
+            "GRANARY_CLIENT_AUTH is off: anyone who can reach Granary can download packages through it"
         );
     }
     let state = AppState {
         cfg: Arc::new(cfg),
         store: Arc::new(store),
         admin: Arc::new(admin),
+        auth: backend,
     };
-    admin::spawn_scheduler(state.clone());
-    axum::serve(listener, app(state.clone()))
+    admin::spawn_scheduler(state.clone(), sessions.clone());
+    let service = app(state.clone(), sessions).into_make_service_with_connect_info::<SocketAddr>();
+    axum::serve(listener, service)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     // Keep download history from the last few seconds before shutdown.
