@@ -1,0 +1,43 @@
+# Granary on TrueNAS SCALE 24.10 or later (Apps → Discover → ⋮ → Install via YAML).
+# See docs/truenas.md for the full walkthrough. Replace POOL with your pool's
+# name and pick the image line that matches how you got the image.
+services:
+  granary:
+    # Built on the NAS with: docker build -t granary:0.2.0 /mnt/POOL/apps/granary/src
+    image: granary:0.2.0
+    pull_policy: never
+    # Or, once you publish it to a registry, e.g. GitHub Container Registry:
+    # image: ghcr.io/YOUR_GITHUB_USER/granary:0.2.0
+    restart: unless-stopped
+    # TrueNAS's built-in "apps" user, which owns the dataset below.
+    user: "568:568"
+    ports:
+      - "8480:8080"
+    volumes:
+      - /mnt/POOL/apps/granary/data:/data
+    environment:
+      # The address clients use. Required behind a reverse proxy; recommended
+      # anyway because every client configuration contains it.
+      GRANARY_PUBLIC_URL: "http://truenas.lan:8480"
+      # Uncomment when a reverse proxy (Nginx Proxy Manager, Caddy, Traefik)
+      # on this NAS terminates HTTPS in front of Granary.
+      # GRANARY_TRUSTED_PROXIES: "172.16.0.0/12"
+      GRANARY_CLIENT_AUTH: "required"
+      GRANARY_SESSION_HOURS: "12"
+      GRANARY_AUDIT_DAYS: "365"
+      RUST_LOG: "granary=info"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "granary", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

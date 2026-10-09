@@ -12,9 +12,10 @@ once, then served from your own disk after that.
 - **Keeps working when upstream is down.** Cached metadata is served stale
   if the public registry can't be reached, so builds of known dependencies
   don't break.
-- **Safe by design.** Clients still verify every download against the
-  registry's own checksums (Cargo's `cksum`, npm's `integrity`, pip's
-  `sha256`), so the cache can't silently serve tampered files.
+- **Safe by design.** Granary checks every download against the
+  registry's own checksum (Cargo's `cksum`, npm's `integrity`, PyPI's
+  `sha256`) before caching it, so a corrupted or tampered response is never
+  stored or served. Clients check again on their side.
 - **Web UI built in.** Browse and search what's cached, delete packages, set
   cleanup rules, watch tasks, check upstream health and read logs. It's served
   by the same binary and never loads anything from the internet.
@@ -112,6 +113,7 @@ To let anyone on your network download without a token, set
 | Tasks | Scheduled jobs (cleanup, upstream checks, saving download history) with last run, result and **Run now** |
 | System | Upstream reachability and latency, disk space, and the active configuration |
 | Logs | Recent server events, filterable by level and text (admins only) |
+| Audit log | Sign-ins, account, token and user changes, deletions and settings changes, with who, when and from where; filterable and exportable as CSV (admins only) |
 | Access tokens | Create and revoke tokens for package managers, with ready-made client configuration |
 | Users | Add people as admins or viewers, reset passwords, turn off two-factor, disable or delete accounts (admins only) |
 | Account | Change your password and set up two-factor authentication |
@@ -129,9 +131,8 @@ To let anyone on your network download without a token, set
   Changing a password signs out the account's other sessions.
 - **Two-factor authentication** uses standard 6-digit codes (TOTP) from any
   authenticator app. A code can't be used twice.
-- **Lockout.** Five wrong passwords or codes for one account within 15 minutes
-  lock it for 15 minutes. Wrong usernames and wrong passwords get the same
-  response and take the same time.
+- **No username probing.** Wrong usernames and wrong passwords get the
+  same response and take the same time.
 - **Sessions** are HttpOnly, `SameSite=Strict` cookies that expire after
   `GRANARY_SESSION_HOURS` of inactivity, stored in the local database so a
   restart doesn't sign anyone out. They are marked `Secure` when
@@ -140,7 +141,25 @@ To let anyone on your network download without a token, set
   your browser.
 - **Access tokens** are only shown when created. Granary stores a SHA-256
   hash, so a copy of the database can't be used to download packages.
-  Disabling an account stops its tokens too.
+  Session IDs are stored the same way. Disabling an account stops its
+  tokens too.
+- **Sign-in limits.** Five wrong passwords or codes from one address lock
+  that address out of that account for 15 minutes, without locking out the
+  account's owner elsewhere. Fifty failures against one account from
+  anywhere, or from one address against any accounts, also lock for 15
+  minutes. Re-entering your password to change it or turn off two-factor
+  counts the same way.
+- **Audit log.** Security-relevant actions are recorded in the database
+  with the user, time, target and client address, and kept for
+  `GRANARY_AUDIT_DAYS`. Admins can search and export it.
+- **Upstream content is sandboxed.** Every response carries `nosniff`,
+  `X-Frame-Options: DENY` and a restrictive Content Security Policy, and
+  package files and registry pages (PyPI's are HTML) are served with
+  `sandbox`, so nothing fetched from a registry can run script on
+  Granary's origin.
+- **No credential relaying.** Of npm's `/-/` API, Granary forwards only
+  audit, search and ping. Login, token, publish and account requests are
+  refused, and clients' credentials are never forwarded upstream.
 - **Locked out?** Reset a password from the server, optionally turning off
   two-factor:
 
@@ -148,10 +167,26 @@ To let anyone on your network download without a token, set
   docker compose exec granary granary reset-password admin --disable-2fa
   ```
 
+- **Monitoring.** `/metrics` serves Prometheus metrics: cache hits and
+  misses, rejected downloads, storage per repository, disk space, upstream
+  health and task results. Scrapers authenticate with an access token
+  (`authorization: Bearer gran_…`); the System page has a ready-made scrape
+  config.
+
 Granary never contacts anything except the upstream registries it caches.
 There are no update checks, analytics, fonts or avatars from outside services.
 
 ![System page in dark mode](docs/system-dark.png)
+
+## Running on TrueNAS SCALE
+
+See [docs/truenas.md](docs/truenas.md) for a step-by-step guide: datasets
+and permissions, building the image, installing it as a custom app from
+[`deploy/truenas/compose.yaml`](deploy/truenas/compose.yaml), HTTPS through a
+reverse proxy, monitoring, upgrades and recovery.
+
+Both compose files run Granary as an unprivileged user with a read-only
+root filesystem, no Linux capabilities and `no-new-privileges`.
 
 ## Configuration
 
@@ -167,7 +202,9 @@ All settings are environment variables.
 | `GRANARY_ADMIN_USER` | `admin` | Username of the first admin, created when there are no users |
 | `GRANARY_ADMIN_PASSWORD` | *(generated)* | That admin's password (12+ characters). Only used on first start |
 | `GRANARY_SESSION_HOURS` | `12` | Sign people out after this many hours of inactivity |
-| `GRANARY_COOKIE_SECURE` | `true` if the public URL is HTTPS | Send the session cookie over HTTPS only |
+| `GRANARY_COOKIE_SECURE` | `true` if the public URL is HTTPS | Send the session cookie over HTTPS only (also turns on `Strict-Transport-Security`) |
+| `GRANARY_TRUSTED_PROXIES` | *(none)* | Comma-separated IPs or CIDR ranges of your reverse proxies, e.g. `172.16.0.0/12`. Granary believes `X-Forwarded-*` headers only from these, and uses `X-Forwarded-For` for sign-in limits and the audit log. From anywhere else, those headers are removed |
+| `GRANARY_AUDIT_DAYS` | `365` | Keep audit log entries for this many days |
 | `GRANARY_CARGO_INDEX` | `https://index.crates.io` | Upstream sparse index |
 | `GRANARY_CARGO_DL` | `https://static.crates.io/crates/{crate}/{version}/download` | Upstream crate download template |
 | `GRANARY_NPM_UPSTREAM` | `https://registry.npmjs.org` | Upstream npm registry |
@@ -201,7 +238,7 @@ place, so a crash never leaves a half-written package in the cache.
 /data
 ├── files/{cargo,npm,pypi}/…   immutable package files
 ├── meta/{cargo,npm,pypi}/…    cached metadata (*.body + *.json info)
-├── state/                     users, tokens and sessions (granary.db),
+├── state/                     users, tokens, sessions and audit log (granary.db),
 │                              cleanup settings, last-download times
 └── tmp/                       in-progress downloads (cleared at startup)
 ```
@@ -228,7 +265,6 @@ cached.
 2. Hosted repositories: publish your own crates, npm packages and wheels
 3. Debian / apt proxy
 4. Optional OpenID Connect sign-in and per-repository permissions
-5. Prometheus metrics
 
 ## Development
 
