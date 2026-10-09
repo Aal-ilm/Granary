@@ -1,0 +1,19 @@
+services:
+  granary:
+    build: .
+    image: granary:latest
+    container_name: granary
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - granary-data:/data
+    environment:
+      # Set this when Granary sits behind a reverse proxy or is reached by a
+      # name other than the one clients put in their config.
+      # GRANARY_PUBLIC_URL: "https://granary.example.lan"
+      GRANARY_META_TTL_SECS: "300"
+      RUST_LOG: "granary=info"
+
+volumes:
+  granary-data:

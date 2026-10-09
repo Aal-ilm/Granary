@@ -1,0 +1,400 @@
+//! The cache engine shared by every package format.
+//!
+//! Two kinds of data are cached:
+//!
+//! * **Files** (crate archives, npm tarballs, wheels) never change once
+//!   published. They are downloaded once and kept forever.
+//! * **Metadata** (index entries, packuments, simple-API pages) changes as new
+//!   versions are published. It is kept for a configurable TTL, revalidated
+//!   with `If-None-Match` / `If-Modified-Since`, and served stale if the
+//!   upstream registry is unreachable.
+//!
+//! Concurrent requests for the same uncached item are coalesced: only one
+//! upstream fetch happens and the others wait for its result.
+
+use std::{
+    collections::HashMap,
+    future::Future,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use axum::{
+    body::Body,
+    http::{HeaderValue, StatusCode, header},
+    response::Response,
+};
+use bytes::Bytes;
+use futures_util::StreamExt;
+use reqwest::header::{ACCEPT, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
+
+use crate::{
+    error::{AppError, AppResult},
+    util::safe_rel_path,
+};
+
+const USER_AGENT: &str = concat!("granary/", env!("CARGO_PKG_VERSION"));
+
+#[derive(Default)]
+pub struct Stats {
+    pub file_hits: AtomicU64,
+    pub file_misses: AtomicU64,
+    pub meta_hits: AtomicU64,
+    pub meta_refreshes: AtomicU64,
+    pub meta_stale_served: AtomicU64,
+}
+
+pub struct Store {
+    root: PathBuf,
+    meta_client: reqwest::Client,
+    file_client: reqwest::Client,
+    meta_ttl: Duration,
+    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    tmp_counter: AtomicU64,
+    pub stats: Stats,
+}
+
+/// A metadata document, as stored from upstream (before any URL rewriting).
+pub struct Meta {
+    pub body: Bytes,
+    pub content_type: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MetaInfo {
+    fetched_at: u64,
+    content_type: String,
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+impl Store {
+    pub async fn new(root: PathBuf, meta_ttl: Duration) -> anyhow::Result<Self> {
+        tokio::fs::create_dir_all(root.join("tmp")).await?;
+        // Leftover partial downloads from a crash are useless; clear them.
+        let mut rd = tokio::fs::read_dir(root.join("tmp")).await?;
+        while let Some(e) = rd.next_entry().await? {
+            let _ = tokio::fs::remove_file(e.path()).await;
+        }
+
+        let meta_client = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(120))
+            .build()?;
+        // Files must arrive byte-for-byte, so never let the client transparently
+        // decompress them (some servers mislabel .tar.gz with Content-Encoding).
+        let file_client = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(60))
+            .no_gzip()
+            .no_brotli()
+            .build()?;
+
+        Ok(Self {
+            root,
+            meta_client,
+            file_client,
+            meta_ttl,
+            locks: Mutex::new(HashMap::new()),
+            tmp_counter: AtomicU64::new(0),
+            stats: Stats::default(),
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Client for uncached pass-through requests.
+    pub fn passthrough_client(&self) -> &reqwest::Client {
+        &self.meta_client
+    }
+
+    /// Run `f` while holding a per-key lock, so concurrent cache misses for the
+    /// same item result in a single upstream fetch.
+    async fn with_lock<T>(&self, key: &str, f: impl Future<Output = T>) -> T {
+        let lock = {
+            let mut map = self.locks.lock().unwrap();
+            map.entry(key.to_string()).or_default().clone()
+        };
+        let out = {
+            let _guard = lock.lock().await;
+            f.await
+        };
+        let mut map = self.locks.lock().unwrap();
+        // Only the map and our clone remain: nobody else is waiting.
+        if Arc::strong_count(&lock) == 2 {
+            map.remove(key);
+        }
+        out
+    }
+
+    fn tmp_path(&self) -> PathBuf {
+        let n = self.tmp_counter.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        self.root
+            .join("tmp")
+            .join(format!("{}-{nanos}-{n}.part", std::process::id()))
+    }
+
+    /// Write `data` to `dest` atomically (write temp file, then rename).
+    async fn write_atomic(&self, dest: &Path, data: &[u8]) -> std::io::Result<()> {
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let tmp = self.tmp_path();
+        tokio::fs::write(&tmp, data).await?;
+        tokio::fs::rename(&tmp, dest).await
+    }
+
+    // ------------------------------------------------------------------ files
+
+    /// Return a response for an immutable file, downloading it from `url` on
+    /// first request. `rel` is the path under `files/<ns>/`.
+    pub async fn file(
+        &self,
+        ns: &str,
+        rel: &str,
+        url: &str,
+        content_type: &'static str,
+    ) -> AppResult<Response> {
+        let path = self.root.join("files").join(ns).join(safe_rel_path(rel)?);
+
+        if tokio::fs::try_exists(&path).await? {
+            self.stats.file_hits.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(ns, rel, "file hit");
+            return serve_file(&path, content_type).await;
+        }
+
+        let key = format!("file:{ns}:{rel}");
+        self.with_lock(&key, async {
+            // Another request may have finished the download while we waited.
+            if tokio::fs::try_exists(&path).await? {
+                self.stats.file_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            self.stats.file_misses.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(ns, rel, "file miss, fetching {url}");
+            self.download(url, &path).await
+        })
+        .await?;
+
+        serve_file(&path, content_type).await
+    }
+
+    async fn download(&self, url: &str, dest: &Path) -> AppResult<()> {
+        let resp = self.file_client.get(url).send().await?;
+        match resp.status() {
+            s if s.is_success() => {}
+            StatusCode::NOT_FOUND | StatusCode::GONE => return Err(AppError::not_found()),
+            s => {
+                return Err(AppError::bad_gateway(format!(
+                    "upstream returned {s} for {url}"
+                )));
+            }
+        }
+
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let tmp = self.tmp_path();
+        let result: AppResult<()> = async {
+            let mut file = tokio::fs::File::create(&tmp).await?;
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                file.write_all(&chunk?).await?;
+            }
+            file.flush().await?;
+            file.sync_all().await?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => Ok(tokio::fs::rename(&tmp, dest).await?),
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                Err(e)
+            }
+        }
+    }
+
+    // --------------------------------------------------------------- metadata
+
+    /// Fetch a metadata document with TTL caching. `variant` distinguishes
+    /// different representations of the same resource (e.g. npm abbreviated vs
+    /// full packuments); `accept` is sent upstream.
+    pub async fn meta(
+        &self,
+        ns: &str,
+        rel: &str,
+        variant: &str,
+        url: &str,
+        accept: &str,
+    ) -> AppResult<Meta> {
+        let base = self.root.join("meta").join(ns).join(safe_rel_path(rel)?);
+        let file_name = base.file_name().unwrap().to_string_lossy().to_string();
+        let body_path = base.with_file_name(format!("{file_name}.{variant}.body"));
+        let info_path = base.with_file_name(format!("{file_name}.{variant}.json"));
+
+        if let Some(m) = self.read_meta_if_fresh(&body_path, &info_path).await {
+            self.stats.meta_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(m);
+        }
+
+        let key = format!("meta:{ns}:{rel}:{variant}");
+        self.with_lock(&key, async {
+            if let Some(m) = self.read_meta_if_fresh(&body_path, &info_path).await {
+                self.stats.meta_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(m);
+            }
+            self.refresh_meta(&body_path, &info_path, url, accept).await
+        })
+        .await
+    }
+
+    async fn read_info(&self, info_path: &Path) -> Option<MetaInfo> {
+        let raw = tokio::fs::read(info_path).await.ok()?;
+        serde_json::from_slice(&raw).ok()
+    }
+
+    async fn read_meta_if_fresh(&self, body_path: &Path, info_path: &Path) -> Option<Meta> {
+        let info = self.read_info(info_path).await?;
+        if now_secs().saturating_sub(info.fetched_at) >= self.meta_ttl.as_secs() {
+            return None;
+        }
+        let body = tokio::fs::read(body_path).await.ok()?;
+        Some(Meta {
+            body: body.into(),
+            content_type: info.content_type,
+        })
+    }
+
+    async fn refresh_meta(
+        &self,
+        body_path: &Path,
+        info_path: &Path,
+        url: &str,
+        accept: &str,
+    ) -> AppResult<Meta> {
+        let cached = self.read_info(info_path).await;
+        let mut req = self.meta_client.get(url).header(ACCEPT, accept);
+        if let Some(info) = &cached {
+            if let Some(etag) = &info.etag {
+                req = req.header(IF_NONE_MATCH, etag);
+            }
+            if let Some(lm) = &info.last_modified {
+                req = req.header(IF_MODIFIED_SINCE, lm);
+            }
+        }
+
+        let serve_stale = |reason: String| async move {
+            let info = cached_info_or_none(info_path).await;
+            match (info, tokio::fs::read(body_path).await) {
+                (Some(info), Ok(body)) => {
+                    self.stats.meta_stale_served.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!("serving stale metadata for {url}: {reason}");
+                    Ok(Meta {
+                        body: body.into(),
+                        content_type: info.content_type,
+                    })
+                }
+                _ => Err(AppError::bad_gateway(reason)),
+            }
+        };
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => return serve_stale(format!("upstream unreachable: {e}")).await,
+        };
+        let status = resp.status();
+
+        if status == StatusCode::NOT_MODIFIED {
+            if let Some(mut info) = cached
+                && let Ok(body) = tokio::fs::read(body_path).await
+            {
+                info.fetched_at = now_secs();
+                let content_type = info.content_type.clone();
+                self.write_atomic(info_path, &serde_json::to_vec(&info).unwrap())
+                    .await?;
+                self.stats.meta_refreshes.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!("revalidated {url}");
+                return Ok(Meta {
+                    body: body.into(),
+                    content_type,
+                });
+            }
+            return Err(AppError::bad_gateway(format!("unexpected 304 from {url}")));
+        }
+        if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
+            return Err(AppError::not_found());
+        }
+        if !status.is_success() {
+            return serve_stale(format!("upstream returned {status} for {url}")).await;
+        }
+
+        let header_str = |name| {
+            resp.headers()
+                .get(name)
+                .and_then(|v: &HeaderValue| v.to_str().ok())
+                .map(String::from)
+        };
+        let info = MetaInfo {
+            fetched_at: now_secs(),
+            content_type: header_str(header::CONTENT_TYPE)
+                .unwrap_or_else(|| "application/octet-stream".into()),
+            etag: header_str(ETAG),
+            last_modified: header_str(LAST_MODIFIED),
+        };
+        let body = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => return serve_stale(format!("upstream body error: {e}")).await,
+        };
+
+        // Body first, then info: a crash in between leaves stale-but-valid info.
+        self.write_atomic(body_path, &body).await?;
+        self.write_atomic(info_path, &serde_json::to_vec(&info).unwrap())
+            .await?;
+        self.stats.meta_refreshes.fetch_add(1, Ordering::Relaxed);
+        tracing::info!("fetched metadata {url}");
+        Ok(Meta {
+            body,
+            content_type: info.content_type,
+        })
+    }
+}
+
+async fn cached_info_or_none(info_path: &Path) -> Option<MetaInfo> {
+    let raw = tokio::fs::read(info_path).await.ok()?;
+    serde_json::from_slice(&raw).ok()
+}
+
+async fn serve_file(path: &Path, content_type: &'static str) -> AppResult<Response> {
+    let file = tokio::fs::File::open(path).await?;
+    let len = file.metadata().await?.len();
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, len)
+        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .body(Body::from_stream(ReaderStream::new(file)))
+        .unwrap())
+}
