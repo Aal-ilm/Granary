@@ -365,7 +365,15 @@ impl Store {
         .await;
 
         match result {
-            Ok(()) => Ok(tokio::fs::rename(&tmp, dest).await?),
+            Ok(()) => {
+                tokio::fs::rename(&tmp, dest).await?;
+                if expected.is_some() {
+                    tracing::info!("cached {url} (checksum verified)");
+                } else {
+                    tracing::info!("cached {url} (registry published no checksum to verify)");
+                }
+                Ok(())
+            }
             Err(e) => {
                 let _ = tokio::fs::remove_file(&tmp).await;
                 Err(e)

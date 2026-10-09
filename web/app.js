@@ -9,6 +9,10 @@ const $$ = (sel, el = document) => Array.from(el.querySelectorAll(sel));
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
+/** Only allow http(s) links (and inline PNGs for the 2FA QR code) in
+ *  href/src attributes built from API data. */
+const safeUrl = (u) => (/^(https?:\/\/|data:image\/png;base64,)/i.test(String(u ?? '')) ? String(u) : '#');
+
 const REPOS = {
   cargo: { label: 'Cargo', upstream: 'crates.io' },
   npm: { label: 'npm', upstream: 'registry.npmjs.org' },
@@ -336,11 +340,25 @@ const routes = [
   [/^\/cleanup$/, 'cleanup', renderCleanup],
   [/^\/tasks$/, 'tasks', renderTasks],
   [/^\/system$/, 'system', renderSystem],
-  [/^\/logs$/, 'logs', renderLogs],
+  [/^\/logs$/, 'logs', renderLogs, { admin: true }],
+  [/^\/audit$/, 'audit', renderAudit, { admin: true }],
   [/^\/account$/, 'account', renderAccount],
   [/^\/tokens$/, 'tokens', renderTokens],
-  [/^\/users$/, 'users', renderUsers],
+  [/^\/users$/, 'users', renderUsers, { admin: true }],
 ];
+
+const decodeParam = (p) => {
+  try {
+    return p ? decodeURIComponent(p) : p;
+  } catch {
+    return null;
+  }
+};
+
+function renderAdminOnly() {
+  setView(`<div class="page-head"><div><h1>Admins only</h1><p>This page is only available to admin accounts. Ask an admin if you need access.</p></div></div>
+    <a class="btn" href="#/">Go to overview</a>`);
+}
 
 async function route() {
   if (!me) return;
@@ -349,8 +367,10 @@ async function route() {
   const token = ++navToken;
   const { path, query } = parseHash();
   const match = routes.find(([re]) => re.test(path));
-  const [re, nav, render] = match || [null, '', renderNotFound];
-  const params = re ? path.match(re).slice(1).map((p) => (p ? decodeURIComponent(p) : p)) : [];
+  let [re, nav, render, opts] = match || [null, '', renderNotFound];
+  const params = re ? path.match(re).slice(1).map(decodeParam) : [];
+  if (params.includes(null)) render = renderNotFound;
+  else if (opts?.admin && !isAdmin()) render = renderAdminOnly;
   $$('.nav a').forEach((a) => (a.dataset.nav === nav ? a.setAttribute('aria-current', 'page') : a.removeAttribute('aria-current')));
   const search = $('#global-search');
   if (document.activeElement !== search) search.value = path.startsWith('/browse') ? query.get('q') || '' : '';
@@ -424,7 +444,7 @@ async function renderOverview({ isCurrent }) {
         <tbody>${d.recent
           .map(
             (a) => `<tr>
-              <td><a class="pkg mono" href="#/c/${a.repo}/${encodeURIComponent(a.package)}">${esc(a.package)}</a></td>
+              <td><a class="pkg mono" href="#/c/${esc(a.repo)}/${esc(encodeURIComponent(a.package))}">${esc(a.package)}</a></td>
               <td class="mono">${esc(a.version)}</td>
               <td>${chip(a.repo)}</td>
               <td class="r num">${esc(bytes(a.size))}</td>
@@ -542,7 +562,7 @@ async function renderBrowse({ params, query, isCurrent }) {
   const q = query.get('q') || '';
   const sort = query.get('sort') || 'name';
   const order = query.get('order') || (sort === 'name' ? 'asc' : 'desc');
-  const page = Math.max(1, parseInt(query.get('page') || '1', 10));
+  const page = Math.max(1, parseInt(query.get('page') || '1', 10) || 1);
 
   const apiQuery = new URLSearchParams({ sort, order, limit: PAGE_SIZE, offset: (page - 1) * PAGE_SIZE });
   if (repo) apiQuery.set('repo', repo);
@@ -570,7 +590,7 @@ async function renderBrowse({ params, query, isCurrent }) {
   const rows = d.items
     .map(
       (c) => `<tr>
-        <td><a class="pkg mono" href="#/c/${c.repo}/${encodeURIComponent(c.name)}">${esc(c.name)}</a></td>
+        <td><a class="pkg mono" href="#/c/${esc(c.repo)}/${esc(encodeURIComponent(c.name))}">${esc(c.name)}</a></td>
         ${repo ? '' : `<td>${chip(c.repo)}</td>`}
         <td class="r num">${esc(count(c.versions))}</td>
         <td class="r num">${esc(bytes(c.size))}</td>
@@ -668,7 +688,7 @@ async function renderComponent({ params, isCurrent }) {
     .map((v, i) => {
       const single = v.files.length === 1 ? v.files[0] : null;
       const actions = single
-        ? `<a class="btn small" href="${esc(single.download)}" download>Download</a>
+        ? `<a class="btn small" href="${esc(safeUrl(single.download))}" download>Download</a>
            <button class="small danger admin-only" data-delete-file="${esc(single.path)}" data-label="${esc(single.file_name)}">Delete</button>`
         : '';
       const versionCell = single
@@ -683,7 +703,7 @@ async function renderComponent({ params, isCurrent }) {
                 <td class="r num">${esc(bytes(f.size))}</td>
                 <td class="hide-sm">${timeTag(f.cached_at)}</td>
                 <td>${timeTag(f.last_access)}</td>
-                <td class="actions"><a class="btn small" href="${esc(f.download)}" download>Download</a>
+                <td class="actions"><a class="btn small" href="${esc(safeUrl(f.download))}" download>Download</a>
                   <button class="small danger admin-only" data-delete-file="${esc(f.path)}" data-label="${esc(f.file_name)}">Delete</button></td>
               </tr>`
             )
@@ -708,7 +728,7 @@ async function renderComponent({ params, isCurrent }) {
           ${chip(repo)}
           <span><b class="num">${esc(plural(d.versions.length, 'version'))}</b> cached</span>
           <span><b class="num">${esc(bytes(d.size))}</b> on disk</span>
-          ${d.upstream ? `<a href="${esc(d.upstream.url)}" target="_blank" rel="noopener noreferrer">View on ${esc(d.upstream.label)}</a>` : ''}
+          ${d.upstream ? `<a href="${esc(safeUrl(d.upstream.url))}" target="_blank" rel="noopener noreferrer">View on ${esc(d.upstream.label)}</a>` : ''}
         </div>
       </div>
       <div class="page-actions admin-only"><button class="danger" data-delete-package>Delete package</button></div>
@@ -845,7 +865,9 @@ async function renderCleanup({ isCurrent }) {
           .map((i) => `<tr><td class="mono">${esc(i.package)}</td><td class="mono">${esc(i.version)}</td><td>${chip(i.repo)}</td><td class="r num">${esc(bytes(i.size))}</td><td>${timeTag(i.last_used)}</td></tr>`)
           .join('')}</tbody></table></div>${r.items.length > 100 ? `<p class="muted">Showing the 100 largest of ${esc(count(r.files))} files.</p>` : ''}`
       : '';
-    $('#cleanup-result').innerHTML = `<div class="result">${head}${items ? '<div class="panel">' + items + '</div>' : ''}</div>`;
+    const out = $('#cleanup-result');
+    if (!out) return; // the user moved to another page meanwhile
+    out.innerHTML = `<div class="result">${head}${items ? '<div class="panel">' + items + '</div>' : ''}</div>`;
   };
 
   $('[data-preview]', form).addEventListener(
@@ -873,7 +895,8 @@ async function renderCleanup({ isCurrent }) {
         await save(policy);
         const r = await act(() => api('/api/cleanup/run', { method: 'POST' }));
         showResult(r, true);
-        $('#last-run').innerHTML = `Last run ${timeTag(r.at)}: removed ${esc(plural(r.files, 'file'))} and ${esc(plural(r.meta_files, 'metadata entry', 'metadata entries'))}, freeing ${esc(bytes(r.bytes + r.meta_bytes))}.`;
+        const last = $('#last-run');
+        if (last) last.innerHTML = `Last run ${timeTag(r.at)}: removed ${esc(plural(r.files, 'file'))} and ${esc(plural(r.meta_files, 'metadata entry', 'metadata entries'))}, freeing ${esc(bytes(r.bytes + r.meta_bytes))}.`;
         toast(`Cleanup removed ${plural(r.files, 'file')}, freed ${bytes(r.bytes + r.meta_bytes)}`);
       } catch (err) {
         toast(err.message, 'error');
@@ -932,7 +955,7 @@ async function renderTasks({ isCurrent }) {
         b.disabled = true;
         await act(() => api(`/api/tasks/${b.dataset.runTask}/run`, { method: 'POST' }));
         toast(`Started ${b.dataset.name.toLowerCase()}`);
-        setTimeout(draw, 600);
+        setTimeout(() => draw().catch(() => {}), 600);
       } catch (err) {
         b.disabled = false;
         toast(err.message, 'error');
@@ -952,6 +975,15 @@ async function renderSystem({ isCurrent }) {
   const disk = d.disk;
   const usedPct = disk && disk.total ? ((disk.total - disk.free) / disk.total) * 100 : 0;
   const health = d.health || [];
+
+  const host = location.host;
+  const promSnippet = `scrape_configs:
+  - job_name: granary
+    scheme: ${location.protocol.replace(':', '')}
+    authorization:
+      credentials: YOUR_TOKEN
+    static_configs:
+      - targets: ['${host}']`;
 
   const upRows = REPO_IDS.map((id) => {
     const h = health.find((x) => x.repo === id);
@@ -979,6 +1011,11 @@ async function renderSystem({ isCurrent }) {
         <div class="fact"><dt>Disk</dt><dd class="num">${disk ? `${esc(bytes(disk.total - disk.free))} used of ${esc(bytes(disk.total))}` : 'Unknown'}
           ${disk ? `<small>${esc(bytes(disk.free))} free</small><div class="meter ${usedPct > 95 ? 'full' : usedPct > 85 ? 'high' : ''}" role="img" aria-label="${Math.round(usedPct)}% used"><span data-pct="${usedPct.toFixed(1)}"></span></div>` : ''}</dd></div>
       </dl>
+    </section>
+    <section>
+      <h2>Monitoring</h2>
+      <p class="muted">Granary serves Prometheus metrics at <code>/metrics</code>: cache hits and misses, rejected downloads, storage per repository, disk space, upstream health and task results. Scrapers sign in with an access token.</p>
+      <div class="snippet"><pre>${esc(promSnippet)}</pre><button class="small" type="button" data-copy="${esc(promSnippet)}">Copy</button></div>
     </section>
     <section>
       <h2>Configuration</h2>
@@ -1019,18 +1056,22 @@ async function renderLogs({ query, isCurrent }) {
         .map(([v, l]) => `<button type="button" data-level="${v}" aria-pressed="${v === level}">${esc(l)}</button>`)
         .join('')}</div>
       <div class="grow"><label class="sr-only" for="log-filter">Filter log messages</label>
-        <input id="log-filter" type="search" placeholder="Filter messages" autocomplete="off"></div>
+        <input id="log-filter" type="search" placeholder="Filter messages" autocomplete="off" value="${esc(query.get('q') || '')}"></div>
       <label class="check"><input type="checkbox" id="log-live" checked> Refresh automatically</label>
     </div>
     <div class="panel log" id="log" aria-live="off"></div>`);
 
+  // Responses can arrive out of order (typing while the timer polls); only
+  // the newest request may draw.
+  let seq = 0;
   const draw = async () => {
+    const mine = ++seq;
     const qs = new URLSearchParams();
     if (level) qs.set('level', level);
     const f = $('#log-filter')?.value.trim();
     if (f) qs.set('q', f);
     const d = await api('/api/logs?' + qs);
-    if (!isCurrent()) return;
+    if (!isCurrent() || mine !== seq) return;
     $('#log').innerHTML = d.entries.length
       ? d.entries
           .map((e) => {
@@ -1046,6 +1087,8 @@ async function renderLogs({ query, isCurrent }) {
     b.addEventListener('click', () => {
       const qs = new URLSearchParams();
       if (b.dataset.level) qs.set('level', b.dataset.level);
+      const f = $('#log-filter')?.value.trim();
+      if (f) qs.set('q', f);
       go('/logs', qs, { replace: true });
     })
   );
@@ -1054,6 +1097,133 @@ async function renderLogs({ query, isCurrent }) {
     if ($('#log-live')?.checked) draw().catch(() => {});
   }, 3000);
   onLeave(() => clearInterval(timer));
+}
+
+// ------------------------------------------------------------------- audit
+
+const AUDIT_ACTIONS = {
+  'auth.login': 'Signed in',
+  'auth.login_2fa': 'Two-factor code',
+  'auth.logout': 'Signed out',
+  'account.password_change': 'Changed password',
+  'account.password_check': 'Password confirmation',
+  'account.2fa_enable': 'Turned on two-factor',
+  'account.2fa_disable': 'Turned off two-factor',
+  'token.create': 'Created access token',
+  'token.revoke': 'Revoked access token',
+  'user.create': 'Added user',
+  'user.role': 'Changed role',
+  'user.disable': 'Disabled user',
+  'user.enable': 'Enabled user',
+  'user.delete': 'Deleted user',
+  'user.reset_password': 'Reset password',
+  'user.reset_2fa': 'Turned off two-factor for user',
+  'package.delete': 'Deleted package',
+  'file.delete': 'Deleted file',
+  'repo.invalidate': 'Invalidated cache',
+  'cleanup.policy': 'Changed cleanup rules',
+  'task.run': 'Ran task',
+  'audit.export': 'Exported audit log',
+};
+
+const AUDIT_FILTERS = [
+  ['', 'All actions'],
+  ['auth', 'Sign-ins'],
+  ['account', 'Account changes'],
+  ['token', 'Access tokens'],
+  ['user', 'User management'],
+  ['package', 'Package deletions'],
+  ['file', 'File deletions'],
+  ['repo', 'Cache invalidation'],
+  ['cleanup', 'Cleanup rules'],
+  ['task', 'Tasks'],
+];
+
+const AUDIT_PAGE = 100;
+
+async function renderAudit({ query, isCurrent }) {
+  const q = query.get('q') || '';
+  const action = query.get('action') || '';
+  const failed = query.get('failed') === '1';
+  const page = Math.max(1, parseInt(query.get('page') || '1', 10) || 1);
+
+  const apiQuery = new URLSearchParams({ limit: AUDIT_PAGE, offset: (page - 1) * AUDIT_PAGE });
+  if (q) apiQuery.set('q', q);
+  if (action) apiQuery.set('action', action);
+  if (failed) apiQuery.set('failed', 'true');
+  const d = await api('/api/audit?' + apiQuery);
+  if (!isCurrent()) return;
+
+  const exportQuery = new URLSearchParams(apiQuery);
+  exportQuery.delete('limit');
+  exportQuery.delete('offset');
+
+  const rows = d.entries
+    .map(
+      (e) => `<tr>
+        <td><time datetime="${esc(new Date(e.at * 1000).toISOString())}" title="${esc(ago(e.at))}">${esc(fullTime(e.at))}</time></td>
+        <td><strong>${esc(e.actor)}</strong></td>
+        <td>${e.ok ? '' : '<span class="status"><span class="dot bad"></span>Failed:</span> '}${esc(AUDIT_ACTIONS[e.action] || e.action)}</td>
+        <td class="mono">${esc(e.target)}</td>
+        <td class="mono hide-sm">${esc(e.ip)}</td>
+      </tr>`
+    )
+    .join('');
+
+  const pages = Math.max(1, Math.ceil(d.total / AUDIT_PAGE));
+  const from = d.total ? d.offset + 1 : 0;
+  const to = d.offset + d.entries.length;
+  const pager = d.total > AUDIT_PAGE
+    ? `<div class="pager"><span>${esc(count(from))} to ${esc(count(to))} of ${esc(count(d.total))}</span>
+        <span class="page-actions">
+          <button class="small" data-page="${page - 1}" ${page <= 1 ? 'disabled' : ''}>Previous</button>
+          <button class="small" data-page="${page + 1}" ${page >= pages ? 'disabled' : ''}>Next</button>
+        </span></div>`
+    : '';
+
+  setView(`
+    <div class="page-head">
+      <div><h1>Audit log</h1>
+      <p>Who signed in and what they changed. Entries are kept for ${esc(plural(d.retention_days, 'day'))} (<code>GRANARY_AUDIT_DAYS</code>) and survive restarts.</p></div>
+      <div class="page-actions"><a class="btn" href="/api/audit.csv?${esc(exportQuery.toString())}" download>Export CSV</a></div>
+    </div>
+    <form class="toolbar" id="audit-filter" role="search">
+      <div class="grow"><label class="sr-only" for="audit-q">Search user, target or address</label>
+        <input id="audit-q" type="search" placeholder="Search user, target or address" value="${esc(q)}" autocomplete="off"></div>
+      <label class="sr-only" for="audit-action">Action</label>
+      <select id="audit-action">${AUDIT_FILTERS.map(([v, l]) => `<option value="${esc(v)}" ${v === action ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
+      <label class="check"><input type="checkbox" id="audit-failed" ${failed ? 'checked' : ''}> Failures only</label>
+    </form>
+    <div class="panel">
+      ${d.entries.length
+        ? `<div class="table-wrap"><table>
+            <thead><tr><th>Time</th><th>User</th><th>Action</th><th>Target</th><th class="hide-sm">Address</th></tr></thead>
+            <tbody>${rows}</tbody></table></div>${pager}`
+        : '<div class="empty"><strong>No audit entries match</strong>Try a different search or action.</div>'}
+    </div>`);
+
+  const update = (changes) => {
+    const next = new URLSearchParams(query);
+    for (const [k, v] of Object.entries(changes)) {
+      if (v === '' || v == null || v === false) next.delete(k);
+      else next.set(k, v);
+    }
+    go('/audit', next, { replace: true });
+  };
+  $('#audit-filter').addEventListener('submit', (e) => {
+    e.preventDefault();
+    update({ q: $('#audit-q').value.trim(), page: '' });
+  });
+  $('#audit-q').addEventListener(
+    'search',
+    () => !$('#audit-q').value && update({ q: '', page: '' })
+  );
+  $('#audit-action').addEventListener('change', (e) => update({ action: e.target.value, page: '' }));
+  $('#audit-failed').addEventListener('change', (e) => update({ failed: e.target.checked ? '1' : '', page: '' }));
+  view().addEventListener('click', (e) => {
+    const p = e.target.closest('[data-page]');
+    if (p && !p.disabled) update({ page: p.dataset.page });
+  });
 }
 
 // ----------------------------------------------------------------- account
@@ -1100,6 +1270,7 @@ async function renderAccount({ isCurrent }) {
       try {
         await api('/api/account/2fa/disable', { method: 'POST', body: { password: $('#tfa-pw').value } });
         toast('Two-factor authentication turned off');
+        me.user.totp_enabled = false;
         drawOff();
       } catch (ex) {
         showError($('#tfa-off-err'), ex.message);
@@ -1115,7 +1286,7 @@ async function renderAccount({ isCurrent }) {
       tfa.innerHTML = `
         <p>Scan this code with your authenticator app, then enter the 6-digit code it shows.</p>
         <div class="tfa-setup">
-          <img class="qr" src="${esc(r.qr)}" alt="QR code for your authenticator app">
+          <img class="qr" src="${esc(safeUrl(r.qr))}" alt="QR code for your authenticator app">
           <div class="stack">
             <div class="field"><span class="label">Or enter this key by hand</span>${reveal(r.secret)}</div>
             <form class="stack" id="tfa-on" novalidate>
@@ -1132,6 +1303,7 @@ async function renderAccount({ isCurrent }) {
         try {
           await api('/api/account/2fa/enable', { method: 'POST', body: { code: $('#tfa-code').value } });
           toast('Two-factor authentication is on');
+          me.user.totp_enabled = true;
           drawOn();
         } catch (ex) {
           showError($('#tfa-on-err'), ex.message);
@@ -1211,7 +1383,7 @@ async function renderTokens({ query, isCurrent }) {
       showError($('#tk-err'), '');
       const snippets = repos.repos
         .map((repo) => {
-          const snippet = repo.setup.snippet.replaceAll('YOUR_TOKEN', r.token);
+          const snippet = repo.setup.snippet.replaceAll('YOUR_TOKEN', () => r.token);
           const after = repo.setup.after ? `<p class="snippet-file">${esc(repo.setup.after)}</p>` : '';
           return `<div class="setup-block"><div class="snippet-file">${chip(repo.id)} Add to ${esc(repo.setup.file)}</div>
             <div class="snippet"><pre>${esc(snippet)}</pre><button class="small" type="button" data-copy="${esc(snippet)}">Copy</button></div>${after}</div>`;
@@ -1225,9 +1397,9 @@ async function renderTokens({ query, isCurrent }) {
         </div>`;
       $('#tk-name').value = '';
       const fresh = await api('/api/tokens' + (all ? '?all=true' : ''));
-      $('#tk-list').innerHTML = tokenList(fresh.tokens);
+      if (isCurrent()) $('#tk-list').innerHTML = tokenList(fresh.tokens);
     } catch (ex) {
-      showError($('#tk-err'), ex.message);
+      if (isCurrent()) showError($('#tk-err'), ex.message);
     }
   });
 
@@ -1326,6 +1498,7 @@ async function renderUsers({ isCurrent }) {
       if (Number(sel.dataset.roleFor) === me.user.id) {
         me = await api('/api/auth/me');
         showShell();
+        if (!isAdmin()) return go('/');
       }
       route();
     } catch (ex) {

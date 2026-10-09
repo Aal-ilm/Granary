@@ -92,6 +92,8 @@ body {
 
 a { color: inherit; }
 code, .mono { font-family: var(--mono); font-size: 12.5px; }
+/* Long URLs and paths wrap rather than widening the page on phones. */
+code { overflow-wrap: anywhere; }
 .num { font-variant-numeric: tabular-nums; }
 .muted { color: var(--muted); }
 .hidden { display: none !important; }
@@ -362,7 +364,8 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--grain-fi
 
 /* ----------------------------------------------------------------- tables */
 
-.table-wrap { overflow-x: auto; }
+/* position: relative keeps visually-hidden labels inside the scroll area. */
+.table-wrap { overflow-x: auto; position: relative; }
 table { width: 100%; border-collapse: collapse; }
 th, td {
   text-align: left;
@@ -703,8 +706,10 @@ dialog .err { color: var(--danger); font-size: 13px; margin: 8px 0 0; }
 }
 
 @media (max-width: 760px) {
-  .shell { grid-template-columns: 1fr; }
+  /* minmax(0, …) lets the nav row scroll instead of widening the page. */
+  .shell { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr; }
   .side {
+    min-width: 0;
     position: static;
     height: auto;
     padding: 12px 16px;
