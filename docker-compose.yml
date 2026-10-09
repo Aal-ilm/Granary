@@ -5,8 +5,10 @@ services:
     container_name: granary
     restart: unless-stopped
     ports:
-      # Host port. Change it with GRANARY_PORT in .env if 8080 is taken.
-      - "${GRANARY_PORT:-8080}:8080"
+      # No host port given: Docker picks a free one when the container starts.
+      # Find it with: docker compose port granary 8080
+      # To pin a port instead, write it as "HOSTPORT:8080", e.g. "8081:8080".
+      - "8080"
     volumes:
       - granary-data:/data
     environment:

@@ -37,10 +37,18 @@ echo "GRANARY_ADMIN_TOKEN=$(openssl rand -hex 24)" > .env   # protects admin act
 docker compose up -d --build
 ```
 
-If port 8080 is already in use on the host, add `GRANARY_PORT=8081` (or any
-free port) to `.env` and run the command again.
+Docker gives Granary a free port on the host. See which one with:
 
-Then open `http://localhost:8080/` (or the port you chose). The Repositories page has ready-to-paste
+```sh
+docker compose port granary 8080      # prints e.g. 0.0.0.0:32768
+```
+
+Then open that address in a browser.
+
+The automatic port can change when the container is recreated or the host
+reboots, and every client config contains the URL. Once Granary is set up the
+way you like, pin the port it was given by changing the `ports:` entry in
+`docker-compose.yml` from `"8080"` to `"32768:8080"` (using your port). The Repositories page has ready-to-paste
 client configuration using the address you reached it on.
 
 Without compose:
