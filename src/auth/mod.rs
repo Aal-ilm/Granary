@@ -6,6 +6,8 @@
 pub mod api;
 mod store;
 
+// Dynamic SQL here joins fixed column lists and clauses; values are always bound.
+use sqlx::AssertSqlSafe;
 use std::{
     collections::HashMap,
     net::IpAddr,
@@ -476,18 +478,19 @@ impl Backend {
     }
 
     pub async fn user_by_id(&self, id: i64) -> sqlx::Result<Option<User>> {
-        let row: Option<UserRow> =
-            sqlx::query_as(&format!("SELECT {USER_COLUMNS} FROM users WHERE id = ?"))
-                .bind(id)
-                .fetch_optional(&self.db)
-                .await?;
+        let row: Option<UserRow> = sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT {USER_COLUMNS} FROM users WHERE id = ?"
+        )))
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await?;
         Ok(row.map(user_from_row))
     }
 
     async fn user_by_name(&self, name: &str) -> sqlx::Result<Option<User>> {
-        let row: Option<UserRow> = sqlx::query_as(&format!(
+        let row: Option<UserRow> = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT {USER_COLUMNS} FROM users WHERE username = ?"
-        ))
+        )))
         .bind(name)
         .fetch_optional(&self.db)
         .await?;
@@ -495,9 +498,9 @@ impl Backend {
     }
 
     pub async fn list_users(&self) -> sqlx::Result<Vec<User>> {
-        let rows: Vec<UserRow> = sqlx::query_as(&format!(
+        let rows: Vec<UserRow> = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT {USER_COLUMNS} FROM users ORDER BY username"
-        ))
+        )))
         .fetch_all(&self.db)
         .await?;
         Ok(rows.into_iter().map(user_from_row).collect())

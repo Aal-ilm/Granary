@@ -1,5 +1,7 @@
 //! Sign-in, account, user management and access token endpoints.
 
+// Dynamic SQL here joins fixed column lists and clauses; values are always bound.
+use sqlx::AssertSqlSafe;
 use std::net::IpAddr;
 
 use axum::{
@@ -417,13 +419,15 @@ async fn list_tokens(
     let sql = "SELECT t.id, t.user_id, u.username, t.name, t.hint, t.created_at, t.last_used, t.expires_at
                FROM tokens t JOIN users u ON u.id = t.user_id";
     let rows: Vec<TokenRow> = if all {
-        sqlx::query_as(&format!("{sql} ORDER BY u.username, t.created_at DESC"))
-            .fetch_all(&st.auth.db)
-            .await
+        sqlx::query_as(AssertSqlSafe(format!(
+            "{sql} ORDER BY u.username, t.created_at DESC"
+        )))
+        .fetch_all(&st.auth.db)
+        .await
     } else {
-        sqlx::query_as(&format!(
+        sqlx::query_as(AssertSqlSafe(format!(
             "{sql} WHERE t.user_id = ? ORDER BY t.created_at DESC"
-        ))
+        )))
         .bind(user.id)
         .fetch_all(&st.auth.db)
         .await

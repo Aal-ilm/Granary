@@ -188,6 +188,11 @@ reverse proxy, monitoring, upgrades and recovery.
 Both compose files run Granary as an unprivileged user with a read-only
 root filesystem, no Linux capabilities and `no-new-privileges`.
 
+The image is built on Google's distroless base, which contains only the C
+runtime libraries and CA certificates Granary needs: no shell, package
+manager or other tools. SQLite is compiled into the binary. CI scans the
+image with Trivy and the dependencies with `cargo audit` (also weekly).
+
 ## Configuration
 
 All settings are environment variables.

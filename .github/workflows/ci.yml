@@ -55,6 +55,20 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+      # Build locally first and scan it, so an image with a fixable high or
+      # critical vulnerability is never published.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: granary:scan
+          cache-from: type=gha
+      - uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: granary:scan
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
       - uses: docker/build-push-action@v6
         with:
           context: .

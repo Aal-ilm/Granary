@@ -14,7 +14,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::SqlitePool;
+// Dynamic SQL below is built only from fixed fragments; every value is bound.
+use sqlx::{AssertSqlSafe, SqlitePool};
 
 use crate::{
     AppState,
@@ -138,7 +139,7 @@ async fn query_entries(
 ) -> sqlx::Result<(i64, Vec<Entry>)> {
     let (clause, binds) = filter(q);
     let count_sql = format!("SELECT COUNT(*) FROM audit{clause}");
-    let mut count = sqlx::query_as::<_, (i64,)>(&count_sql);
+    let mut count = sqlx::query_as::<_, (i64,)>(AssertSqlSafe(count_sql));
     for b in &binds {
         count = count.bind(b);
     }
@@ -146,7 +147,7 @@ async fn query_entries(
     let sql = format!(
         "SELECT id, at, actor, action, target, ip, ok FROM audit{clause} ORDER BY id DESC LIMIT ? OFFSET ?"
     );
-    let mut rows = sqlx::query_as::<_, Entry>(&sql);
+    let mut rows = sqlx::query_as::<_, Entry>(AssertSqlSafe(sql));
     for b in &binds {
         rows = rows.bind(b);
     }
