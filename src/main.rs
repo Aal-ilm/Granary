@@ -1,12 +1,15 @@
 //! Granary: a small, self-hostable caching proxy for package registries.
 
 mod admin;
+mod audit;
 mod auth;
 mod config;
 mod error;
 mod formats;
 mod inventory;
 mod logbuf;
+mod metrics;
+mod net;
 mod store;
 mod ui;
 mod util;
@@ -52,6 +55,7 @@ pub fn app(state: AppState, sessions: SqliteSessionStore) -> Router {
     let api = Router::new()
         .merge(admin::api::router())
         .merge(auth::api::router())
+        .merge(audit::router())
         .route_layer(middleware::from_fn(auth::api_guard));
 
     let idle = state.cfg.session_idle.as_secs() as i64;
@@ -68,8 +72,17 @@ pub fn app(state: AppState, sessions: SqliteSessionStore) -> Router {
         .merge(ui::router())
         .merge(api)
         .merge(packages)
-        .with_state(state)
+        .merge(metrics::router())
         .layer(auth_layer)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            net::client_ip,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            net::security_headers,
+        ))
+        .with_state(state)
 }
 
 /// `granary healthcheck`: exit 0 if the local server answers `/healthz`.
@@ -145,6 +158,13 @@ async fn run() -> anyhow::Result<()> {
         println!();
     }
     let sessions = SqliteSessionStore::new(db.clone());
+    // Sessions from versions that stored raw session IDs can't be looked up
+    // any more; remove them (those people sign in once more).
+    if let Ok(n) = sessions.remove_unhashed().await
+        && n > 0
+    {
+        tracing::info!("removed {n} sessions saved in the old format");
+    }
     let backend = Backend::new(db).await?;
     tracing::info!(
         data_dir = %store.root().display(),
@@ -155,6 +175,12 @@ async fn run() -> anyhow::Result<()> {
     );
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
+    if !cfg.trusted_proxies.is_empty() {
+        tracing::info!(
+            "trusting X-Forwarded-* headers from {} proxy range(s)",
+            cfg.trusted_proxies.len()
+        );
+    }
     if !cfg.client_auth {
         tracing::warn!(
             "GRANARY_CLIENT_AUTH is off: anyone who can reach Granary can download packages through it"

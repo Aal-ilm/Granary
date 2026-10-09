@@ -105,6 +105,8 @@ mod tests {
             client_auth: true,
             cookie_secure: false,
             session_idle: std::time::Duration::from_secs(3600),
+            trusted_proxies: Vec::new(),
+            audit_days: 365,
         }
     }
 }

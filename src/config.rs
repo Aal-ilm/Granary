@@ -1,7 +1,7 @@
 //! Runtime configuration, read from environment variables so the service is
 //! easy to configure from `docker run -e` or a compose file.
 
-use std::{path::PathBuf, time::Duration};
+use std::{net::IpAddr, path::PathBuf, time::Duration};
 
 use anyhow::Context;
 
@@ -33,6 +33,61 @@ pub struct Config {
     pub cookie_secure: bool,
     /// Sign users out after this much inactivity.
     pub session_idle: Duration,
+    /// Reverse proxies whose `X-Forwarded-*` headers are believed. Requests
+    /// from anywhere else have those headers removed before routing.
+    pub trusted_proxies: Vec<IpNet>,
+    /// Delete audit log entries older than this many days.
+    pub audit_days: u32,
+}
+
+/// An IP network such as `10.0.0.0/8` or `fd00::/8` (a bare address is a /32 or /128).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IpNet {
+    addr: IpAddr,
+    prefix: u8,
+}
+
+impl IpNet {
+    pub fn parse(s: &str) -> Option<Self> {
+        let (addr, prefix) = match s.split_once('/') {
+            Some((a, p)) => (a.parse::<IpAddr>().ok()?, Some(p.parse::<u8>().ok()?)),
+            None => (s.parse::<IpAddr>().ok()?, None),
+        };
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        let prefix = prefix.unwrap_or(max);
+        (prefix <= max).then_some(Self { addr, prefix })
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        // Treat IPv4-mapped IPv6 peers (::ffff:a.b.c.d) as the IPv4 address.
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            v4 => v4,
+        };
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let mask = u32::MAX.checked_shl(32 - self.prefix as u32).unwrap_or(0);
+                u32::from(net) & mask == u32::from(ip) & mask
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let mask = u128::MAX.checked_shl(128 - self.prefix as u32).unwrap_or(0);
+                u128::from(net) & mask == u128::from(ip) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+fn parse_proxies(raw: &str) -> anyhow::Result<Vec<IpNet>> {
+    raw.split([',', ' '])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            IpNet::parse(s).with_context(|| {
+                format!("GRANARY_TRUSTED_PROXIES: {s:?} is not an IP address or CIDR range")
+            })
+        })
+        .collect()
 }
 
 fn var(key: &str, default: &str) -> String {
@@ -101,6 +156,40 @@ impl Config {
                     .clamp(1, 24 * 30)
                     * 3600,
             ),
+            trusted_proxies: parse_proxies(&var("GRANARY_TRUSTED_PROXIES", ""))?,
+            audit_days: var("GRANARY_AUDIT_DAYS", "365")
+                .parse::<u32>()
+                .context("GRANARY_AUDIT_DAYS must be a whole number of days")?
+                .clamp(1, 3650),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ip_networks() {
+        let lan = IpNet::parse("192.168.1.0/24").unwrap();
+        assert!(lan.contains("192.168.1.77".parse().unwrap()));
+        assert!(!lan.contains("192.168.2.1".parse().unwrap()));
+        assert!(lan.contains("::ffff:192.168.1.5".parse().unwrap()));
+        let one = IpNet::parse("10.0.0.1").unwrap();
+        assert!(one.contains("10.0.0.1".parse().unwrap()));
+        assert!(!one.contains("10.0.0.2".parse().unwrap()));
+        assert!(
+            IpNet::parse("0.0.0.0/0")
+                .unwrap()
+                .contains("8.8.8.8".parse().unwrap())
+        );
+        assert!(
+            IpNet::parse("fd00::/8")
+                .unwrap()
+                .contains("fd12::1".parse().unwrap())
+        );
+        assert!(IpNet::parse("10.0.0.0/33").is_none());
+        assert!(parse_proxies("10.0.0.0/8, 172.16.0.0/12").unwrap().len() == 2);
+        assert!(parse_proxies("nonsense").is_err());
     }
 }

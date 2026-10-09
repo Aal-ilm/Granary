@@ -5,7 +5,7 @@
 use std::{cmp::Ordering, collections::BTreeMap, sync::atomic::Ordering as AtomicOrdering};
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -20,6 +20,7 @@ use crate::{
     AppState,
     error::{AppError, AppResult},
     inventory::{self, Asset, REPOS},
+    net::ClientIp,
     store::{dir_size, now_secs},
     util::base_url,
 };
@@ -44,6 +45,10 @@ pub fn router() -> Router<AppState> {
 
 // -------------------------------------------------------------------- auth
 
+async fn audit(st: &AppState, actor: &str, action: &str, target: &str, ip: ClientIp) {
+    crate::audit::record(&st.auth.db, actor, action, target, Some(ip.0), true).await;
+}
+
 fn repo_id(s: &str) -> AppResult<&'static str> {
     REPOS
         .iter()
@@ -55,15 +60,15 @@ fn repo_id(s: &str) -> AppResult<&'static str> {
 // ---------------------------------------------------------------- overview
 
 #[derive(Serialize)]
-struct RepoUsage {
-    repo: &'static str,
-    packages: usize,
-    files: usize,
-    size: u64,
-    meta_size: u64,
+pub(crate) struct RepoUsage {
+    pub repo: &'static str,
+    pub packages: usize,
+    pub files: usize,
+    pub size: u64,
+    pub meta_size: u64,
 }
 
-async fn usage(st: &AppState, inv: &[Asset]) -> Vec<RepoUsage> {
+pub(crate) async fn usage(st: &AppState, inv: &[Asset]) -> Vec<RepoUsage> {
     let meta_dirs: Vec<_> = REPOS.iter().map(|r| st.store.meta_dir(r)).collect();
     let meta_sizes = tokio::task::spawn_blocking(move || {
         meta_dirs.iter().map(|d| dir_size(d)).collect::<Vec<_>>()
@@ -216,12 +221,14 @@ async fn repos(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
 async fn invalidate(
     State(st): State<AppState>,
     auth: AuthSession,
+    Extension(ip): Extension<ClientIp>,
     Path(repo): Path<String>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&auth)?;
+    let admin = require_admin(&auth)?;
     let repo = repo_id(&repo)?;
     let freed = st.store.invalidate_meta(repo).await?;
     tracing::info!("{repo}: metadata cache invalidated");
+    audit(&st, &admin.username, "repo.invalidate", repo, ip).await;
     Ok(Json(json!({ "freed": freed })))
 }
 
@@ -422,9 +429,10 @@ async fn component(
 async fn delete_component(
     State(st): State<AppState>,
     auth: AuthSession,
+    Extension(ip): Extension<ClientIp>,
     Query(q): Query<ComponentQuery>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&auth)?;
+    let admin = require_admin(&auth)?;
     let repo = repo_id(&q.repo)?;
     let inv = st.admin.inventory(&st.store).await;
     let paths: Vec<String> = inv
@@ -448,6 +456,14 @@ async fn delete_component(
     st.admin.invalidate_inventory();
     let _ = st.store.flush_access().await;
     tracing::info!("{repo}: deleted {} ({files} files)", q.name);
+    audit(
+        &st,
+        &admin.username,
+        "package.delete",
+        &format!("{repo}/{} ({files} files)", q.name),
+        ip,
+    )
+    .await;
     Ok(Json(json!({ "files": files, "bytes": bytes })))
 }
 
@@ -460,14 +476,23 @@ struct AssetQuery {
 async fn delete_asset(
     State(st): State<AppState>,
     auth: AuthSession,
+    Extension(ip): Extension<ClientIp>,
     Query(q): Query<AssetQuery>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&auth)?;
+    let admin = require_admin(&auth)?;
     let repo = repo_id(&q.repo)?;
     let freed = st.store.delete_file(repo, &q.path).await?;
     st.admin.invalidate_inventory();
     let _ = st.store.flush_access().await;
     tracing::info!("{repo}: deleted {}", q.path);
+    audit(
+        &st,
+        &admin.username,
+        "file.delete",
+        &format!("{repo}/{}", q.path),
+        ip,
+    )
+    .await;
     Ok(Json(json!({ "files": 1, "bytes": freed })))
 }
 
@@ -496,9 +521,10 @@ fn validate_policy(p: &CleanupPolicy) -> AppResult<()> {
 async fn cleanup_put(
     State(st): State<AppState>,
     auth: AuthSession,
+    Extension(ip): Extension<ClientIp>,
     Json(policy): Json<CleanupPolicy>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&auth)?;
+    let admin = require_admin(&auth)?;
     validate_policy(&policy)?;
     st.admin.settings.lock().unwrap().cleanup = policy.clone();
     st.admin.save_settings().await?;
@@ -512,6 +538,17 @@ async fn cleanup_put(
         },
         policy.unused_days
     );
+    let summary = format!(
+        "{}, {} days, {}",
+        if policy.enabled {
+            "scheduled"
+        } else {
+            "manual"
+        },
+        policy.unused_days,
+        policy.repos.join("+")
+    );
+    audit(&st, &admin.username, "cleanup.policy", &summary, ip).await;
     Ok(Json(json!({ "policy": policy })))
 }
 
@@ -529,8 +566,13 @@ async fn cleanup_preview(
     Ok(Json(json!(cleanup(&st, &policy, true).await)))
 }
 
-async fn cleanup_run(State(st): State<AppState>, auth: AuthSession) -> AppResult<Response> {
-    require_admin(&auth)?;
+async fn cleanup_run(
+    State(st): State<AppState>,
+    auth: AuthSession,
+    Extension(ip): Extension<ClientIp>,
+) -> AppResult<Response> {
+    let admin = require_admin(&auth)?.username.clone();
+    audit(&st, &admin, "task.run", "cleanup", ip).await;
     if !run_task(&st, "cleanup").await {
         return Err(AppError::new(
             StatusCode::CONFLICT,
@@ -550,9 +592,10 @@ async fn tasks(State(st): State<AppState>) -> Json<Value> {
 async fn task_run(
     State(st): State<AppState>,
     auth: AuthSession,
+    Extension(ip): Extension<ClientIp>,
     Path(id): Path<String>,
 ) -> AppResult<Response> {
-    require_admin(&auth)?;
+    let admin = require_admin(&auth)?.username.clone();
     let known = st
         .admin
         .tasks
@@ -570,6 +613,7 @@ async fn task_run(
             "task is already running",
         ));
     }
+    audit(&st, &admin, "task.run", id, ip).await;
     tokio::spawn(async move {
         run_task(&st, id).await;
     });
@@ -657,7 +701,7 @@ mod tests {
 
     #[test]
     fn natural_version_order() {
-        let mut v = vec!["1.10.0", "1.2.0", "1.9.3", "0.9", "1.10.0-rc.1"];
+        let mut v = ["1.10.0", "1.2.0", "1.9.3", "0.9", "1.10.0-rc.1"];
         v.sort_by(|a, b| version_cmp(b, a));
         assert_eq!(v[0], "1.10.0");
         assert_eq!(v[1], "1.10.0-rc.1");

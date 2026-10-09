@@ -1,10 +1,10 @@
 //! Sign-in, account, user management and access token endpoints.
 
-use std::net::SocketAddr;
+use std::net::IpAddr;
 
 use axum::{
-    Json, Router,
-    extract::{ConnectInfo, Path, Query, State},
+    Extension, Json, Router,
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{delete, get, post},
 };
@@ -18,8 +18,61 @@ use super::{
 use crate::{
     AppState,
     error::{AppError, AppResult},
+    net::ClientIp,
     store::now_secs,
 };
+
+async fn audit(st: &AppState, actor: &str, action: &str, target: &str, ip: IpAddr, ok: bool) {
+    crate::audit::record(&st.auth.db, actor, action, target, Some(ip), ok).await;
+}
+
+/// Re-check the signed-in user's password before a sensitive change, with
+/// the same lockout as signing in so a borrowed session can't be used to
+/// guess it.
+async fn confirm_password(
+    st: &AppState,
+    user: &User,
+    password: String,
+    ip: IpAddr,
+) -> AppResult<()> {
+    let limiter = &st.auth.limiter;
+    if let Some(secs) = limiter.locked_for(&user.username, ip) {
+        return Err(AppError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "too many wrong passwords. Try again in {} minutes",
+                secs.div_ceil(60).max(1)
+            ),
+        ));
+    }
+    let creds = Credentials {
+        username: user.username.clone(),
+        password,
+    };
+    if st
+        .auth
+        .check_password(&creds)
+        .await
+        .map_err(db_err)?
+        .is_none()
+    {
+        limiter.record_failure(&user.username, ip);
+        audit(
+            st,
+            &user.username,
+            "account.password_check",
+            &user.username,
+            ip,
+            false,
+        )
+        .await;
+        return Err(AppError::new(
+            StatusCode::UNAUTHORIZED,
+            "your password is wrong",
+        ));
+    }
+    Ok(())
+}
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -60,11 +113,16 @@ struct LoginBody {
 async fn login(
     State(st): State<AppState>,
     mut auth: AuthSession,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
     Json(body): Json<LoginBody>,
 ) -> AppResult<Json<Value>> {
-    let ip = peer.ip();
     let username = body.username.trim().to_string();
+    if username.len() > 64 || body.password.len() > 1024 {
+        return Err(AppError::new(
+            StatusCode::UNAUTHORIZED,
+            "wrong username or password",
+        ));
+    }
     let limiter = &st.auth.limiter;
 
     if let Some(secs) = limiter.locked_for(&username, ip) {
@@ -88,6 +146,7 @@ async fn login(
         Ok(None) => {
             limiter.record_failure(&username, ip);
             tracing::warn!("failed sign-in for {username:?} from {ip}");
+            audit(&st, &username, "auth.login", &username, ip, false).await;
             return Err(wrong());
         }
         Err(e) => {
@@ -106,6 +165,15 @@ async fn login(
         if !st.auth.check_totp(&user, &code).await.map_err(db_err)? {
             limiter.record_failure(&username, ip);
             tracing::warn!("failed two-factor code for {:?} from {ip}", user.username);
+            audit(
+                &st,
+                &user.username,
+                "auth.login_2fa",
+                &user.username,
+                ip,
+                false,
+            )
+            .await;
             return Err(AppError::new(
                 StatusCode::UNAUTHORIZED,
                 "that code didn't work. Wait for a new one and try again",
@@ -116,7 +184,7 @@ async fn login(
     auth.login(&user)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    limiter.record_success(&username);
+    limiter.record_success(&username, ip);
     sqlx::query("UPDATE users SET last_login = ? WHERE id = ?")
         .bind(now_secs() as i64)
         .bind(user.id)
@@ -124,12 +192,18 @@ async fn login(
         .await
         .map_err(db_err)?;
     tracing::info!("{} signed in from {ip}", user.username);
+    audit(&st, &user.username, "auth.login", &user.username, ip, true).await;
     Ok(Json(json!({ "status": "ok", "user": user })))
 }
 
-async fn logout(mut auth: AuthSession) -> AppResult<Json<Value>> {
+async fn logout(
+    State(st): State<AppState>,
+    mut auth: AuthSession,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
+) -> AppResult<Json<Value>> {
     if let Ok(Some(user)) = auth.logout().await {
         tracing::info!("{} signed out", user.username);
+        audit(&st, &user.username, "auth.logout", &user.username, ip, true).await;
     }
     Ok(Json(json!({ "status": "ok" })))
 }
@@ -154,31 +228,17 @@ struct PasswordBody {
 async fn change_password(
     State(st): State<AppState>,
     mut auth: AuthSession,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
     Json(body): Json<PasswordBody>,
 ) -> AppResult<Json<Value>> {
     let user = current_user(&auth)?.clone();
-    let creds = Credentials {
-        username: user.username.clone(),
-        password: body.current,
-    };
-    if st
-        .auth
-        .check_password(&creds)
-        .await
-        .map_err(db_err)?
-        .is_none()
-    {
-        return Err(AppError::new(
-            StatusCode::UNAUTHORIZED,
-            "your current password is wrong",
-        ));
-    }
     check_password_policy(&body.new)?;
-    if creds.password == body.new {
+    if body.current == body.new {
         return Err(AppError::bad_request(
             "choose a password different from your current one",
         ));
     }
+    confirm_password(&st, &user, body.current, ip).await?;
     let hash = hash_password(body.new)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -199,6 +259,15 @@ async fn change_password(
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     tracing::info!("{} changed their password", user.username);
+    audit(
+        &st,
+        &user.username,
+        "account.password_change",
+        &user.username,
+        ip,
+        true,
+    )
+    .await;
     Ok(Json(json!({ "status": "ok", "user": updated })))
 }
 
@@ -243,6 +312,7 @@ struct CodeBody {
 async fn totp_enable(
     State(st): State<AppState>,
     auth: AuthSession,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
     Json(body): Json<CodeBody>,
 ) -> AppResult<Json<Value>> {
     let user = current_user(&auth)?.clone();
@@ -273,6 +343,15 @@ async fn totp_enable(
     .await
     .map_err(db_err)?;
     tracing::info!("{} turned on two-factor authentication", user.username);
+    audit(
+        &st,
+        &user.username,
+        "account.2fa_enable",
+        &user.username,
+        ip,
+        true,
+    )
+    .await;
     Ok(Json(json!({ "status": "ok" })))
 }
 
@@ -284,25 +363,11 @@ struct DisableTotpBody {
 async fn totp_disable(
     State(st): State<AppState>,
     auth: AuthSession,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
     Json(body): Json<DisableTotpBody>,
 ) -> AppResult<Json<Value>> {
     let user = current_user(&auth)?.clone();
-    let creds = Credentials {
-        username: user.username.clone(),
-        password: body.password,
-    };
-    if st
-        .auth
-        .check_password(&creds)
-        .await
-        .map_err(db_err)?
-        .is_none()
-    {
-        return Err(AppError::new(
-            StatusCode::UNAUTHORIZED,
-            "your password is wrong",
-        ));
-    }
+    confirm_password(&st, &user, body.password, ip).await?;
     sqlx::query(
         "UPDATE users SET totp_enabled = 0, totp_secret = NULL, totp_pending = NULL WHERE id = ?",
     )
@@ -311,6 +376,15 @@ async fn totp_disable(
     .await
     .map_err(db_err)?;
     tracing::info!("{} turned off two-factor authentication", user.username);
+    audit(
+        &st,
+        &user.username,
+        "account.2fa_disable",
+        &user.username,
+        ip,
+        true,
+    )
+    .await;
     Ok(Json(json!({ "status": "ok" })))
 }
 
@@ -367,11 +441,12 @@ struct NewToken {
 async fn create_token(
     State(st): State<AppState>,
     auth: AuthSession,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
     Json(body): Json<NewToken>,
 ) -> AppResult<Json<Value>> {
     let user = current_user(&auth)?;
     let name = body.name.trim();
-    if name.is_empty() || name.len() > 80 {
+    if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
         return Err(AppError::bad_request(
             "give the token a name of up to 80 characters",
         ));
@@ -387,6 +462,15 @@ async fn create_token(
         .await
         .map_err(db_err)?;
     tracing::info!("{} created access token {name:?}", user.username);
+    audit(
+        &st,
+        &user.username,
+        "token.create",
+        &format!("#{id} {name}"),
+        ip,
+        true,
+    )
+    .await;
     Ok(Json(
         json!({ "id": id, "token": token, "name": name, "expires_at": expires_at }),
     ))
@@ -395,6 +479,7 @@ async fn create_token(
 async fn revoke_token(
     State(st): State<AppState>,
     auth: AuthSession,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<Value>> {
     let user = current_user(&auth)?;
@@ -415,6 +500,15 @@ async fn revoke_token(
         return Err(AppError::not_found());
     }
     tracing::info!("{} revoked access token #{id}", user.username);
+    audit(
+        &st,
+        &user.username,
+        "token.revoke",
+        &format!("#{id}"),
+        ip,
+        true,
+    )
+    .await;
     Ok(Json(json!({ "status": "ok" })))
 }
 
@@ -449,6 +543,7 @@ struct NewUser {
 async fn create_user(
     State(st): State<AppState>,
     auth: AuthSession,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
     Json(body): Json<NewUser>,
 ) -> AppResult<Json<Value>> {
     let admin = require_admin(&auth)?;
@@ -489,6 +584,15 @@ async fn create_user(
         admin.username,
         role.as_str()
     );
+    audit(
+        &st,
+        &admin.username,
+        "user.create",
+        &format!("{username} ({})", role.as_str()),
+        ip,
+        true,
+    )
+    .await;
     Ok(Json(json!({ "username": username, "password": password })))
 }
 
@@ -530,6 +634,7 @@ struct UserUpdate {
 async fn update_user(
     State(st): State<AppState>,
     auth: AuthSession,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
     Path(id): Path<i64>,
     Json(body): Json<UserUpdate>,
 ) -> AppResult<Json<Value>> {
@@ -553,6 +658,15 @@ async fn update_user(
             target.username,
             role.as_str()
         );
+        audit(
+            &st,
+            &admin.username,
+            "user.role",
+            &format!("{} -> {}", target.username, role.as_str()),
+            ip,
+            true,
+        )
+        .await;
     }
     if let Some(disabled) = body.disabled {
         if disabled {
@@ -573,6 +687,12 @@ async fn update_user(
             if disabled { "disabled" } else { "enabled" },
             target.username
         );
+        let action = if disabled {
+            "user.disable"
+        } else {
+            "user.enable"
+        };
+        audit(&st, &admin.username, action, &target.username, ip, true).await;
     }
     Ok(Json(json!({ "user": load_user(&st, id).await? })))
 }
@@ -580,6 +700,7 @@ async fn update_user(
 async fn reset_password(
     State(st): State<AppState>,
     auth: AuthSession,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<Value>> {
     let admin = require_admin(&auth)?;
@@ -600,6 +721,15 @@ async fn reset_password(
         admin.username,
         target.username
     );
+    audit(
+        &st,
+        &admin.username,
+        "user.reset_password",
+        &target.username,
+        ip,
+        true,
+    )
+    .await;
     Ok(Json(
         json!({ "username": target.username, "password": password }),
     ))
@@ -608,6 +738,7 @@ async fn reset_password(
 async fn reset_totp(
     State(st): State<AppState>,
     auth: AuthSession,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<Value>> {
     let admin = require_admin(&auth)?;
@@ -624,12 +755,22 @@ async fn reset_totp(
         admin.username,
         target.username
     );
+    audit(
+        &st,
+        &admin.username,
+        "user.reset_2fa",
+        &target.username,
+        ip,
+        true,
+    )
+    .await;
     Ok(Json(json!({ "status": "ok" })))
 }
 
 async fn delete_user(
     State(st): State<AppState>,
     auth: AuthSession,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<Value>> {
     let admin = require_admin(&auth)?.clone();
@@ -644,5 +785,14 @@ async fn delete_user(
         .await
         .map_err(db_err)?;
     tracing::info!("{} deleted user {}", admin.username, target.username);
+    audit(
+        &st,
+        &admin.username,
+        "user.delete",
+        &target.username,
+        ip,
+        true,
+    )
+    .await;
     Ok(Json(json!({ "status": "ok" })))
 }

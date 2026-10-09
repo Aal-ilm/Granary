@@ -88,7 +88,20 @@ pub fn scan_repo(repo: &'static str, root: &Path, access: &HashMap<String, u64>)
                 continue;
             };
             let rel = rel.to_string_lossy().replace('\\', "/");
-            let Some((package, version)) = classify(repo, &rel) else {
+            // PyPI `.metadata` files normally count toward their wheel. Ones
+            // whose wheel was never downloaded (pip and uv often resolve from
+            // metadata alone) are listed on their own, so they show up in
+            // Browse and can be cleaned up.
+            let classified = match rel.strip_suffix(".metadata") {
+                Some(dist) if repo == "pypi" => {
+                    if path.with_extension("").exists() {
+                        continue;
+                    }
+                    classify(repo, dist)
+                }
+                _ => classify(repo, &rel),
+            };
+            let Some((package, version)) = classified else {
                 continue;
             };
             let Ok(meta) = entry.metadata() else { continue };

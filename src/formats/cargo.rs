@@ -23,6 +23,8 @@ use axum::{
 use crate::{
     AppState,
     error::{AppError, AppResult},
+    inventory::meta_key,
+    store::Checksum,
     util::base_url,
 };
 
@@ -72,9 +74,39 @@ async fn download(
         .replace("{crate}", &krate)
         .replace("{version}", &version);
     let rel = format!("{lower}/{lower}-{version}.crate");
+    let expected = if st.store.has_file("cargo", &rel).await {
+        None
+    } else {
+        expected_cksum(&st, &lower, &version).await
+    };
     st.store
-        .file("cargo", &rel, &url, "application/x-tar")
+        .file("cargo", &rel, &url, "application/x-tar", expected)
         .await
+}
+
+/// The `cksum` the index publishes for this crate version.
+async fn expected_cksum(st: &AppState, name: &str, version: &str) -> Option<Checksum> {
+    let key = meta_key("cargo", name)?;
+    let url = format!("{}/{key}", st.cfg.cargo_index);
+    let meta = st
+        .store
+        .meta("cargo", &key, "raw", &url, "*/*")
+        .await
+        .ok()?;
+    cksum_from_index(&meta.body, version)
+}
+
+fn cksum_from_index(index: &[u8], version: &str) -> Option<Checksum> {
+    #[derive(serde::Deserialize)]
+    struct Line {
+        vers: String,
+        cksum: String,
+    }
+    index
+        .split(|b| *b == b'\n')
+        .filter_map(|l| serde_json::from_slice::<Line>(l).ok())
+        .find(|l| l.vers == version)
+        .and_then(|l| Checksum::sha256_hex(&l.cksum))
 }
 
 async fn index_file(State(st): State<AppState>, Path(path): Path<String>) -> AppResult<Response> {
@@ -96,5 +128,14 @@ mod tests {
         assert!(!valid_crate_name(""));
         assert!(valid_version("1.0.0-alpha.1+build.5"));
         assert!(!valid_version("1.0/../../x"));
+    }
+
+    #[test]
+    fn finds_cksum_in_index() {
+        let index = br#"{"name":"x","vers":"1.0.0","deps":[],"cksum":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","features":{},"yanked":false}
+{"name":"x","vers":"1.0.1","deps":[],"cksum":"00","features":{},"yanked":false}"#;
+        assert!(cksum_from_index(index, "1.0.0").is_some());
+        assert!(cksum_from_index(index, "1.0.1").is_none());
+        assert!(cksum_from_index(index, "2.0.0").is_none());
     }
 }

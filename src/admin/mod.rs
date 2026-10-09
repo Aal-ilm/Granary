@@ -238,7 +238,7 @@ impl Admin {
             task(
                 "sessions",
                 "Remove expired sign-ins",
-                "Deletes sessions that have timed out.",
+                "Deletes sessions that have timed out and audit entries past their retention period.",
                 3600,
                 60,
             ),
@@ -547,9 +547,13 @@ async fn run_task_with(st: &AppState, id: &str, sessions: Option<&SqliteSessionS
             let store = sessions
                 .cloned()
                 .unwrap_or_else(|| SqliteSessionStore::new(st.auth.db.clone()));
-            match store.delete_expired().await {
-                Ok(n) => (true, format!("Removed {n} expired sign-ins")),
-                Err(e) => (false, format!("Could not clean up sessions: {e}")),
+            let pruned = crate::audit::prune(&st.auth.db, st.cfg.audit_days).await;
+            match (store.delete_expired().await, pruned) {
+                (Ok(n), Ok(a)) => (
+                    true,
+                    format!("Removed {n} expired sign-ins and {a} old audit entries"),
+                ),
+                (Err(e), _) | (_, Err(e)) => (false, format!("Could not clean up: {e}")),
             }
         }
         "flush" => match st.store.flush_access().await {

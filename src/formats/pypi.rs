@@ -22,6 +22,8 @@ use axum::{
 use crate::{
     AppState,
     error::{AppError, AppResult},
+    inventory::classify,
+    store::Checksum,
     util::base_url,
 };
 
@@ -76,8 +78,12 @@ fn variant(headers: &HeaderMap) -> (&'static str, &'static str) {
     }
 }
 
-async fn redirect_slash(Path(project): Path<String>) -> Redirect {
-    Redirect::permanent(&format!("/pypi/simple/{}/", normalize(&project)))
+async fn redirect_slash(Path(project): Path<String>) -> AppResult<Redirect> {
+    let name = normalize(&project);
+    if !valid_project(&name) {
+        return Err(AppError::not_found());
+    }
+    Ok(Redirect::permanent(&format!("/pypi/simple/{name}/")))
 }
 
 async fn root_index(State(st): State<AppState>, headers: HeaderMap) -> AppResult<Response> {
@@ -113,9 +119,49 @@ async fn serve_page(
 
 async fn file(State(st): State<AppState>, Path(path): Path<String>) -> AppResult<Response> {
     let url = format!("{}/{path}", st.cfg.pypi_files);
+    let expected = if st.store.has_file("pypi", &path).await {
+        None
+    } else {
+        expected_sha256(&st, &path).await
+    };
     st.store
-        .file("pypi", &path, &url, "application/octet-stream")
+        .file("pypi", &path, &url, "application/octet-stream", expected)
         .await
+}
+
+/// The sha256 the project's Simple API page lists for this file (or, for a
+/// PEP 658 `.metadata` file, for its metadata).
+async fn expected_sha256(st: &AppState, path: &str) -> Option<Checksum> {
+    let dist = path.strip_suffix(".metadata").unwrap_or(path);
+    let (project, _) = classify("pypi", dist)?;
+    if !valid_project(&project) {
+        return None;
+    }
+    let index = format!("{}/{project}/", st.cfg.pypi_index);
+    let meta = st
+        .store
+        .meta("pypi", &project, "json", &index, SIMPLE_JSON)
+        .await
+        .ok()?;
+    let want_url = format!("{}/{dist}", st.cfg.pypi_files);
+    sha256_from_simple_json(&meta.body, &want_url, path.ends_with(".metadata"))
+}
+
+fn sha256_from_simple_json(doc: &[u8], file_url: &str, metadata: bool) -> Option<Checksum> {
+    let v: serde_json::Value = serde_json::from_slice(doc).ok()?;
+    let f = v.get("files")?.as_array()?.iter().find(|f| {
+        f.get("url")
+            .and_then(|u| u.as_str())
+            .is_some_and(|u| u.split('#').next() == Some(file_url))
+    })?;
+    let hashes = if metadata {
+        // PEP 714 renamed `dist-info-metadata` to `core-metadata`.
+        f.get("core-metadata")
+            .or_else(|| f.get("dist-info-metadata"))?
+    } else {
+        f.get("hashes")?
+    };
+    Checksum::sha256_hex(hashes.get("sha256")?.as_str()?)
 }
 
 #[cfg(test)]
@@ -127,5 +173,14 @@ mod tests {
         assert_eq!(normalize("Django"), "django");
         assert_eq!(normalize("zope.interface"), "zope-interface");
         assert_eq!(normalize("Foo__Bar-.baz"), "foo-bar-baz");
+    }
+
+    #[test]
+    fn finds_sha256_in_simple_json() {
+        let doc = br#"{"files":[{"filename":"a-1.0-py3-none-any.whl","url":"https://files.pythonhosted.org/packages/aa/bb/cc/a-1.0-py3-none-any.whl","hashes":{"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},"core-metadata":{"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}}]}"#;
+        let url = "https://files.pythonhosted.org/packages/aa/bb/cc/a-1.0-py3-none-any.whl";
+        assert!(sha256_from_simple_json(doc, url, false).is_some());
+        assert!(sha256_from_simple_json(doc, url, true).is_some());
+        assert!(sha256_from_simple_json(doc, "https://x/other.whl", false).is_none());
     }
 }

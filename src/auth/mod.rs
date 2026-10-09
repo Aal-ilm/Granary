@@ -198,6 +198,8 @@ pub async fn open_db(data_dir: &Path) -> anyhow::Result<SqlitePool> {
             data BLOB NOT NULL,
             expiry INTEGER NOT NULL
         )",
+        crate::audit::SCHEMA,
+        crate::audit::INDEX,
     ] {
         sqlx::query(stmt).execute(&pool).await?;
     }
@@ -302,10 +304,12 @@ pub async fn reset_password_cli(
     let r = sqlx::query(
         "UPDATE users SET password_hash = ?, must_change_password = 1, disabled = 0,
             totp_enabled = CASE WHEN ? THEN 0 ELSE totp_enabled END,
-            totp_secret = CASE WHEN ? THEN NULL ELSE totp_secret END
+            totp_secret = CASE WHEN ? THEN NULL ELSE totp_secret END,
+            totp_pending = CASE WHEN ? THEN NULL ELSE totp_pending END
          WHERE username = ?",
     )
     .bind(&hash)
+    .bind(disable_2fa)
     .bind(disable_2fa)
     .bind(disable_2fa)
     .bind(username)
@@ -318,8 +322,17 @@ pub async fn reset_password_cli(
         let names: Vec<String> = names.into_iter().map(|n| n.0).collect();
         anyhow::bail!("no user named {username:?}. Users: {}", names.join(", "));
     }
-    // Sign the account out everywhere.
-    sqlx::query("DELETE FROM sessions").execute(&pool).await?;
+    // Sessions are tied to the password hash, so the new password has
+    // already signed this account (and only this account) out everywhere.
+    crate::audit::record(
+        &pool,
+        "(server console)",
+        "user.reset_password",
+        username,
+        None,
+        true,
+    )
+    .await;
     println!("New password for {username}: {password}");
     println!("You'll be asked to change it after signing in.");
     if disable_2fa {
@@ -337,72 +350,101 @@ struct Attempts {
     locked_until: u64,
 }
 
-/// Locks out an account after repeated failed sign-ins, and slows down any
-/// single address that keeps guessing.
+impl Attempts {
+    fn bump(&mut self, max: u32, now: u64) {
+        if now.saturating_sub(self.window_start) > WINDOW {
+            *self = Attempts {
+                failures: 0,
+                window_start: now,
+                locked_until: 0,
+            };
+        }
+        self.failures += 1;
+        if self.failures >= max {
+            self.locked_until = now + LOCKOUT;
+            self.failures = 0;
+            self.window_start = now;
+        }
+    }
+
+    fn active(&self, now: u64) -> bool {
+        self.locked_until > now || now.saturating_sub(self.window_start) <= WINDOW
+    }
+}
+
+/// Slows down password guessing without letting a stranger lock someone out:
+///
+/// * one address gets `MAX_PER_PAIR` tries at one account before that address
+///   is locked out *of that account* (the owner elsewhere can still sign in);
+/// * any account gets `MAX_PER_USER` failures from all addresses combined,
+///   which stops guessing spread across many machines;
+/// * any address gets `MAX_PER_IP` failures across all accounts.
+///
+/// Entries expire, and each table is capped so made-up usernames can't use
+/// up memory.
 #[derive(Default)]
 pub struct Limiter {
+    pairs: Mutex<HashMap<(String, IpAddr), Attempts>>,
     users: Mutex<HashMap<String, Attempts>>,
     ips: Mutex<HashMap<IpAddr, Attempts>>,
 }
 
 const WINDOW: u64 = 15 * 60;
 const LOCKOUT: u64 = 15 * 60;
-const MAX_PER_USER: u32 = 5;
+const MAX_PER_PAIR: u32 = 5;
+const MAX_PER_USER: u32 = 50;
 const MAX_PER_IP: u32 = 50;
+const MAX_ENTRIES: usize = 10_000;
+
+fn bump_in<K: std::hash::Hash + Eq>(map: &Mutex<HashMap<K, Attempts>>, key: K, max: u32) {
+    let now = now_secs();
+    let mut map = map.lock().unwrap();
+    if map.len() >= MAX_ENTRIES {
+        map.retain(|_, a| a.active(now));
+        if map.len() >= MAX_ENTRIES {
+            // Still full of live entries: keep only the lockouts.
+            map.retain(|_, a| a.locked_until > now);
+        }
+    }
+    map.entry(key).or_default().bump(max, now);
+}
+
+fn locked_in<K: std::hash::Hash + Eq>(map: &Mutex<HashMap<K, Attempts>>, key: &K) -> u64 {
+    let now = now_secs();
+    map.lock()
+        .unwrap()
+        .get(key)
+        .map_or(0, |a| a.locked_until.saturating_sub(now))
+}
 
 impl Limiter {
     /// Seconds until sign-in is allowed again, if currently locked.
     pub fn locked_for(&self, user: &str, ip: IpAddr) -> Option<u64> {
-        let now = now_secs();
-        let u = self
-            .users
-            .lock()
-            .unwrap()
-            .get(&user.to_lowercase())
-            .copied();
-        let i = self.ips.lock().unwrap().get(&ip).copied();
-        [u, i]
-            .into_iter()
-            .flatten()
-            .filter(|a| a.locked_until > now)
-            .map(|a| a.locked_until - now)
-            .max()
+        let user = user.to_lowercase();
+        let secs = locked_in(&self.pairs, &(user.clone(), ip))
+            .max(locked_in(&self.users, &user))
+            .max(locked_in(&self.ips, &ip));
+        (secs > 0).then_some(secs)
     }
 
     pub fn record_failure(&self, user: &str, ip: IpAddr) {
-        fn bump(a: &mut Attempts, max: u32) {
-            let now = now_secs();
-            if now.saturating_sub(a.window_start) > WINDOW {
-                *a = Attempts {
-                    failures: 0,
-                    window_start: now,
-                    locked_until: 0,
-                };
-            }
-            a.failures += 1;
-            if a.failures >= max {
-                a.locked_until = now + LOCKOUT;
-                a.failures = 0;
-                a.window_start = now;
-            }
-        }
-        bump(
-            self.users
-                .lock()
-                .unwrap()
-                .entry(user.to_lowercase())
-                .or_default(),
-            MAX_PER_USER,
-        );
-        bump(self.ips.lock().unwrap().entry(ip).or_default(), MAX_PER_IP);
+        let user = user.to_lowercase();
+        bump_in(&self.pairs, (user.clone(), ip), MAX_PER_PAIR);
+        bump_in(&self.users, user, MAX_PER_USER);
+        bump_in(&self.ips, ip, MAX_PER_IP);
     }
 
-    pub fn record_success(&self, user: &str) {
-        self.users.lock().unwrap().remove(&user.to_lowercase());
+    pub fn record_success(&self, user: &str, ip: IpAddr) {
+        self.pairs
+            .lock()
+            .unwrap()
+            .remove(&(user.to_lowercase(), ip));
     }
 
     pub fn unlock(&self, user: &str) {
-        self.users.lock().unwrap().remove(&user.to_lowercase());
+        let user = user.to_lowercase();
+        self.pairs.lock().unwrap().retain(|(u, _), _| *u != user);
+        self.users.lock().unwrap().remove(&user);
     }
 }
 
@@ -637,7 +679,7 @@ pub async fn api_guard(auth: AuthSession, req: Request, next: Next) -> Response 
 /// Pull an access token out of whichever header a package manager uses:
 /// `Bearer <token>` (npm), Basic auth with the token as password (pip, uv)
 /// or a bare token (Cargo).
-fn token_from_headers(headers: &HeaderMap) -> Option<String> {
+pub fn token_from_headers(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
     if let Some(t) = value.strip_prefix("Bearer ") {
         return Some(t.trim().to_string());
@@ -732,13 +774,33 @@ mod tests {
     fn limiter_locks_after_failures() {
         let l = Limiter::default();
         let ip = IpAddr::from([10, 0, 0, 1]);
-        for _ in 0..MAX_PER_USER - 1 {
+        let owner = IpAddr::from([10, 0, 0, 2]);
+        for _ in 0..MAX_PER_PAIR - 1 {
             l.record_failure("Dev", ip);
         }
         assert!(l.locked_for("dev", ip).is_none());
         l.record_failure("dev", ip);
         assert!(l.locked_for("DEV", ip).is_some());
+        // The account's owner on another machine is not locked out.
+        assert!(l.locked_for("dev", owner).is_none());
         l.unlock("dev");
         assert!(l.locked_for("dev", ip).is_none());
+    }
+
+    #[test]
+    fn limiter_stops_distributed_guessing_and_stays_bounded() {
+        let l = Limiter::default();
+        for i in 0..MAX_PER_USER {
+            l.record_failure("admin", IpAddr::from([10, 1, (i / 256) as u8, i as u8]));
+        }
+        assert!(
+            l.locked_for("admin", IpAddr::from([192, 168, 0, 9]))
+                .is_some()
+        );
+        for i in 0..(MAX_ENTRIES as u32 + 50) {
+            l.record_failure(&format!("nobody{i}"), IpAddr::from([10, 9, 9, 9]));
+        }
+        assert!(l.users.lock().unwrap().len() <= MAX_ENTRIES);
+        assert!(l.pairs.lock().unwrap().len() <= MAX_ENTRIES);
     }
 }

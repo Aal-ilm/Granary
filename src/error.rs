@@ -36,7 +36,14 @@ impl IntoResponse for AppError {
         if self.status.is_server_error() {
             tracing::warn!(status = %self.status, "{}", self.message);
         }
-        (self.status, format!("{}\n", self.message)).into_response()
+        // Internal errors can mention file paths or database details; keep
+        // those in the server log and give clients a generic message.
+        let message = if self.status == StatusCode::INTERNAL_SERVER_ERROR {
+            "internal error; see the server log for details"
+        } else {
+            self.message.as_str()
+        };
+        (self.status, format!("{message}\n")).into_response()
     }
 }
 
