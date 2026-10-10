@@ -349,7 +349,7 @@ struct ComponentQuery {
 }
 
 /// Order versions naturally: numeric runs compare as numbers.
-fn version_cmp(a: &str, b: &str) -> Ordering {
+pub fn version_cmp(a: &str, b: &str) -> Ordering {
     fn chunks(s: &str) -> Vec<(bool, &str)> {
         let mut out = Vec::new();
         let mut start = 0;
@@ -711,6 +711,9 @@ async fn system(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
             {"key": "GRANARY_NPM_UPSTREAM", "label": "npm registry", "value": cfg.npm_upstream},
             {"key": "GRANARY_PYPI_INDEX", "label": "PyPI index", "value": cfg.pypi_index},
             {"key": "GRANARY_PYPI_FILES", "label": "PyPI files", "value": cfg.pypi_files},
+            {"key": "GRANARY_SEARCH", "label": "Package search", "value": if !cfg.search { "Off: exact name lookup only" } else if cfg.offline { "On, but offline mode allows exact lookups of cached packages only" } else { "On" }},
+            {"key": "GRANARY_CARGO_API", "label": "Cargo search", "value": cfg.cargo_api},
+            {"key": "GRANARY_MAVEN_SEARCH", "label": "Maven search", "value": cfg.maven_search},
             {"key": "GRANARY_MAVEN_UPSTREAM", "label": "Maven repository", "value": cfg.maven_upstream},
         ],
     }))

@@ -1,0 +1,15 @@
+name = "Rust async service"
+description = "HTTP services on Tokio and axum, with an HTTP client, SQLite and tracing."
+tags = ["rust", "web", "async"]
+
+[cargo]
+# reqwest is held at 0.12 because its TLS feature names differ between majors.
+dependencies = [
+  'tokio = { version = "*", features = ["full"] }',
+  'axum = "*"',
+  'tower-http = "*"',
+  'reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }',
+  'sqlx = { version = "*", features = ["sqlite", "runtime-tokio"] }',
+  'serde = { version = "*", features = ["derive"] }',
+  'tracing = "*"',
+]

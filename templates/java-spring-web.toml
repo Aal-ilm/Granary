@@ -1,0 +1,9 @@
+name = "Java Spring web"
+description = "A Spring Boot web application with its test starter."
+tags = ["java", "web"]
+
+[maven]
+dependencies = [
+  "org.springframework.boot:spring-boot-starter-web",
+  "org.springframework.boot:spring-boot-starter-test",
+]

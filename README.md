@@ -19,6 +19,8 @@ public registry once, then served from your own disk after that.
 - **Web UI built in.** Browse and search what's cached, delete packages, set
   cleanup rules, watch tasks, check upstream health and read logs. It's served
   by the same binary and never loads anything from the internet.
+- **Fill the cache ahead of time.** Search a registry and cache a version,
+  or keep templates of the packages each kind of project needs.
 - **Accounts built in.** Sign-in with admin and viewer roles, two-factor
   codes, and per-machine access tokens for Cargo, npm, pip, Maven and Gradle. Built on the
   open-source axum-login, tower-sessions, password-auth (Argon2id) and
@@ -179,6 +181,8 @@ For Gradle it writes `~/.gradle/init.d/granary.gradle`; `use-public` and
 | Repositories | Each proxy's URL, upstream, size and status, client setup snippets, and **Invalidate cache** to force fresh metadata |
 | Browse | Every cached package, filterable and sortable by size, versions, cache date and last download; the sidebar search covers all repositories |
 | Package detail | Each cached version and file, with download and delete |
+| Get packages | Search a registry and cache a version before anyone needs it (admins only; see [Getting packages ahead of time](#getting-packages-ahead-of-time)) |
+| Templates | Named sets of packages for a kind of project: browse, create, edit, clone, delete and export (see [Templates](#templates)) |
 | Cleanup | Delete packages nobody has downloaded in *N* days, per repository, with a dry-run preview and an optional daily schedule |
 | Tasks | Scheduled jobs (cleanup, upstream checks, saving download history) with last run, result and **Run now** |
 | System | Upstream reachability and latency, disk space, and the active configuration |
@@ -187,6 +191,84 @@ For Gradle it writes `~/.gradle/init.d/granary.gradle`; `use-public` and
 | Access tokens | Create and revoke tokens for package managers, with ready-made client configuration |
 | Users | Add people as admins or viewers, reset passwords, turn off two-factor, disable or delete accounts (admins only) |
 | Account | Change your password and set up two-factor authentication |
+
+## Getting packages ahead of time
+
+Admins can fill the cache from the web UI, without running npm, cargo, pip
+or mvn anywhere. Open **Get packages**, pick an ecosystem and search:
+
+| Ecosystem | Where the search goes |
+|---|---|
+| npm | The npm registry's search (`GRANARY_NPM_UPSTREAM/-/v1/search`) |
+| Cargo | crates.io's web API (`GRANARY_CARGO_API`) |
+| PyPI | Nowhere: PyPI has no search API, so type the exact project name |
+| Maven | search.maven.org (`GRANARY_MAVEN_SEARCH`) |
+
+Each result shows the latest version, a description where the registry has
+one, and how many versions Granary already holds. **Cache** asks for a
+version (latest by default) and fetches that one version straight away: the
+`.crate`, the npm tarball, the PyPI file you pick (a pure-Python wheel is
+suggested) or a Maven POM with its jar, aar or war. Every file is checked
+against the registry's checksum, exactly as for client downloads. Its
+dependencies are fetched when a client first asks for them.
+
+**Privacy note.** Search sends the text you type to crates.io and
+search.maven.org, which are not otherwise contacted, and to the npm
+registry. Exact-name lookups use the same registry metadata clients already
+fetch. To keep search text inside your network, set `GRANARY_SEARCH=off`:
+the page then looks packages up by exact name only. In offline mode nothing
+is sent anywhere, and only packages already in the cache can be looked up.
+
+Search is limited to one request per second per admin when it reaches a
+search host; results are reused for ten minutes. Every search, lookup and
+cached version is recorded in the audit log.
+
+## Templates
+
+A template is a named set of packages for a kind of project, listed one
+per line in each ecosystem's own syntax:
+
+| Ecosystem | Example line |
+|---|---|
+| Cargo | `serde = { version = "1", features = ["derive"] }` |
+| npm | `"react": "^19"` |
+| PyPI | `fastapi>=0.115` |
+| Maven | `org.springframework.boot:spring-boot-starter-web:3.4.0` (version optional) |
+
+Only registry packages can be cached, so git, path, file and URL
+dependencies are refused, as are pip options such as `-r` and Maven
+snapshots. Lines starting with `#` are comments. A template also lists the
+platforms to cache for (Linux x86-64 and macOS Apple silicon by default) and
+whether Python source distributions are allowed; building an sdist runs the
+package's own code, so templates use wheels only unless you allow them.
+
+Granary ships these built-in templates, with versions left open so the
+newest compatible release is used:
+
+| Template | Packages |
+|---|---|
+| Rust CLI | clap, anyhow, thiserror, serde, serde_json, tracing, tracing-subscriber |
+| Rust async service | tokio, axum, tower-http, reqwest, sqlx, serde, tracing |
+| Rust embedded (Cortex-M) | cortex-m, cortex-m-rt, embedded-hal, defmt, defmt-rtt, panic-probe, heapless, embassy-executor, embassy-time |
+| Node API | fastify, zod, pino, typescript, tsx, vitest |
+| React + Vite + TS | react, react-dom, vite, @vitejs/plugin-react, typescript, eslint, prettier, vitest |
+| Python web API | fastapi, uvicorn, pydantic, httpx, pytest, ruff |
+| Python data | numpy, pandas, matplotlib, jupyterlab, scipy |
+| Java Spring web | spring-boot-starter-web, spring-boot-starter-test |
+
+Built-in templates live as TOML files in `templates/` and are compiled into
+Granary. They are read-only in the web UI: **Clone** makes an editable copy.
+Upgrading Granary updates the built-ins and never touches your own
+templates, which are stored in `state/granary.db`.
+
+The template editor checks every line as you type and names the line and
+the problem. **Import from manifest** fills a section from a `Cargo.toml`,
+`package.json`, `requirements.txt` or `pom.xml` (uploaded or pasted), and
+lists anything it had to leave out, such as path dependencies. **Export**
+downloads a template as a TOML file in the same format as the built-ins.
+
+Viewers can see templates and export them; creating, editing, cloning and
+deleting them needs an admin. Every change is recorded in the audit log.
 
 ## Sign-in and security
 
@@ -288,6 +370,9 @@ All settings are environment variables.
 | `GRANARY_PYPI_INDEX` | `https://pypi.org/simple` | Upstream Simple API |
 | `GRANARY_PYPI_FILES` | `https://files.pythonhosted.org` | Host that PyPI file links point to |
 | `GRANARY_MAVEN_UPSTREAM` | `https://repo1.maven.org/maven2` | Upstream Maven repository (Maven 2 layout) |
+| `GRANARY_SEARCH` | `on` | `off`: **Get packages** never sends search text to a search host and looks packages up by exact name only |
+| `GRANARY_CARGO_API` | `https://crates.io/api/v1` | crates.io web API, used only for search |
+| `GRANARY_MAVEN_SEARCH` | `https://search.maven.org/solrsearch/select` | Maven Central search, used only for search |
 | `RUST_LOG` | `granary=info` | Log level (`granary=debug` logs every cache hit) |
 
 Granary honors the standard `HTTPS_PROXY` / `NO_PROXY` variables for its own

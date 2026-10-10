@@ -27,7 +27,7 @@ use crate::{
     util::base_url,
 };
 
-const SIMPLE_JSON: &str = "application/vnd.pypi.simple.v1+json";
+pub const SIMPLE_JSON: &str = "application/vnd.pypi.simple.v1+json";
 const SIMPLE_HTML: &str = "text/html";
 
 pub fn router() -> Router<AppState> {
@@ -60,7 +60,7 @@ pub fn normalize(name: &str) -> String {
     out
 }
 
-fn valid_project(name: &str) -> bool {
+pub fn valid_project(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 200
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -118,14 +118,20 @@ async fn serve_page(
 }
 
 async fn file(State(st): State<AppState>, Path(path): Path<String>) -> AppResult<Response> {
+    fetch_file(&st, &path).await
+}
+
+/// Serve one distribution file (path under the files host), downloading and
+/// verifying it on first use.
+pub async fn fetch_file(st: &AppState, path: &str) -> AppResult<Response> {
     let url = format!("{}/{path}", st.cfg.pypi_files);
-    let expected = if st.store.has_file("pypi", &path).await {
+    let expected = if st.store.has_file("pypi", path).await {
         None
     } else {
-        expected_sha256(&st, &path).await
+        expected_sha256(st, path).await
     };
     st.store
-        .file("pypi", &path, &url, "application/octet-stream", expected)
+        .file("pypi", path, &url, "application/octet-stream", expected)
         .await
 }
 

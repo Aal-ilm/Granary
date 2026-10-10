@@ -1,0 +1,12 @@
+name = "Python data"
+description = "Numerical computing, dataframes, plotting and notebooks."
+tags = ["python", "data"]
+
+[pypi]
+dependencies = [
+  "numpy",
+  "pandas",
+  "matplotlib",
+  "jupyterlab",
+  "scipy",
+]

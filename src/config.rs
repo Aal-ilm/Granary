@@ -25,6 +25,12 @@ pub struct Config {
     pub pypi_files: String,
     /// Maven repository in the standard Maven 2 layout.
     pub maven_upstream: String,
+    /// Allow "Get packages" to send search text to search hosts.
+    pub search: bool,
+    /// crates.io's web API, used only for search.
+    pub cargo_api: String,
+    /// Maven Central's search API, used only for search.
+    pub maven_search: String,
     /// Username for the first admin account, created when no users exist.
     pub admin_user: String,
     /// Password for that account. When unset, one is generated and printed once.
@@ -168,6 +174,12 @@ impl Config {
             pypi_index: url_var("GRANARY_PYPI_INDEX", "https://pypi.org/simple"),
             pypi_files: url_var("GRANARY_PYPI_FILES", "https://files.pythonhosted.org"),
             maven_upstream: url_var("GRANARY_MAVEN_UPSTREAM", "https://repo1.maven.org/maven2"),
+            search: bool_var("GRANARY_SEARCH", true)?,
+            cargo_api: url_var("GRANARY_CARGO_API", "https://crates.io/api/v1"),
+            maven_search: url_var(
+                "GRANARY_MAVEN_SEARCH",
+                "https://search.maven.org/solrsearch/select",
+            ),
             admin_user: var("GRANARY_ADMIN_USER", "admin"),
             admin_password: std::env::var("GRANARY_ADMIN_PASSWORD")
                 .ok()

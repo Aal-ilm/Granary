@@ -1,0 +1,13 @@
+name = "Node API"
+description = "A TypeScript HTTP API on Fastify with schema validation, logging and tests."
+tags = ["node", "typescript", "web"]
+
+[npm]
+dependencies = [
+  '"fastify": "latest"',
+  '"zod": "latest"',
+  '"pino": "latest"',
+  '"typescript": "latest"',
+  '"tsx": "latest"',
+  '"vitest": "latest"',
+]

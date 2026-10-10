@@ -167,21 +167,27 @@ async fn handle(State(st): State<AppState>, method: Method, uri: Uri) -> AppResu
         return Ok(resp);
     }
     let rel = checked_path(&uri)?;
+    fetch(&st, &rel).await
+}
+
+/// Serve one repository path (already checked), with the snapshot rule,
+/// the negative cache and checksum verification.
+pub async fn fetch(st: &AppState, rel: &str) -> AppResult<Response> {
     if rel.contains("-SNAPSHOT") {
         return Err(AppError::new(
             StatusCode::NOT_FOUND,
             "Maven Central has no snapshots",
         ));
     }
-    let kind = classify(&rel).ok_or_else(AppError::not_found)?;
+    let kind = classify(rel).ok_or_else(AppError::not_found)?;
 
     let missing_key = format!("maven:{rel}");
     if st.store.known_missing(&missing_key) {
         return Err(AppError::not_found());
     }
     let result = match kind {
-        Kind::Metadata => metadata(&st, &rel).await,
-        Kind::Release { verify } => release(&st, &rel, verify).await,
+        Kind::Metadata => metadata(st, rel).await,
+        Kind::Release { verify } => release(st, rel, verify).await,
     };
     // Only upstream's own 404s are remembered; an offline miss isn't one.
     if let Err(e) = &result

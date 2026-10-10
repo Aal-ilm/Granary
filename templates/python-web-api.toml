@@ -1,0 +1,13 @@
+name = "Python web API"
+description = "A FastAPI service with an HTTP client, tests and linting."
+tags = ["python", "web"]
+
+[pypi]
+dependencies = [
+  "fastapi",
+  "uvicorn",
+  "pydantic",
+  "httpx",
+  "pytest",
+  "ruff",
+]

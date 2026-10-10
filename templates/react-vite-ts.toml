@@ -1,0 +1,15 @@
+name = "React + Vite + TS"
+description = "A React single-page app built with Vite and TypeScript, with linting, formatting and tests."
+tags = ["node", "typescript", "frontend"]
+
+[npm]
+dependencies = [
+  '"react": "latest"',
+  '"react-dom": "latest"',
+  '"vite": "latest"',
+  '"@vitejs/plugin-react": "latest"',
+  '"typescript": "latest"',
+  '"eslint": "latest"',
+  '"prettier": "latest"',
+  '"vitest": "latest"',
+]

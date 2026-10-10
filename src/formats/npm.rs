@@ -30,7 +30,7 @@ use crate::{
     util::base_url,
 };
 
-const ABBREVIATED: &str = "application/vnd.npm.install-v1+json";
+pub const ABBREVIATED: &str = "application/vnd.npm.install-v1+json";
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/npm/{*rest}", any(handle))
@@ -72,7 +72,7 @@ async fn handle(
     }
 }
 
-fn valid_package_name(name: &str) -> bool {
+pub fn valid_package_name(name: &str) -> bool {
     let ok_chars = |s: &str| {
         !s.is_empty()
             && s.bytes()
@@ -127,7 +127,8 @@ pub fn rewrite_tarball_urls(doc: &str, upstream: &str, ours: &str) -> String {
     out
 }
 
-async fn tarball(st: &AppState, pkg: &str, file: &str) -> AppResult<Response> {
+/// Serve one tarball (`<pkg>/-/<file>`), downloading and verifying it on first use.
+pub async fn tarball(st: &AppState, pkg: &str, file: &str) -> AppResult<Response> {
     let valid_file = file.ends_with(".tgz") && !file.contains('/') && !file.starts_with('.');
     if !valid_package_name(pkg) || !valid_file {
         return Err(AppError::not_found());

@@ -354,6 +354,11 @@ const routes = [
   [/^\/repos$/, 'repos', renderRepos],
   [/^\/browse(?:\/(cargo|npm|pypi|maven))?$/, 'browse', renderBrowse],
   [/^\/c\/(cargo|npm|pypi|maven)\/(.+)$/, 'browse', renderComponent],
+  [/^\/get(?:\/(npm|cargo|pypi|maven))?$/, 'get', renderGet, { admin: true }],
+  [/^\/templates$/, 'templates', renderTemplates],
+  [/^\/templates\/new$/, 'templates', renderTemplateEditor, { admin: true }],
+  [/^\/templates\/(\d+)$/, 'templates', renderTemplate],
+  [/^\/templates\/(\d+)\/edit$/, 'templates', renderTemplateEditor, { admin: true }],
   [/^\/cleanup$/, 'cleanup', renderCleanup],
   [/^\/tasks$/, 'tasks', renderTasks],
   [/^\/system$/, 'system', renderSystem],
@@ -835,6 +840,510 @@ async function renderComponent({ params, isCurrent }) {
       } catch (err) {
         toast(err.message, 'error');
       }
+    }
+  });
+}
+
+// ------------------------------------------------------------ get packages
+
+const GET_ECOS = ['npm', 'cargo', 'pypi', 'maven'];
+const SEARCH_HINTS = {
+  npm: { placeholder: 'Search npm, e.g. react', lookup: 'Exact package name, e.g. react' },
+  cargo: { placeholder: 'Search crates.io, e.g. serde', lookup: 'Exact crate name, e.g. serde' },
+  pypi: { placeholder: 'Exact project name, e.g. requests', lookup: 'Exact project name, e.g. requests' },
+  maven: { placeholder: 'Search Maven Central, e.g. guava', lookup: 'group:artifact, e.g. com.google.guava:guava' },
+};
+
+async function renderGet({ params, query, isCurrent }) {
+  const eco = params[0] || 'npm';
+  const q = (query.get('q') || '').trim();
+  const status = await api('/api/packages/status');
+  let d = null;
+  let error = '';
+  if (q) {
+    try {
+      d = await api(`/api/packages/search?eco=${eco}&q=${encodeURIComponent(q)}`);
+    } catch (e) {
+      error = e.message;
+    }
+  }
+  if (!isCurrent()) return;
+
+  const searching = status.search && eco !== 'pypi';
+  const hint = SEARCH_HINTS[eco];
+  const tabs = GET_ECOS.map((id) => {
+    const qs = q ? '?q=' + encodeURIComponent(q) : '';
+    return `<a href="#/get/${id}${qs}" aria-current="${id === eco}">${esc(REPOS[id].label)}</a>`;
+  }).join('');
+  const notes = [];
+  if (status.note) notes.push(status.note);
+  else if (eco === 'pypi') notes.push('PyPI has no search API, so type the exact project name.');
+  if (searching) notes.push(`Search text is sent to ${new URL(status.hosts[eco]).host}.`);
+
+  let body = '';
+  if (error) {
+    body = `<div class="panel panel-pad"><p class="err">${esc(error)}</p></div>`;
+  } else if (d && !d.results.length) {
+    body = `<div class="panel empty"><strong>Nothing found for “${esc(q)}”</strong>${
+      d.mode === 'lookup' ? 'Lookups need the exact name.' : 'Try a shorter or different search.'
+    }${status.offline ? ' Offline mode only finds packages Granary has already cached.' : ''}</div>`;
+  } else if (d) {
+    // Maven Central's search has no descriptions; skip the empty column.
+    const described = d.results.some((r) => r.description);
+    const rows = d.results
+      .map(
+        (r) => `<tr>
+          <td>${r.cached_versions ? `<a class="pkg mono" href="#/c/${eco}/${esc(encodeURIComponent(r.name))}">${esc(r.name)}</a>` : `<span class="pkg mono">${esc(r.name)}</span>`}</td>
+          <td class="mono">${esc(r.latest || '')}</td>
+          ${described ? `<td class="desc">${esc(r.description || '')}</td>` : ''}
+          <td>${r.cached_versions ? `<span class="status"><span class="dot ok"></span>${esc(plural(r.cached_versions, 'version'))}</span>` : '<span class="muted">Not cached</span>'}</td>
+          <td class="actions"><button class="small" data-cache="${esc(r.name)}" data-latest="${esc(r.latest || '')}">Cache</button></td>
+        </tr>`
+      )
+      .join('');
+    body = `<div class="panel table-wrap"><table>
+      <thead><tr><th>Package</th><th>Latest</th>${described ? '<th>Description</th>' : ''}<th>In Granary</th><th class="r"><span class="sr-only">Actions</span></th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
+  }
+
+  setView(`
+    <div class="page-head">
+      <div><h1>Get packages</h1><p>Find a package and cache it before anyone needs it.</p></div>
+    </div>
+    <div class="toolbar">
+      <nav class="seg" aria-label="Ecosystem">${tabs}</nav>
+      <form class="grow get-search" id="get-form" role="search">
+        <label class="sr-only" for="get-q">${esc(searching ? 'Search' : 'Look up')}</label>
+        <input id="get-q" type="search" value="${esc(q)}" placeholder="${esc(searching ? hint.placeholder : hint.lookup)}" autocomplete="off">
+        <button class="primary" type="submit">${searching ? 'Search' : 'Look up'}</button>
+      </form>
+    </div>
+    ${notes.length ? `<p class="page-note">${notes.map(esc).join(' ')}</p>` : ''}
+    ${body}
+    <dialog id="cache-dialog" aria-labelledby="cache-title"></dialog>`);
+
+  $('#get-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const text = $('#get-q').value.trim();
+    go('/get/' + eco, text ? new URLSearchParams({ q: text }) : null);
+  });
+  if (!q) $('#get-q').focus();
+  view().addEventListener('click', (e) => {
+    const b = e.target.closest('[data-cache]');
+    if (b) openCacheDialog(eco, b.dataset.cache, b.dataset.latest);
+  });
+}
+
+/** Pick a version (and, for PyPI, a file) and cache it. */
+async function openCacheDialog(eco, name, latest) {
+  const dlg = $('#cache-dialog');
+  dlg.innerHTML = `
+    <form method="dialog" id="cache-form">
+      <h2 id="cache-title">Cache <span class="mono">${esc(name)}</span></h2>
+      <p>Caches this one version${eco === 'maven' ? ' (its POM and artifact)' : ''}. Its dependencies are fetched when a client first asks for them.</p>
+      <div class="stack">
+        <div class="field"><label for="cache-version">Version</label>
+          <select id="cache-version" disabled><option>Loading versions…</option></select></div>
+        ${eco === 'pypi' ? '<div class="field"><label for="cache-file">File</label><select id="cache-file" disabled><option>Choose a version first</option></select><p class="help">Wheels are built for one platform; a file ending in -none-any.whl works everywhere.</p></div>' : ''}
+      </div>
+      <p class="err hidden" id="cache-err"></p>
+      <div class="row">
+        <button value="cancel" formnovalidate>Cancel</button>
+        <button class="primary" id="cache-ok" value="ok" disabled>Cache</button>
+      </div>
+    </form>`;
+  dlg.showModal();
+  const err = $('#cache-err');
+  const versionSel = $('#cache-version');
+  const fileSel = $('#cache-file');
+  const ok = $('#cache-ok');
+
+  const loadFiles = async () => {
+    if (!fileSel) return;
+    fileSel.disabled = true;
+    ok.disabled = true;
+    fileSel.innerHTML = '<option>Loading files…</option>';
+    try {
+      const f = await api(`/api/packages/files?name=${encodeURIComponent(name)}&version=${encodeURIComponent(versionSel.value)}`);
+      if (!f.files.length) {
+        fileSel.innerHTML = '<option>No files for this version</option>';
+        return;
+      }
+      fileSel.innerHTML = f.files
+        .map((x) => `<option value="${esc(x.path)}" ${x.path === f.suggested ? 'selected' : ''}>${esc(x.filename)}</option>`)
+        .join('');
+      fileSel.disabled = false;
+      ok.disabled = false;
+    } catch (e) {
+      showError(err, e.message);
+    }
+  };
+
+  try {
+    const v = await api(`/api/packages/versions?eco=${eco}&name=${encodeURIComponent(name)}`);
+    const pick = v.latest || latest || v.versions[0];
+    versionSel.innerHTML = v.versions
+      .map((x) => `<option value="${esc(x)}" ${x === pick ? 'selected' : ''}>${esc(x)}${x === v.latest ? ' (latest)' : ''}</option>`)
+      .join('');
+    versionSel.disabled = !v.versions.length;
+    ok.disabled = !v.versions.length;
+    if (fileSel) await loadFiles();
+  } catch (e) {
+    versionSel.innerHTML = '<option>Unavailable</option>';
+    showError(err, e.message);
+  }
+  versionSel.addEventListener('change', loadFiles);
+
+  $('#cache-form').addEventListener('submit', async (e) => {
+    if (e.submitter?.value !== 'ok') return;
+    e.preventDefault();
+    ok.disabled = true;
+    ok.textContent = 'Caching…';
+    showError(err, '');
+    try {
+      const body = { eco, name, version: versionSel.value };
+      if (fileSel) body.file = fileSel.value;
+      const r = await act(() => api('/api/packages/cache', { method: 'POST', body }));
+      dlg.close();
+      toast(`Cached ${name} ${body.version}: ${plural(r.files.length, 'file')}, ${bytes(r.bytes)}`);
+      route();
+    } catch (ex) {
+      showError(err, ex.message);
+      ok.disabled = false;
+      ok.textContent = 'Cache';
+    }
+  });
+}
+
+// --------------------------------------------------------------- templates
+
+const TEMPLATE_ECOS = ['cargo', 'npm', 'pypi', 'maven'];
+const LINE_EXAMPLES = {
+  cargo: 'serde = { version = "1", features = ["derive"] }\nanyhow = "*"',
+  npm: '"react": "^19"\n"vite": "latest"',
+  pypi: 'fastapi>=0.115\nuvicorn[standard]',
+  maven: 'org.springframework.boot:spring-boot-starter-web:3.4.0\ncom.google.guava:guava',
+};
+
+const packageCounts = (counts) =>
+  TEMPLATE_ECOS.filter((e) => counts[e])
+    .map((e) => `<span class="count">${chip(e)} <b class="num">${esc(count(counts[e]))}</b></span>`)
+    .join('');
+
+async function renderTemplates({ query, isCurrent }) {
+  const d = await api('/api/templates');
+  if (!isCurrent()) return;
+  const tag = query.get('tag') || '';
+  const q = query.get('q') || '';
+  const tags = [...new Set(d.templates.flatMap((t) => t.tags))].sort();
+  const tagLink = (t) => {
+    const qs = new URLSearchParams();
+    if (t) qs.set('tag', t);
+    if (q) qs.set('q', q);
+    return '#/templates' + ([...qs].length ? '?' + qs : '');
+  };
+  const tagNav = [['', 'All'], ...tags.map((t) => [t, t])]
+    .map(([id, label]) => `<a href="${tagLink(id)}" aria-current="${id === tag}">${esc(label)}</a>`)
+    .join('');
+
+  const cards = d.templates
+    .filter((t) => !tag || t.tags.includes(tag))
+    .map(
+      (t) => `
+      <article class="tpl-card panel" data-search="${esc([t.name, t.description, ...t.tags].join(' ').toLowerCase())}">
+        <div class="tpl-head">
+          <h2><a href="#/templates/${t.id}">${esc(t.name)}</a></h2>
+          ${t.builtin ? '<span class="kind">Built-in</span>' : '<span class="kind custom">Custom</span>'}
+        </div>
+        <p class="tpl-desc">${esc(t.description || 'No description.')}</p>
+        <div class="tpl-counts">${packageCounts(t.counts)}</div>
+        <div class="tpl-tags">${t.tags.map((x) => `<a class="tag" href="${tagLink(x)}">${esc(x)}</a>`).join('')}</div>
+        <div class="tpl-foot">
+          <span class="muted">Last warmed ${t.last_warmed_at ? timeTag(t.last_warmed_at) : '<span>never</span>'}</span>
+          <span class="page-actions">
+            ${t.builtin ? '' : `<a class="btn small admin-only" href="#/templates/${t.id}/edit">Edit</a>`}
+            <button class="small admin-only" data-clone="${t.id}">Clone</button>
+            <a class="btn small" href="/api/templates/${t.id}/export" download>Export</a>
+            ${t.builtin ? '' : `<button class="small danger admin-only" data-delete="${t.id}" data-name="${esc(t.name)}">Delete</button>`}
+          </span>
+        </div>
+      </article>`
+    )
+    .join('');
+
+  setView(`
+    <div class="page-head">
+      <div><h1>Templates</h1><p>Named sets of packages for a kind of project. Built-in templates are read-only; clone one to change it.</p></div>
+      <div class="page-actions admin-only"><a class="btn primary" href="#/templates/new">New template</a></div>
+    </div>
+    <div class="toolbar">
+      ${tags.length ? `<nav class="seg" aria-label="Tag">${tagNav}</nav>` : ''}
+      <div class="grow"><label class="sr-only" for="tpl-filter">Filter templates</label>
+        <input id="tpl-filter" type="search" placeholder="Filter templates" value="${esc(q)}" autocomplete="off"></div>
+    </div>
+    <div class="tpl-grid">${cards}</div>
+    <div class="panel empty hidden" id="tpl-none"><strong>No templates match</strong>Try another word or tag.</div>`);
+
+  const filter = $('#tpl-filter');
+  const apply = () => {
+    const needle = filter.value.trim().toLowerCase();
+    let shown = 0;
+    $$('.tpl-card', view()).forEach((c) => {
+      const hit = !needle || c.dataset.search.includes(needle);
+      c.classList.toggle('hidden', !hit);
+      if (hit) shown++;
+    });
+    $('#tpl-none').classList.toggle('hidden', shown > 0);
+  };
+  filter.addEventListener('input', apply);
+  apply();
+  view().addEventListener('click', (e) => templateAction(e));
+}
+
+/** Clone and delete buttons, on the list and on a template's page. */
+async function templateAction(e) {
+  const clone = e.target.closest('[data-clone]');
+  if (clone) {
+    try {
+      const r = await act(() => api(`/api/templates/${clone.dataset.clone}/clone`, { method: 'POST' }));
+      toast(`Created ${r.name}`);
+      location.hash = `#/templates/${r.id}/edit`;
+    } catch (err) {
+      toast(err.message, 'error');
+    }
+    return;
+  }
+  const del = e.target.closest('[data-delete]');
+  if (del) {
+    const ok = await confirmAction({
+      title: `Delete ${del.dataset.name}?`,
+      body: 'The template is removed. Packages it cached stay in Granary.',
+      ok: 'Delete template',
+    });
+    if (!ok) return;
+    try {
+      await act(() => api(`/api/templates/${del.dataset.delete}`, { method: 'DELETE' }));
+      toast(`Deleted ${del.dataset.name}`);
+      if (location.hash.startsWith('#/templates/')) location.hash = '#/templates';
+      else route();
+    } catch (err) {
+      toast(err.message, 'error');
+    }
+  }
+}
+
+async function renderTemplate({ params, isCurrent }) {
+  const t = await api(`/api/templates/${params[0]}`);
+  if (!isCurrent()) return;
+  const platforms = (await api('/api/templates')).platforms;
+  if (!isCurrent()) return;
+  const label = (id) => platforms.find((p) => p.id === id)?.label || id;
+  const sections = TEMPLATE_ECOS.filter((e) => t[e].trim())
+    .map(
+      (e) => `<section class="tpl-section">
+        <h2>${chip(e)} <span class="muted">${esc(plural(t.counts[e], 'package'))}</span></h2>
+        <div class="snippet"><pre>${esc(t[e])}</pre></div>
+      </section>`
+    )
+    .join('');
+  setView(`
+    <div class="crumbs"><a href="#/templates">Templates</a></div>
+    <div class="page-head">
+      <div>
+        <h1>${esc(t.name)}</h1>
+        <div class="summary-line">
+          ${t.builtin ? '<span class="kind">Built-in</span>' : '<span class="kind custom">Custom</span>'}
+          ${t.tags.map((x) => `<a class="tag" href="#/templates?tag=${esc(encodeURIComponent(x))}">${esc(x)}</a>`).join('')}
+          <span>Last warmed ${t.last_warmed_at ? timeTag(t.last_warmed_at) : 'never'}</span>
+        </div>
+        ${t.description ? `<p>${esc(t.description)}</p>` : ''}
+      </div>
+      <div class="page-actions">
+        ${t.builtin ? '' : `<a class="btn admin-only" href="#/templates/${t.id}/edit">Edit</a>`}
+        <button class="admin-only" data-clone="${t.id}">Clone</button>
+        <a class="btn" href="/api/templates/${t.id}/export" download>Export</a>
+        ${t.builtin ? '' : `<button class="danger admin-only" data-delete="${t.id}" data-name="${esc(t.name)}">Delete</button>`}
+      </div>
+    </div>
+    <dl class="panel panel-pad tpl-facts">
+      <div><dt>Platforms</dt><dd>${t.platforms.map((p) => esc(label(p))).join(', ')}</dd></div>
+      <div><dt>Source distributions</dt><dd>${t.allow_sdist ? 'Allowed (building one can run code)' : 'Wheels only'}</dd></div>
+    </dl>
+    ${sections}`);
+  view().addEventListener('click', (e) => templateAction(e));
+}
+
+async function renderTemplateEditor({ params, isCurrent }) {
+  const id = params[0] || null;
+  const [list, t] = await Promise.all([api('/api/templates'), id ? api(`/api/templates/${id}`) : null]);
+  if (!isCurrent()) return;
+  if (t?.builtin) {
+    setView(`<div class="crumbs"><a href="#/templates">Templates</a></div>
+      <div class="page-head"><div><h1>${esc(t.name)} is built in</h1><p>Built-in templates are read-only. Clone it to make your own version.</p></div></div>
+      <button class="primary" data-clone="${t.id}">Clone ${esc(t.name)}</button>`);
+    view().addEventListener('click', (e) => templateAction(e));
+    return;
+  }
+  const v = t || { name: '', description: '', tags: [], platforms: list.default_platforms, allow_sdist: false, cargo: '', npm: '', pypi: '', maven: '' };
+
+  const ecoBlock = (e) => `
+    <div class="tpl-eco" data-eco="${e}">
+      <div class="tpl-eco-head">
+        <label for="tpl-${e}">${chip(e)} <span class="muted" id="tpl-count-${e}"></span></label>
+        <button type="button" class="small" data-import="${e}">Import from manifest</button>
+      </div>
+      <textarea id="tpl-${e}" class="mono" rows="7" spellcheck="false" placeholder="${esc(LINE_EXAMPLES[e])}">${esc(v[e])}</textarea>
+      <ul class="line-errors" id="tpl-err-${e}"></ul>
+    </div>`;
+
+  setView(`
+    <div class="crumbs"><a href="#/templates">Templates</a>${t ? ` <span aria-hidden="true">/</span> <a href="#/templates/${t.id}">${esc(t.name)}</a>` : ''}</div>
+    <div class="page-head"><div><h1>${t ? 'Edit template' : 'New template'}</h1>
+      <p>One package per line, in each ecosystem's own syntax. Lines starting with # are comments.</p></div></div>
+    <form class="panel panel-pad" id="tpl-form" novalidate>
+      <div class="form-grid">
+        <div class="label"><label for="tpl-name">Name</label></div>
+        <div><input type="text" id="tpl-name" maxlength="80" value="${esc(v.name)}"><p class="err hidden" id="tpl-err-name"></p></div>
+        <div class="label"><label for="tpl-desc">Description</label></div>
+        <div><input type="text" id="tpl-desc" maxlength="500" value="${esc(v.description)}"></div>
+        <div class="label"><label for="tpl-tags">Tags</label></div>
+        <div><input type="text" id="tpl-tags" value="${esc(v.tags.join(', '))}" placeholder="rust, web">
+          <div class="help">Comma-separated. Lowercase letters, digits and dashes.</div><p class="err hidden" id="tpl-err-tags"></p></div>
+        <div class="label">Platforms</div>
+        <div><div class="inline">${list.platforms
+          .map((p) => `<label class="check"><input type="checkbox" name="platform" value="${esc(p.id)}" ${v.platforms.includes(p.id) ? 'checked' : ''}> ${esc(p.label)}</label>`)
+          .join('')}</div>
+          <div class="help">Packages with per-platform builds are cached for each one chosen.</div><p class="err hidden" id="tpl-err-platforms"></p></div>
+        <div class="label">Python builds</div>
+        <div><label class="check"><input type="checkbox" id="tpl-sdist" ${v.allow_sdist ? 'checked' : ''}> Allow source distributions (sdists)</label>
+          <div class="banner sdist-warning ${v.allow_sdist ? '' : 'hidden'}" id="tpl-sdist-warn"><span class="dot bad"></span><span>Building an sdist runs the package's own build code. Leave this off to cache wheels only.</span></div></div>
+      </div>
+      <div class="tpl-ecos">${TEMPLATE_ECOS.map(ecoBlock).join('')}</div>
+      <p class="err hidden" id="tpl-err-packages"></p>
+      <div class="page-actions tpl-save">
+        <button class="primary" type="submit">${t ? 'Save changes' : 'Create template'}</button>
+        <a class="btn" href="${t ? `#/templates/${t.id}` : '#/templates'}">Cancel</a>
+      </div>
+    </form>
+    <dialog id="import-dialog" aria-labelledby="import-title"></dialog>`);
+
+  const read = () => ({
+    name: $('#tpl-name').value,
+    description: $('#tpl-desc').value,
+    tags: $('#tpl-tags').value.split(',').map((s) => s.trim()).filter(Boolean),
+    platforms: $$('input[name="platform"]:checked', view()).map((c) => c.value),
+    allow_sdist: $('#tpl-sdist').checked,
+    ...Object.fromEntries(TEMPLATE_ECOS.map((e) => [e, $('#tpl-' + e).value])),
+  });
+
+  // Field problems wait until something has been typed or a save tried,
+  // so a blank new template doesn't open full of errors.
+  let touched = !!t;
+  const sentence = (m) => m[0].toUpperCase() + m.slice(1) + '.';
+  const show = (r) => {
+    for (const f of ['name', 'tags', 'platforms', 'packages']) {
+      const msgs = touched ? r.problems.fields.filter((x) => x.field === f).map((x) => sentence(x.message)) : [];
+      showError($('#tpl-err-' + f), msgs.join(' '));
+    }
+    for (const e of TEMPLATE_ECOS) {
+      $('#tpl-count-' + e).textContent = r.counts[e] ? plural(r.counts[e], 'package') : '';
+      const errs = r.problems.lines[e] || [];
+      $('#tpl-err-' + e).innerHTML = errs
+        .map((x) => `<li><b>Line ${esc(x.line)}</b> <code>${esc(x.text)}</code> ${esc(sentence(x.message))}</li>`)
+        .join('');
+      $('#tpl-' + e).toggleAttribute('aria-invalid', errs.length > 0);
+    }
+  };
+  const check = async () => {
+    const r = await api('/api/templates/check' + (id ? '?id=' + id : ''), { method: 'POST', body: read() });
+    if (isCurrent()) show(r);
+    return r;
+  };
+  const recheck = debounce(() => check().catch(() => {}), 400);
+  $('#tpl-form').addEventListener('input', () => {
+    touched = true;
+    recheck();
+  });
+  $('#tpl-sdist').addEventListener('change', (e) => $('#tpl-sdist-warn').classList.toggle('hidden', !e.target.checked));
+  check().catch(() => {});
+
+  $('#tpl-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    touched = true;
+    const r = await check();
+    if (!r.ok) {
+      toast('Fix the problems shown before saving', 'error');
+      return;
+    }
+    try {
+      const body = read();
+      const out = await act(() => api(id ? `/api/templates/${id}` : '/api/templates', { method: id ? 'PUT' : 'POST', body }));
+      toast(id ? 'Template saved' : 'Template created');
+      location.hash = `#/templates/${out.id}`;
+    } catch (ex) {
+      toast(ex.message, 'error');
+    }
+  });
+
+  view().addEventListener('click', (e) => {
+    const b = e.target.closest('[data-import]');
+    if (b) openImportDialog(b.dataset.import, recheck);
+  });
+}
+
+const MANIFESTS = { cargo: 'Cargo.toml', npm: 'package.json', pypi: 'requirements.txt', maven: 'pom.xml' };
+
+/** Fill a section from a Cargo.toml, package.json, requirements.txt or pom.xml. */
+function openImportDialog(eco, changed) {
+  const dlg = $('#import-dialog');
+  dlg.innerHTML = `
+    <form method="dialog" id="import-form">
+      <h2 id="import-title">Import from ${esc(MANIFESTS[eco])}</h2>
+      <p>Choose the file or paste its contents. Its dependencies are added to the ${esc(REPOS[eco].label)} section.</p>
+      <div class="stack">
+        <div class="field"><label for="import-file">File</label><input type="file" id="import-file" accept=".toml,.json,.txt,.in,.xml,.pom"></div>
+        <div class="field"><label for="import-text">Or paste it</label><textarea id="import-text" class="mono" rows="8" spellcheck="false"></textarea></div>
+      </div>
+      <ul class="line-errors" id="import-skipped"></ul>
+      <p class="err hidden" id="import-err"></p>
+      <div class="row">
+        <button value="cancel" formnovalidate>Close</button>
+        <button class="primary" value="ok">Import</button>
+      </div>
+    </form>`;
+  dlg.showModal();
+  let filename = null;
+  $('#import-file').addEventListener('change', async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    if (f.size > 1024 * 1024) return showError($('#import-err'), 'That file is larger than 1 MB.');
+    filename = f.name;
+    $('#import-text').value = await f.text();
+  });
+  $('#import-form').addEventListener('submit', async (e) => {
+    if (e.submitter?.value !== 'ok') return;
+    e.preventDefault();
+    showError($('#import-err'), '');
+    const content = $('#import-text').value;
+    if (!content.trim()) return showError($('#import-err'), 'Choose a file or paste one first.');
+    try {
+      const r = await api('/api/templates/import', { method: 'POST', body: { filename: filename || MANIFESTS[eco], content } });
+      if (r.ecosystem !== eco) {
+        return showError($('#import-err'), `That looks like a ${REPOS[r.ecosystem].label} manifest. Use the import button on the ${REPOS[r.ecosystem].label} section.`);
+      }
+      const ta = $('#tpl-' + eco);
+      const have = new Set(ta.value.split('\n').map((l) => l.trim()));
+      const added = r.lines.filter((l) => !have.has(l));
+      ta.value = [ta.value.trimEnd(), ...added].filter(Boolean).join('\n');
+      changed();
+      toast(`Added ${plural(added.length, 'package')}`);
+      if (r.skipped.length) {
+        $('#import-skipped').innerHTML = `<li><b>Skipped</b></li>` + r.skipped.map((s) => `<li>${esc(s)}</li>`).join('');
+      } else {
+        dlg.close();
+      }
+    } catch (ex) {
+      showError($('#import-err'), ex.message);
     }
   });
 }

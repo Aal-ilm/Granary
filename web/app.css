@@ -1140,3 +1140,106 @@ td select { padding: 3px 6px; }
   dialog { background: Canvas; }
   .dot { forced-color-adjust: none; }
 }
+
+/* ------------------------------------------------- get packages & templates */
+
+textarea {
+  font: 13px/1.5 var(--mono);
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 0;
+  border: 1px solid var(--line-strong);
+  background: var(--field);
+  color: var(--ink);
+  resize: vertical;
+}
+textarea:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; border-color: var(--focus); }
+textarea[aria-invalid] { border-color: var(--danger); }
+textarea::placeholder { color: var(--muted); opacity: 1; }
+dialog textarea { margin: 0; }
+input[type="file"] { font: inherit; color: var(--muted); }
+
+.get-search { display: flex; gap: 8px; }
+.get-search input { flex: 1 1 auto; }
+.page-note { color: var(--muted); font-size: 13px; margin: -6px 0 14px; }
+td.desc { color: var(--muted); max-width: 420px; }
+
+.kind {
+  font: 650 11px/1 var(--sans);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 3px 6px;
+  border: 1px solid var(--line-strong);
+  white-space: nowrap;
+}
+.kind.custom { color: var(--link); border-color: var(--link); }
+.tag {
+  font-size: 12px;
+  padding: 1px 7px;
+  color: var(--muted);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  text-decoration: none;
+}
+.tag:hover { color: var(--ink); border-color: var(--line-strong); }
+
+/* Long filter rows (many tags) scroll on their own instead of the page. */
+.toolbar .seg { max-width: 100%; overflow-x: auto; }
+.toolbar .seg > * { white-space: nowrap; }
+
+.tpl-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+  gap: 16px;
+}
+.tpl-card { padding: 16px 18px 14px; display: flex; flex-direction: column; gap: 10px; }
+.tpl-head { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }
+.tpl-head h2 { margin: 0; font-size: 20px; line-height: 1.2; }
+.tpl-head h2 a { color: var(--ink); text-decoration: none; }
+.tpl-head h2 a:hover { color: var(--link); text-decoration: underline; }
+.tpl-desc { margin: 0; color: var(--muted); font-size: 13.5px; flex: 1 1 auto; }
+.tpl-counts { display: flex; gap: 6px 14px; flex-wrap: wrap; font-size: 13px; }
+.tpl-counts .count { display: inline-flex; gap: 6px; align-items: center; }
+.tpl-tags { display: flex; gap: 6px; flex-wrap: wrap; }
+.tpl-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+  font-size: 13px;
+}
+
+.tpl-facts { display: flex; gap: 12px 40px; flex-wrap: wrap; margin: 0 0 18px; }
+.tpl-facts dt { color: var(--muted); font-size: 12.5px; }
+.tpl-facts dd { margin: 2px 0 0; font-weight: 650; }
+.tpl-section { margin-bottom: 18px; }
+.tpl-section h2 { display: flex; gap: 10px; align-items: baseline; font-size: 18px; margin: 0 0 6px; }
+.tpl-section h2 .fmt { font: 600 15px/1.5 var(--sans); }
+
+.tpl-ecos {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));
+  gap: 18px 22px;
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+.tpl-eco-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 6px; }
+.tpl-eco-head label { display: inline-flex; gap: 10px; align-items: baseline; font-weight: 650; }
+.tpl-save { margin-top: 20px; }
+#tpl-form input[type="text"] { width: 100%; max-width: 560px; }
+.sdist-warning { margin: 10px 0 0; }
+
+.line-errors { list-style: none; margin: 6px 0 0; padding: 0; font-size: 12.5px; color: var(--danger); }
+.line-errors li + li { margin-top: 3px; }
+.line-errors code { color: var(--ink); background: var(--surface-2); padding: 0 4px; word-break: break-all; }
+dialog .line-errors { color: var(--muted); max-height: 160px; overflow: auto; }
+
+@media (max-width: 720px) {
+  .get-search { flex-wrap: wrap; }
+  .get-search button { width: 100%; justify-content: center; }
+}

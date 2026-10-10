@@ -4,6 +4,8 @@
 mod cache_limit;
 mod maven;
 mod offline;
+mod search;
+mod templates;
 
 use std::{
     collections::HashMap,
@@ -100,6 +102,9 @@ impl Mock {
 
 pub struct Harness {
     pub app: Router,
+    /// The mock upstream's base URL, e.g. http://127.0.0.1:1234.
+    base: String,
+    db: sqlx::SqlitePool,
     pub mock: Mock,
     pub data: PathBuf,
     pub token: String,
@@ -111,6 +116,7 @@ pub struct Opts {
     pub meta_ttl: Duration,
     pub offline: bool,
     pub cache_limit: Option<u64>,
+    pub search: bool,
 }
 
 impl Default for Opts {
@@ -120,6 +126,7 @@ impl Default for Opts {
             meta_ttl: Duration::from_secs(300),
             offline: false,
             cache_limit: None,
+            search: true,
         }
     }
 }
@@ -144,6 +151,7 @@ impl Harness {
             meta_ttl,
             offline,
             cache_limit,
+            search,
         } = opts;
         let mock = Mock::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -171,6 +179,9 @@ impl Harness {
             pypi_index: format!("{base}/simple"),
             pypi_files: format!("{base}/files"),
             maven_upstream: format!("{base}/maven2"),
+            search,
+            cargo_api: format!("{base}/crates-api"),
+            maven_search: format!("{base}/solr/select"),
             admin_user: "admin".into(),
             admin_password: None,
             client_auth,
@@ -187,6 +198,7 @@ impl Harness {
         auth::ensure_admin(&db, "admin", Some("a long test password"))
             .await
             .unwrap();
+        crate::templates::sync_builtins(&db).await.unwrap();
         let sessions = auth::SqliteSessionStore::new(db.clone());
         let backend = auth::Backend::new(db).await.unwrap();
         let user = backend.list_users().await.unwrap().remove(0);
@@ -199,6 +211,8 @@ impl Harness {
             auth: backend,
         };
         Self {
+            base,
+            db: state.auth.db.clone(),
             app: crate::app(state, sessions),
             mock,
             data,
@@ -284,6 +298,42 @@ impl Harness {
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
         let set = headers[header::SET_COOKIE].to_str().unwrap();
         set.split(';').next().unwrap().to_string()
+    }
+
+    pub fn upstream_base(&self) -> &str {
+        &self.base
+    }
+
+    /// Create a viewer account and sign in as it; returns the session cookie.
+    pub async fn viewer_login(&self) -> String {
+        let hash = auth::hash_password("a long viewer password".into())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO users (username, password_hash, role, created_at) VALUES ('viewer', ?, 'viewer', 0)",
+        )
+        .bind(hash)
+        .execute(&self.db)
+        .await
+        .unwrap();
+        let (status, headers, _) = self
+            .send(
+                "POST",
+                "/api/auth/login",
+                None,
+                Some(
+                    serde_json::json!({"username": "viewer", "password": "a long viewer password"}),
+                ),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        headers[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
     }
 
     /// GET a JSON API route as the signed-in admin.

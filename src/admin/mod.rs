@@ -182,6 +182,8 @@ pub struct Admin {
     pub tasks: Mutex<Vec<TaskStatus>>,
     pub health: Mutex<Vec<UpstreamHealth>>,
     pub logs: LogBuffer,
+    /// Search results and per-user limits for "Get packages".
+    pub search: crate::search::SearchState,
     pub started_at: u64,
     inventory: Mutex<Option<(Instant, Arc<Vec<Asset>>)>>,
     settings_path: PathBuf,
@@ -252,6 +254,7 @@ impl Admin {
             logs,
             started_at: now_secs(),
             inventory: Mutex::new(None),
+            search: Default::default(),
             settings_path,
         })
     }

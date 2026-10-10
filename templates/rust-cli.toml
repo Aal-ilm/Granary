@@ -1,0 +1,14 @@
+name = "Rust CLI"
+description = "Command-line tools: argument parsing, error handling, serialization and logging."
+tags = ["rust", "cli"]
+
+[cargo]
+dependencies = [
+  'clap = { version = "*", features = ["derive"] }',
+  'anyhow = "*"',
+  'thiserror = "*"',
+  'serde = { version = "*", features = ["derive"] }',
+  'serde_json = "*"',
+  'tracing = "*"',
+  'tracing-subscriber = "*"',
+]

@@ -10,7 +10,9 @@ mod inventory;
 mod logbuf;
 mod metrics;
 mod net;
+mod search;
 mod store;
+mod templates;
 #[cfg(test)]
 mod tests;
 mod ui;
@@ -59,6 +61,8 @@ pub fn app(state: AppState, sessions: SqliteSessionStore) -> Router {
         .merge(admin::api::router())
         .merge(auth::api::router())
         .merge(audit::router())
+        .merge(search::router())
+        .merge(templates::api::router())
         .route_layer(middleware::from_fn(auth::api_guard));
 
     let idle = state.cfg.session_idle.as_secs() as i64;
@@ -160,6 +164,7 @@ async fn run() -> anyhow::Result<()> {
         println!("  Sign in and you'll be asked to choose a new password.");
         println!();
     }
+    templates::sync_builtins(&db).await?;
     let sessions = SqliteSessionStore::new(db.clone());
     // Sessions from versions that stored raw session IDs can't be looked up
     // any more; remove them (those people sign in once more).

@@ -63,7 +63,12 @@ async fn download(
     State(st): State<AppState>,
     Path((krate, version)): Path<(String, String)>,
 ) -> AppResult<Response> {
-    if !valid_crate_name(&krate) || !valid_version(&version) {
+    fetch_crate(&st, &krate, &version).await
+}
+
+/// Serve one `.crate`, downloading and verifying it on first use.
+pub async fn fetch_crate(st: &AppState, krate: &str, version: &str) -> AppResult<Response> {
+    if !valid_crate_name(krate) || !valid_version(version) {
         return Err(AppError::bad_request("invalid crate name or version"));
     }
     // Crate names are case-insensitive, so store under the lowercased name.
@@ -71,13 +76,13 @@ async fn download(
     let url = st
         .cfg
         .cargo_dl
-        .replace("{crate}", &krate)
-        .replace("{version}", &version);
+        .replace("{crate}", krate)
+        .replace("{version}", version);
     let rel = format!("{lower}/{lower}-{version}.crate");
     let expected = if st.store.has_file("cargo", &rel).await {
         None
     } else {
-        expected_cksum(&st, &lower, &version).await
+        expected_cksum(st, &lower, version).await
     };
     st.store
         .file("cargo", &rel, &url, "application/x-tar", expected)

@@ -1,0 +1,16 @@
+name = "Rust embedded (Cortex-M)"
+description = "Bare-metal Cortex-M firmware with defmt logging and the Embassy async executor."
+tags = ["rust", "embedded"]
+
+[cargo]
+dependencies = [
+  'cortex-m = "*"',
+  'cortex-m-rt = "*"',
+  'embedded-hal = "*"',
+  'defmt = "*"',
+  'defmt-rtt = "*"',
+  'panic-probe = "*"',
+  'heapless = "*"',
+  'embassy-executor = "*"',
+  'embassy-time = "*"',
+]

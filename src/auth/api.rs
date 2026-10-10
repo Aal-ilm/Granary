@@ -215,6 +215,7 @@ async fn me(State(st): State<AppState>, auth: AuthSession) -> AppResult<Json<Val
     Ok(Json(json!({
         "user": user,
         "client_auth": st.cfg.client_auth,
+        "offline": st.cfg.offline,
         "min_password_length": super::MIN_PASSWORD_LEN,
     })))
 }

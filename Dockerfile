@@ -10,6 +10,8 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs \
 
 COPY src ./src
 COPY web ./web
+# Built-in templates are compiled into the binary.
+COPY templates ./templates
 RUN touch src/main.rs && cargo build --release --locked \
     && mkdir /data-dir
 
