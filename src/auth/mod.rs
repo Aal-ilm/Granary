@@ -680,7 +680,8 @@ pub async fn api_guard(auth: AuthSession, req: Request, next: Next) -> Response 
 }
 
 /// Pull an access token out of whichever header a package manager uses:
-/// `Bearer <token>` (npm), Basic auth with the token as password (pip, uv)
+/// `Bearer <token>` (npm), Basic auth with the token as password (pip, uv,
+/// Maven, Gradle)
 /// or a bare token (Cargo).
 pub fn token_from_headers(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
@@ -723,8 +724,12 @@ pub async fn client_guard(
         }
     }
     let base = base_url(&st.cfg, req.headers());
-    let challenge = if req.uri().path().starts_with("/cargo/") {
+    let path = req.uri().path();
+    let challenge = if path.starts_with("/cargo/") {
         format!("Cargo login_url=\"{base}/#/tokens\"")
+    } else if path.starts_with("/maven/") {
+        // Maven only sends its <server> credentials after this challenge.
+        "Basic realm=\"granary\"".to_string()
     } else {
         "Basic realm=\"Granary\", charset=\"UTF-8\"".to_string()
     };

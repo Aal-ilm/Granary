@@ -181,6 +181,13 @@ async fn repos(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
                         },
                     }),
                 ),
+                "maven" => (
+                    "Maven Central",
+                    "Maven",
+                    "/maven",
+                    vec![json!({"label": "Repository", "url": cfg.maven_upstream})],
+                    maven_setup(&base, auth),
+                ),
                 _ => (
                     "pypi.org",
                     "PyPI",
@@ -216,6 +223,46 @@ async fn repos(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
         })
         .collect();
     Json(json!({ "base_url": base, "client_auth": auth, "repos": list }))
+}
+
+/// settings.xml for Maven, plus a Gradle init script that does the same.
+fn maven_setup(base: &str, auth: bool) -> Value {
+    let url = format!("{base}/maven");
+    let server = if auth {
+        "\n<servers>\n  <server>\n    <id>granary</id>\n    <username>token</username>\n    <password>YOUR_TOKEN</password>\n  </server>\n</servers>"
+    } else {
+        ""
+    };
+    json!({
+        "file": "~/.m2/settings.xml, inside <settings>",
+        "snippet": format!("<mirrors>\n  <mirror>\n    <id>granary</id>\n    <mirrorOf>central</mirrorOf>\n    <url>{url}</url>\n  </mirror>\n</mirrors>{server}"),
+        "more": [{
+            "label": "Gradle",
+            "file": "~/.gradle/init.d/granary.gradle",
+            "snippet": gradle_init(&url, auth.then_some("YOUR_TOKEN")),
+        }],
+    })
+}
+
+/// A Gradle init script that sends every `mavenCentral()` repository
+/// (in settings, plugin management, buildscripts and projects) to Granary.
+/// `scripts/granary-client.sh` writes the same script.
+fn gradle_init(url: &str, token: Option<&str>) -> String {
+    let insecure = if url.starts_with("http://") {
+        "\n            repo.allowInsecureProtocol = true"
+    } else {
+        ""
+    };
+    let credentials = token
+        .map(|t| {
+            format!(
+                "\n            repo.credentials {{\n                username = 'token'\n                password = '{t}'\n            }}"
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "def granary = {{ RepositoryHandler repos ->\n    repos.configureEach {{ repo ->\n        if (repo instanceof MavenArtifactRepository && repo.url.toString().startsWith('https://repo.maven.apache.org/maven2')) {{\n            repo.url = '{url}'{insecure}{credentials}\n        }}\n    }}\n}}\nbeforeSettings {{ settings ->\n    granary(settings.pluginManagement.repositories)\n    granary(settings.dependencyResolutionManagement.repositories)\n}}\nallprojects {{\n    granary(buildscript.repositories)\n    granary(repositories)\n}}"
+    )
 }
 
 async fn invalidate(
@@ -351,6 +398,13 @@ fn upstream_page(st: &AppState, repo: &str, name: &str) -> Option<(String, Strin
             "pypi.org".into(),
             format!("https://pypi.org/project/{name}/"),
         )),
+        "maven" if cfg.maven_upstream == "https://repo1.maven.org/maven2" => {
+            let (group, artifact) = name.split_once(':')?;
+            Some((
+                "Maven Central".into(),
+                format!("https://central.sonatype.com/artifact/{group}/{artifact}"),
+            ))
+        }
         _ => None,
     }
 }
@@ -387,6 +441,7 @@ async fn component(
                     let download = match repo {
                         "cargo" => format!("{base}/cargo/dl/{}/{v}", a.package),
                         "npm" => format!("{base}/npm/{}", a.path),
+                        "maven" => format!("{base}/maven/{}", a.path),
                         _ => format!("{base}/pypi/files/{}", a.path),
                     };
                     json!({
@@ -450,7 +505,7 @@ async fn delete_component(
             bytes += freed;
         }
     }
-    if let Some(key) = inventory::meta_key(repo, &q.name) {
+    for key in inventory::meta_keys(repo, &q.name) {
         bytes += st.store.delete_meta(repo, &key).await.unwrap_or(0);
     }
     st.admin.invalidate_inventory();
@@ -651,6 +706,7 @@ async fn system(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
             {"key": "GRANARY_NPM_UPSTREAM", "label": "npm registry", "value": cfg.npm_upstream},
             {"key": "GRANARY_PYPI_INDEX", "label": "PyPI index", "value": cfg.pypi_index},
             {"key": "GRANARY_PYPI_FILES", "label": "PyPI files", "value": cfg.pypi_files},
+            {"key": "GRANARY_MAVEN_UPSTREAM", "label": "Maven repository", "value": cfg.maven_upstream},
         ],
     }))
 }

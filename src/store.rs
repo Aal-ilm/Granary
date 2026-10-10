@@ -14,7 +14,7 @@
 //! as their own task, so a client that disconnects doesn't abort them.
 //!
 //! When the format knows the registry's checksum for a file (Cargo's
-//! `cksum`, npm's `integrity`, PyPI's `sha256`), the download is verified
+//! `cksum`, npm's `integrity`, PyPI's `sha256`, Maven's `.sha1`), the download is verified
 //! before it enters the cache, so a corrupted or tampered response from
 //! upstream is never stored or served to anyone.
 
@@ -38,6 +38,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
@@ -57,6 +58,7 @@ const MAX_META_BYTES: usize = 512 * 1024 * 1024;
 /// A checksum published by the registry for a file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Checksum {
+    Sha1(Vec<u8>),
     Sha256(Vec<u8>),
     Sha512(Vec<u8>),
 }
@@ -65,6 +67,13 @@ impl Checksum {
     pub fn sha256_hex(s: &str) -> Option<Self> {
         let b = hex::decode(s.trim()).ok()?;
         (b.len() == 32).then_some(Self::Sha256(b))
+    }
+
+    /// The contents of a Maven `.sha1` file: the hex digest, sometimes
+    /// followed by the file name (`<hex>  name.jar`).
+    pub fn sha1_file(s: &str) -> Option<Self> {
+        let b = hex::decode(s.split_whitespace().next()?).ok()?;
+        (b.len() == 20).then_some(Self::Sha1(b))
     }
 
     /// An npm/SRI `integrity` value; only sha512 (and sha256) are trusted.
@@ -83,6 +92,7 @@ impl Checksum {
 }
 
 enum Hasher {
+    Sha1(Sha1),
     Sha256(Sha256),
     Sha512(Sha512),
 }
@@ -90,18 +100,21 @@ enum Hasher {
 impl Hasher {
     fn new(c: &Checksum) -> Self {
         match c {
+            Checksum::Sha1(_) => Self::Sha1(Sha1::new()),
             Checksum::Sha256(_) => Self::Sha256(Sha256::new()),
             Checksum::Sha512(_) => Self::Sha512(Sha512::new()),
         }
     }
     fn update(&mut self, data: &[u8]) {
         match self {
+            Self::Sha1(h) => h.update(data),
             Self::Sha256(h) => h.update(data),
             Self::Sha512(h) => h.update(data),
         }
     }
     fn matches(self, c: &Checksum) -> bool {
         match (self, c) {
+            (Self::Sha1(h), Checksum::Sha1(want)) => h.finalize().as_slice() == want.as_slice(),
             (Self::Sha256(h), Checksum::Sha256(want)) => h.finalize().as_slice() == want.as_slice(),
             (Self::Sha512(h), Checksum::Sha512(want)) => h.finalize().as_slice() == want.as_slice(),
             _ => false,
@@ -130,7 +143,12 @@ pub struct Store {
     /// Last time each cached file was served, keyed by `ns/rel`.
     access: Mutex<HashMap<String, u64>>,
     access_dirty: AtomicBool,
+    /// Items upstream recently said don't exist, with when to forget that.
+    missing: Mutex<HashMap<String, u64>>,
 }
+
+/// Most negative-cache entries kept; expired ones are dropped first.
+const MAX_MISSING: usize = 50_000;
 
 /// A metadata document, as stored from upstream (before any URL rewriting).
 pub struct Meta {
@@ -192,6 +210,7 @@ impl Store {
             stats: Stats::default(),
             access: Mutex::new(access),
             access_dirty: AtomicBool::new(false),
+            missing: Mutex::new(HashMap::new()),
         })
     }
 
@@ -254,6 +273,35 @@ impl Store {
         let tmp = self.tmp_path();
         tokio::fs::write(&tmp, data).await?;
         tokio::fs::rename(&tmp, dest).await
+    }
+
+    // ---------------------------------------------------------- negative cache
+
+    /// Whether upstream answered 404 for `key` within its negative-cache time.
+    pub fn known_missing(&self, key: &str) -> bool {
+        let mut map = self.missing.lock().unwrap();
+        match map.get(key) {
+            Some(&until) if until > now_secs() => true,
+            Some(_) => {
+                map.remove(key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Remember for `ttl` that upstream has no `key`, so repeated probes for
+    /// it are answered without asking upstream again.
+    pub fn remember_missing(&self, key: &str, ttl: Duration) {
+        let now = now_secs();
+        let mut map = self.missing.lock().unwrap();
+        if map.len() >= MAX_MISSING {
+            map.retain(|_, until| *until > now);
+            if map.len() >= MAX_MISSING {
+                map.clear();
+            }
+        }
+        map.insert(key.to_string(), now + ttl.as_secs());
     }
 
     // ------------------------------------------------------------------ files
@@ -320,6 +368,53 @@ impl Store {
 
         self.touch(ns, rel);
         serve_file(&path, content_type).await
+    }
+
+    /// Fetch a small upstream file (such as a checksum) without caching it.
+    /// Returns `None` when upstream has no such file.
+    pub async fn fetch_small(&self, url: &str, max: usize) -> AppResult<Option<Bytes>> {
+        let resp = self.file_client.get(url).send().await?;
+        match resp.status() {
+            s if s.is_success() => {}
+            StatusCode::NOT_FOUND | StatusCode::GONE => return Ok(None),
+            s => {
+                return Err(AppError::bad_gateway(format!(
+                    "upstream returned {s} for {url}"
+                )));
+            }
+        }
+        if resp.content_length().is_some_and(|n| n > max as u64) {
+            return Err(AppError::bad_gateway(format!(
+                "{url} is unexpectedly large"
+            )));
+        }
+        let mut buf = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if buf.len() + chunk.len() > max {
+                return Err(AppError::bad_gateway(format!(
+                    "{url} is unexpectedly large"
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(Some(buf.into()))
+    }
+
+    /// Read a cached file's contents, if it is cached.
+    pub async fn read_file(&self, ns: &str, rel: &str) -> Option<Vec<u8>> {
+        let path = self.files_dir(ns).join(safe_rel_path(rel).ok()?);
+        tokio::fs::read(path).await.ok()
+    }
+
+    /// Store a small file in the cache (atomically) unless it is already there.
+    pub async fn put_file(&self, ns: &str, rel: &str, data: &[u8]) -> AppResult<()> {
+        let path = self.files_dir(ns).join(safe_rel_path(rel)?);
+        if !tokio::fs::try_exists(&path).await? {
+            self.write_atomic(&path, data).await?;
+        }
+        Ok(())
     }
 
     async fn download(&self, url: &str, dest: &Path, expected: Option<&Checksum>) -> AppResult<()> {
@@ -596,17 +691,20 @@ impl Store {
         Ok(true)
     }
 
-    /// Delete one cached file (and a PyPI `.metadata` companion). Returns bytes freed.
+    /// Delete one cached file and its companions (a PyPI `.metadata` file,
+    /// Maven checksum files). Returns bytes freed.
     pub async fn delete_file(&self, ns: &str, rel: &str) -> AppResult<u64> {
         let path = self.files_dir(ns).join(safe_rel_path(rel)?);
         let mut freed = 0;
-        for (p, key) in [
-            (path.clone(), rel.to_string()),
-            (
-                PathBuf::from(format!("{}.metadata", path.display())),
-                format!("{rel}.metadata"),
-            ),
-        ] {
+        let targets = std::iter::once(String::new())
+            .chain(companions(ns).iter().map(|ext| ext.to_string()))
+            .map(|ext| {
+                (
+                    PathBuf::from(format!("{}{ext}", path.display())),
+                    format!("{rel}{ext}"),
+                )
+            });
+        for (p, key) in targets {
             if let Ok(meta) = tokio::fs::metadata(&p).await {
                 tokio::fs::remove_file(&p).await?;
                 freed += meta.len();
@@ -666,6 +764,16 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
             Err(e) => Err(e),
         }
+    }
+}
+
+/// Suffixes of small files that belong to a cached file in `ns` and are
+/// listed, sized and deleted together with it.
+pub fn companions(ns: &str) -> &'static [&'static str] {
+    match ns {
+        "pypi" => &[".metadata"],
+        "maven" => &[".sha1", ".md5", ".sha256", ".sha512"],
+        _ => &[],
     }
 }
 
@@ -740,5 +848,11 @@ mod tests {
         assert!(h.matches(&sri));
         assert!(Checksum::from_sri("sha1-qZk+NkcGgWq6PiVxeFDCbJzQ2J0=").is_none());
         assert!(Checksum::sha256_hex("abcd").is_none());
+        let sha1 =
+            Checksum::sha1_file("a9993e364706816aba3e25717850c26c9cd0d89d  abc.jar\n").unwrap();
+        let mut h = Hasher::new(&sha1);
+        h.update(b"abc");
+        assert!(h.matches(&sha1));
+        assert!(Checksum::sha1_file("not hex").is_none());
     }
 }

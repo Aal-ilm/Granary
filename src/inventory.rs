@@ -5,10 +5,13 @@ use std::{collections::HashMap, path::Path, time::UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::formats::pypi::normalize;
+use crate::{
+    formats::{maven, pypi::normalize},
+    store::companions,
+};
 
 /// The repositories Granary serves, in display order.
-pub const REPOS: [&str; 3] = ["cargo", "npm", "pypi"];
+pub const REPOS: [&str; 4] = ["cargo", "npm", "pypi", "maven"];
 
 /// One cached file.
 #[derive(Clone, Debug, Serialize)]
@@ -28,6 +31,7 @@ pub struct Asset {
 
 /// Work out which package and version a cached file belongs to.
 /// Returns `None` for files that aren't packages (e.g. PyPI `.metadata`).
+/// Maven packages are named `group:artifact`.
 pub fn classify(repo: &str, rel: &str) -> Option<(String, String)> {
     match repo {
         "cargo" => {
@@ -62,6 +66,13 @@ pub fn classify(repo: &str, rel: &str) -> Option<(String, String)> {
             let (name, version) = stem.rsplit_once('-')?;
             Some((normalize(name), version.to_string()))
         }
+        "maven" => {
+            if companions("maven").iter().any(|ext| rel.ends_with(ext)) {
+                return None;
+            }
+            let (group, artifact, version, _) = maven::coordinates(rel)?;
+            Some((format!("{group}:{artifact}"), version.to_string()))
+        }
         _ => None,
     }
 }
@@ -88,18 +99,22 @@ pub fn scan_repo(repo: &'static str, root: &Path, access: &HashMap<String, u64>)
                 continue;
             };
             let rel = rel.to_string_lossy().replace('\\', "/");
-            // PyPI `.metadata` files normally count toward their wheel. Ones
-            // whose wheel was never downloaded (pip and uv often resolve from
-            // metadata alone) are listed on their own, so they show up in
-            // Browse and can be cleaned up.
-            let classified = match rel.strip_suffix(".metadata") {
-                Some(dist) if repo == "pypi" => {
-                    if path.with_extension("").exists() {
+            // Companions (PyPI `.metadata`, Maven checksums) normally count
+            // toward their main file. Ones whose main file was never
+            // downloaded (pip and uv often resolve from metadata alone) are
+            // listed on their own, so they show up in Browse and can be
+            // cleaned up.
+            let main = companions(repo)
+                .iter()
+                .find_map(|ext| rel.strip_suffix(ext));
+            let classified = match main {
+                Some(main) => {
+                    if root.join(main).exists() {
                         continue;
                     }
-                    classify(repo, dist)
+                    classify(repo, main)
                 }
-                _ => classify(repo, &rel),
+                None => classify(repo, &rel),
             };
             let Some((package, version)) = classified else {
                 continue;
@@ -111,10 +126,12 @@ pub fn scan_repo(repo: &'static str, root: &Path, access: &HashMap<String, u64>)
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            // A PyPI file's `.metadata` companion counts toward its size.
-            let companion = std::fs::metadata(format!("{}.metadata", path.display()))
+            // Companion files count toward their main file's size.
+            let companion: u64 = companions(repo)
+                .iter()
+                .filter_map(|ext| std::fs::metadata(format!("{}{ext}", path.display())).ok())
                 .map(|m| m.len())
-                .unwrap_or(0);
+                .sum();
             out.push(Asset {
                 repo,
                 package,
@@ -188,7 +205,28 @@ pub fn meta_key(repo: &str, name: &str) -> Option<String> {
         }
         "npm" => Some(name.to_string()),
         "pypi" => Some(normalize(name)),
+        "maven" => {
+            let (group, artifact) = name.split_once(':')?;
+            Some(format!(
+                "{}/{artifact}/maven-metadata.xml",
+                group.replace('.', "/")
+            ))
+        }
         _ => None,
+    }
+}
+
+/// Every metadata cache key to remove along with a package.
+pub fn meta_keys(repo: &str, name: &str) -> Vec<String> {
+    let Some(key) = meta_key(repo, name) else {
+        return Vec::new();
+    };
+    if repo == "maven" {
+        let mut keys = vec![key.clone()];
+        keys.extend(companions("maven").iter().map(|ext| format!("{key}{ext}")));
+        keys
+    } else {
+        vec![key]
     }
 }
 
@@ -234,6 +272,30 @@ mod tests {
             ),
             None
         );
+        assert_eq!(
+            c(
+                "maven",
+                "org/apache/commons/commons-lang3/3.17.0/commons-lang3-3.17.0-sources.jar"
+            ),
+            pair("org.apache.commons:commons-lang3", "3.17.0")
+        );
+        assert_eq!(
+            c(
+                "maven",
+                "org/slf4j/slf4j-api/2.0.17/slf4j-api-2.0.17.jar.sha1"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn maven_metadata_keys() {
+        assert_eq!(
+            meta_key("maven", "org.slf4j:slf4j-api").as_deref(),
+            Some("org/slf4j/slf4j-api/maven-metadata.xml")
+        );
+        assert_eq!(meta_keys("maven", "org.slf4j:slf4j-api").len(), 5);
+        assert!(meta_key("maven", "no-colon").is_none());
     }
 
     #[test]

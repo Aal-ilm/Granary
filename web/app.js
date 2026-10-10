@@ -17,8 +17,19 @@ const REPOS = {
   cargo: { label: 'Cargo', upstream: 'crates.io' },
   npm: { label: 'npm', upstream: 'registry.npmjs.org' },
   pypi: { label: 'PyPI', upstream: 'pypi.org' },
+  maven: { label: 'Maven', upstream: 'Maven Central' },
 };
 const REPO_IDS = Object.keys(REPOS);
+
+/** Maven packages are named `group:artifact`. */
+const mavenName = (name) => {
+  const i = String(name).indexOf(':');
+  return i < 0 ? { group: '', artifact: name } : { group: name.slice(0, i), artifact: name.slice(i + 1) };
+};
+
+/** A repository's client setup as a list of snippets: the main one, then
+ *  any alternatives (Gradle next to Maven). */
+const setupSnippets = (setup) => [{ label: '', file: setup.file, snippet: setup.snippet, after: setup.after }, ...(setup.more || [])];
 
 const chip = (repo) => `<span class="fmt ${esc(repo)}">${esc(REPOS[repo]?.label ?? repo)}</span>`;
 
@@ -335,8 +346,8 @@ function go(path, query, { replace = false } = {}) {
 const routes = [
   [/^\/$/, 'overview', renderOverview],
   [/^\/repos$/, 'repos', renderRepos],
-  [/^\/browse(?:\/(cargo|npm|pypi))?$/, 'browse', renderBrowse],
-  [/^\/c\/(cargo|npm|pypi)\/(.+)$/, 'browse', renderComponent],
+  [/^\/browse(?:\/(cargo|npm|pypi|maven))?$/, 'browse', renderBrowse],
+  [/^\/c\/(cargo|npm|pypi|maven)\/(.+)$/, 'browse', renderComponent],
   [/^\/cleanup$/, 'cleanup', renderCleanup],
   [/^\/tasks$/, 'tasks', renderTasks],
   [/^\/system$/, 'system', renderSystem],
@@ -452,7 +463,7 @@ async function renderOverview({ isCurrent }) {
           )
           .join('')}</tbody></table></div>`
     : `<div class="panel empty"><strong>Nothing cached yet</strong>
-        Point Cargo, npm or pip at Granary and packages will appear here as they are downloaded.
+        Point Cargo, npm, pip, Maven or Gradle at Granary and packages will appear here as they are downloaded.
         <p><a class="btn" href="#/repos">Show client setup</a></p></div>`;
 
   setView(`
@@ -517,9 +528,14 @@ async function renderRepos({ isCurrent }) {
         <div class="repo-upstream">${r.upstream.map((u) => `${esc(u.label)} from <code>${esc(u.url)}</code>`).join('<br>')}</div>
         <details class="setup">
           <summary>Client setup</summary>
-          <div class="snippet"><pre>${esc(r.setup.snippet)}</pre><button class="small" data-copy="${esc(r.setup.snippet)}">Copy</button></div>
-          <div class="snippet-file">Add to ${esc(r.setup.file)}${d.client_auth ? '. Replace YOUR_TOKEN with a token from <a href="#/tokens">Access tokens</a>.' : ''}</div>
-          ${r.setup.after ? `<div class="snippet-file">${esc(r.setup.after)}</div>` : ''}
+          ${setupSnippets(r.setup)
+            .map(
+              (s) => `${s.label ? `<h3 class="setup-label">${esc(s.label)}</h3>` : ''}
+          <div class="snippet"><pre>${esc(s.snippet)}</pre><button class="small" data-copy="${esc(s.snippet)}">Copy</button></div>
+          <div class="snippet-file">Add to ${esc(s.file)}${d.client_auth ? '. Replace YOUR_TOKEN with a token from <a href="#/tokens">Access tokens</a>.' : ''}</div>
+          ${s.after ? `<div class="snippet-file">${esc(s.after)}</div>` : ''}`
+            )
+            .join('')}
         </details>
       </article>`;
     })
@@ -587,17 +603,30 @@ async function renderBrowse({ params, query, isCurrent }) {
     return `<th class="${cls}"${ariaSort}><button class="sort" data-sort="${key}" data-order="${nextOrder}">${esc(label)}${arrow}</button></th>`;
   };
 
+  // Maven, sorted by name: artifacts sit under a row for their group.
+  const byGroup = repo === 'maven' && sort === 'name';
+  let lastGroup = null;
   const rows = d.items
-    .map(
-      (c) => `<tr>
-        <td><a class="pkg mono" href="#/c/${esc(c.repo)}/${esc(encodeURIComponent(c.name))}">${esc(c.name)}</a></td>
+    .map((c) => {
+      let head = '';
+      let label = c.name;
+      if (byGroup) {
+        const { group, artifact } = mavenName(c.name);
+        label = artifact;
+        if (group !== lastGroup) {
+          lastGroup = group;
+          head = `<tr class="group-row"><th colspan="5" scope="colgroup"><button class="group-filter" data-group="${esc(group)}" title="Show only ${esc(group)}">${esc(group)}</button></th></tr>`;
+        }
+      }
+      return `${head}<tr${byGroup ? ' class="in-group"' : ''}>
+        <td><a class="pkg mono" href="#/c/${esc(c.repo)}/${esc(encodeURIComponent(c.name))}">${esc(label)}</a></td>
         ${repo ? '' : `<td>${chip(c.repo)}</td>`}
         <td class="r num">${esc(count(c.versions))}</td>
         <td class="r num">${esc(bytes(c.size))}</td>
         <td class="hide-sm">${timeTag(c.latest_cached)}</td>
         <td>${timeTag(c.last_access)}</td>
-      </tr>`
-    )
+      </tr>`;
+    })
     .join('');
 
   const from = d.total ? d.offset + 1 : 0;
@@ -634,7 +663,7 @@ async function renderBrowse({ params, query, isCurrent }) {
     <div class="panel">
       ${d.items.length
         ? `<div class="table-wrap"><table>
-            <thead><tr>${col('name', 'Package')}${repo ? '' : '<th>Repository</th>'}${col('versions', 'Versions', 'r')}${col('size', 'Size', 'r')}${col('cached', 'Cached', 'hide-sm')}${col('used', 'Last downloaded')}</tr></thead>
+            <thead><tr>${col('name', repo === 'maven' ? 'Group / artifact' : 'Package')}${repo ? '' : '<th>Repository</th>'}${col('versions', 'Versions', 'r')}${col('size', 'Size', 'r')}${col('cached', 'Cached', 'hide-sm')}${col('used', 'Last downloaded')}</tr></thead>
             <tbody>${rows}</tbody></table></div>${pager}`
         : empty}
     </div>`);
@@ -663,6 +692,8 @@ async function renderBrowse({ params, query, isCurrent }) {
   view().addEventListener('click', (e) => {
     const s = e.target.closest('[data-sort]');
     if (s) return update({ sort: s.dataset.sort, order: s.dataset.order, page: '' });
+    const g = e.target.closest('[data-group]');
+    if (g) return update({ q: g.dataset.group + ':', page: '' });
     const p = e.target.closest('[data-page]');
     if (p && !p.disabled) update({ page: p.dataset.page });
   });
@@ -672,14 +703,20 @@ async function renderBrowse({ params, query, isCurrent }) {
 
 async function renderComponent({ params, isCurrent }) {
   const [repo, name] = params;
+  // Maven: Browse > group > artifact, then its versions.
+  const maven = repo === 'maven' ? mavenName(name) : null;
+  const crumbs = `<div class="crumbs"><a href="#/browse/${repo}">Browse ${esc(REPOS[repo].label)}</a>${
+    maven && maven.group ? ` <span aria-hidden="true">/</span> <a class="mono" href="#/browse/maven?q=${esc(encodeURIComponent(maven.group + ':'))}">${esc(maven.group)}</a>` : ''
+  }</div>`;
+  const title = maven ? maven.artifact : name;
   let d;
   try {
     d = await api(`/api/component?repo=${repo}&name=${encodeURIComponent(name)}`);
   } catch (e) {
     if (e.status !== 404) throw e;
     if (!isCurrent()) return;
-    setView(`<div class="crumbs"><a href="#/browse/${repo}">Browse ${esc(REPOS[repo].label)}</a></div>
-      <div class="page-head"><div><h1 class="title-mono">${esc(name)}</h1><p>This package is not cached. It will be downloaded the next time a client asks for it.</p></div></div>`);
+    setView(`${crumbs}
+      <div class="page-head"><div><h1 class="title-mono">${esc(title)}</h1><p>This package is not cached. It will be downloaded the next time a client asks for it.</p></div></div>`);
     return;
   }
   if (!isCurrent()) return;
@@ -720,12 +757,13 @@ async function renderComponent({ params, isCurrent }) {
     .join('');
 
   setView(`
-    <div class="crumbs"><a href="#/browse/${repo}">Browse ${esc(REPOS[repo].label)}</a></div>
+    ${crumbs}
     <div class="page-head">
       <div>
-        <h1 class="title-mono">${esc(d.name)}</h1>
+        <h1 class="title-mono">${esc(title)}</h1>
         <div class="summary-line">
           ${chip(repo)}
+          ${maven && maven.group ? `<span>Group <b class="mono">${esc(maven.group)}</b></span>` : ''}
           <span><b class="num">${esc(plural(d.versions.length, 'version'))}</b> cached</span>
           <span><b class="num">${esc(bytes(d.size))}</b> on disk</span>
           ${d.upstream ? `<a href="${esc(safeUrl(d.upstream.url))}" target="_blank" rel="noopener noreferrer">View on ${esc(d.upstream.label)}</a>` : ''}
@@ -1355,7 +1393,7 @@ async function renderTokens({ query, isCurrent }) {
   setView(`
     <div class="page-head">
       <div><h1>Access tokens</h1>
-      <p>Cargo, npm and pip use a token to download through Granary. Make one per machine so you can revoke it on its own.</p></div>
+      <p>Cargo, npm, pip, Maven and Gradle use a token to download through Granary. Make one per machine so you can revoke it on its own.</p></div>
       ${isAdmin() ? `<div class="page-actions"><nav class="seg" aria-label="Whose tokens">
         <a href="#/tokens" aria-current="${!all}">Mine</a><a href="#/tokens?all=1" aria-current="${all}">Everyone's</a></nav></div>` : ''}
     </div>
@@ -1382,12 +1420,15 @@ async function renderTokens({ query, isCurrent }) {
       const r = await api('/api/tokens', { method: 'POST', body: { name, expires_days: Number($('#tk-exp').value) } });
       showError($('#tk-err'), '');
       const snippets = repos.repos
-        .map((repo) => {
-          const snippet = repo.setup.snippet.replaceAll('YOUR_TOKEN', () => r.token);
-          const after = repo.setup.after ? `<p class="snippet-file">${esc(repo.setup.after)}</p>` : '';
-          return `<div class="setup-block"><div class="snippet-file">${chip(repo.id)} Add to ${esc(repo.setup.file)}</div>
+        .flatMap((repo) =>
+          setupSnippets(repo.setup).map((s) => {
+            const snippet = s.snippet.replaceAll('YOUR_TOKEN', () => r.token);
+            const after = s.after ? `<p class="snippet-file">${esc(s.after)}</p>` : '';
+            const label = s.label ? ` <span class="muted">${esc(s.label)}</span>` : '';
+            return `<div class="setup-block"><div class="snippet-file">${chip(repo.id)}${label} Add to ${esc(s.file)}</div>
             <div class="snippet"><pre>${esc(snippet)}</pre><button class="small" type="button" data-copy="${esc(snippet)}">Copy</button></div>${after}</div>`;
-        })
+          })
+        )
         .join('');
       $('#tk-result').innerHTML = `
         <div class="result">

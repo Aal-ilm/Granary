@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Point this machine's npm, pip and Cargo at Granary, or switch them back to
-# the public registries, without retyping anything.
+# Point this machine's npm, pip, Cargo, Maven and Gradle at Granary, or
+# switch them back to the public registries, without retyping anything.
 #
 #   granary-client.sh use-granary   install through Granary
 #   granary-client.sh use-public    install straight from the public registries
@@ -14,11 +14,14 @@
 #   GRANARY_URL     Granary's address, e.g. http://10.212.46.20:8480
 #                   (remembered after the first use-granary)
 #   GRANARY_TOKEN   access token; asked for once if not set, then remembered
-#   TOOLS           which tools to change, default "npm pip cargo"
+#   TOOLS           which tools to change, default "npm pip cargo maven"
+#                   ("maven" covers both Maven and Gradle)
 #
 # Compatible with Bash 3.2 (macOS) and later. Only edits per-user config:
-# ~/.npmrc, your user pip.conf and $CARGO_HOME/config.toml. Each file is
-# backed up before its first change.
+# ~/.npmrc, your user pip.conf, $CARGO_HOME/config.toml, ~/.m2/settings.xml
+# and $GRADLE_USER_HOME/init.d/granary.gradle. Each file is backed up before
+# its first change. settings.xml is edited by m2-settings.py (next to this
+# script, needs python3), which works on the XML rather than on raw lines.
 
 set -euo pipefail
 
@@ -26,8 +29,14 @@ STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/granary-client"
 URL_FILE="$STATE_DIR/url"
 TOKEN_FILE="$STATE_DIR/token"
 CARGO_DIR="${CARGO_HOME:-$HOME/.cargo}"
-TOOLS="${TOOLS:-npm pip cargo}"
+M2_DIR="$HOME/.m2"
+GRADLE_DIR="${GRADLE_USER_HOME:-$HOME/.gradle}"
+GRADLE_INIT="$GRADLE_DIR/init.d/granary.gradle"
+GRADLE_MARK="// Managed by granary-client; 'make use-public' and 'make remove' delete it."
+TOOLS="${TOOLS:-npm pip cargo maven}"
 PIP=(python3 -m pip)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+M2_SETTINGS=(python3 "$SCRIPT_DIR/m2-settings.py")
 
 REG_BEGIN="# >>> granary registry (managed by granary-client) >>>"
 REG_END="# <<< granary registry <<<"
@@ -331,6 +340,121 @@ cargo_status() {
   fi
 }
 
+# ------------------------------------------------------------ maven, gradle
+
+# Maven counts as present when mvn is installed or ~/.m2 exists (projects
+# often use ./mvnw); likewise Gradle with ~/.gradle and ./gradlew.
+maven_present() { has mvn || [ -d "$M2_DIR" ]; }
+gradle_present() { has gradle || [ -d "$GRADLE_DIR" ]; }
+
+m2_settings() {
+  has python3 || die "python3 is needed to edit $M2_DIR/settings.xml"
+  "${M2_SETTINGS[@]}" "$@"
+}
+
+maven_use_granary() {
+  if maven_present; then
+    local file="$M2_DIR/settings.xml"
+    mkdir -p "$M2_DIR"
+    backup "$file"
+    GRANARY_TOKEN="$TOKEN" m2_settings use "$file" "$URL/maven"
+    chmod 600 "$file"
+    ok "maven -> $URL/maven"
+  else
+    info "maven: not installed, skipped"
+  fi
+  if gradle_present; then
+    gradle_write_init
+    ok "gradle -> $URL/maven"
+  else
+    info "gradle: not installed, skipped"
+  fi
+}
+
+# An init script that sends every mavenCentral() repository to Granary. The
+# web UI shows the same script under Repositories, Maven, Client setup.
+gradle_write_init() {
+  local insecure=""
+  case "$URL" in http://*) insecure="
+            repo.allowInsecureProtocol = true" ;; esac
+  mkdir -p "$GRADLE_DIR/init.d"
+  backup "$GRADLE_INIT"
+  local tmp="$GRADLE_INIT.granary-tmp"
+  (
+    umask 077
+    cat >"$tmp" <<GRADLE
+$GRADLE_MARK
+def granary = { RepositoryHandler repos ->
+    repos.configureEach { repo ->
+        if (repo instanceof MavenArtifactRepository && repo.url.toString().startsWith('https://repo.maven.apache.org/maven2')) {
+            repo.url = '$URL/maven'$insecure
+            repo.credentials {
+                username = 'token'
+                password = '$TOKEN'
+            }
+        }
+    }
+}
+beforeSettings { settings ->
+    granary(settings.pluginManagement.repositories)
+    granary(settings.dependencyResolutionManagement.repositories)
+}
+allprojects {
+    granary(buildscript.repositories)
+    granary(repositories)
+}
+GRADLE
+  )
+  mv "$tmp" "$GRADLE_INIT"
+}
+
+gradle_managed() {
+  [ -f "$GRADLE_INIT" ] && [ "$(head -n 1 "$GRADLE_INIT")" = "$GRADLE_MARK" ]
+}
+
+# Only delete the init script if granary-client wrote it.
+gradle_remove_init() {
+  [ -f "$GRADLE_INIT" ] || return 0
+  if gradle_managed; then
+    rm -f "$GRADLE_INIT"
+  else
+    warn "$GRADLE_INIT was not written by granary-client; left as it is"
+  fi
+}
+
+maven_use_public() {
+  # Keep the <server> (and its token) so switching back needs nothing.
+  if [ -f "$M2_DIR/settings.xml" ]; then m2_settings public "$M2_DIR/settings.xml"; fi
+  if maven_present; then ok "maven -> https://repo.maven.apache.org/maven2/ (default)"; fi
+  gradle_remove_init
+  if gradle_present; then ok "gradle -> https://repo.maven.apache.org/maven2/ (default)"; fi
+}
+
+maven_remove() {
+  if [ -f "$M2_DIR/settings.xml" ]; then m2_settings remove "$M2_DIR/settings.xml"; fi
+  gradle_remove_init
+  ok "maven, gradle: Granary mirror, server and token removed"
+}
+
+maven_status() {
+  if ! maven_present; then
+    info "maven  not installed"
+  elif has python3; then
+    info "maven  $(m2_settings status "$M2_DIR/settings.xml")"
+  else
+    info "maven  unknown (python3 is needed to read settings.xml)"
+  fi
+  if ! gradle_present; then
+    info "gradle not installed"
+  elif gradle_managed; then
+    local url
+    url="$(sed -n "s/^ *repo\.url = '\(.*\)'.*$/\1/p" "$GRADLE_INIT" | head -n 1)"
+    info "gradle ${url:-Granary} (init.d/granary.gradle)"
+  else
+    info "gradle https://repo.maven.apache.org/maven2/ (default)"
+  fi
+}
+
 # -------------------------------------------------------------- commands
 
 cmd_use_granary() {
@@ -400,7 +524,7 @@ cmd_status() {
 }
 
 for t in $TOOLS; do
-  case "$t" in npm | pip | cargo) ;; *) die "unknown tool in TOOLS: $t (use npm, pip, cargo)" ;; esac
+  case "$t" in npm | pip | cargo | maven) ;; *) die "unknown tool in TOOLS: $t (use npm, pip, cargo, maven)" ;; esac
 done
 
 case "${1:-}" in

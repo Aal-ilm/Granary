@@ -447,6 +447,11 @@ pub async fn check_upstreams(st: &AppState) -> Vec<UpstreamHealth> {
             reqwest::Method::HEAD,
             format!("{}/pip/", cfg.pypi_index),
         ),
+        (
+            "maven",
+            reqwest::Method::HEAD,
+            format!("{}/", cfg.maven_upstream),
+        ),
     ];
     let client = st.store.passthrough_client();
     let checks = targets.into_iter().map(|(repo, method, url)| async move {

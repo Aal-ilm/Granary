@@ -1,8 +1,8 @@
 # Granary
 
-A small, self-hostable caching proxy for package registries. Point Cargo, npm
-and pip at Granary, and every package is downloaded from the public registry
-once, then served from your own disk after that.
+A small, self-hostable caching proxy for package registries. Point Cargo, npm,
+pip, Maven and Gradle at Granary, and every package is downloaded from the
+public registry once, then served from your own disk after that.
 
 - **Free and open source** (MIT or Apache-2.0), with no usage caps, no license
   keys and no telemetry. The only outbound connections Granary makes are to
@@ -14,13 +14,13 @@ once, then served from your own disk after that.
   don't break.
 - **Safe by design.** Granary checks every download against the
   registry's own checksum (Cargo's `cksum`, npm's `integrity`, PyPI's
-  `sha256`) before caching it, so a corrupted or tampered response is never
+  `sha256`, Maven Central's `.sha1`) before caching it, so a corrupted or tampered response is never
   stored or served. Clients check again on their side.
 - **Web UI built in.** Browse and search what's cached, delete packages, set
   cleanup rules, watch tasks, check upstream health and read logs. It's served
   by the same binary and never loads anything from the internet.
 - **Accounts built in.** Sign-in with admin and viewer roles, two-factor
-  codes, and per-machine access tokens for Cargo, npm and pip. Built on the
+  codes, and per-machine access tokens for Cargo, npm, pip, Maven and Gradle. Built on the
   open-source axum-login, tower-sessions, password-auth (Argon2id) and
   totp-rs libraries, stored in a local SQLite file. No external identity
   service is needed.
@@ -32,6 +32,7 @@ once, then served from your own disk after that.
 | Cargo (crates.io, sparse protocol) | ✅ proxy | `/cargo/` |
 | npm (registry.npmjs.org) | ✅ proxy | `/npm/` |
 | PyPI (Simple API, PEP 503/691) | ✅ proxy | `/pypi/simple/` |
+| Maven Central (Maven 2 layout, for Maven and Gradle) | ✅ proxy | `/maven` |
 | Docker / OCI | planned | |
 | Debian (apt) | planned | |
 | Publishing your own packages | planned | |
@@ -98,8 +99,77 @@ registry=http://HOST/npm/
 index-url = http://__token__:TOKEN@HOST/pypi/simple/
 ```
 
+**Maven** (`~/.m2/settings.xml`, inside `<settings>`). Maven only sends the
+`<server>` credentials after Granary answers 401, which it does when a token
+is required. The username can be anything; the password is the token.
+
+```xml
+<mirrors>
+  <mirror>
+    <id>granary</id>
+    <mirrorOf>central</mirrorOf>
+    <url>http://HOST/maven</url>
+  </mirror>
+</mirrors>
+<servers>
+  <server>
+    <id>granary</id>
+    <username>token</username>
+    <password>TOKEN</password>
+  </server>
+</servers>
+```
+
+**Gradle** (`~/.gradle/init.d/granary.gradle`). This init script sends every
+`mavenCentral()` repository to Granary, including plugin management and
+`dependencyResolutionManagement` in settings files. Leave out
+`allowInsecureProtocol` when Granary is served over HTTPS.
+
+```groovy
+def granary = { RepositoryHandler repos ->
+    repos.configureEach { repo ->
+        if (repo instanceof MavenArtifactRepository && repo.url.toString().startsWith('https://repo.maven.apache.org/maven2')) {
+            repo.url = 'http://HOST/maven'
+            repo.allowInsecureProtocol = true
+            repo.credentials {
+                username = 'token'
+                password = 'TOKEN'
+            }
+        }
+    }
+}
+beforeSettings { settings ->
+    granary(settings.pluginManagement.repositories)
+    granary(settings.dependencyResolutionManagement.repositories)
+}
+allprojects {
+    granary(buildscript.repositories)
+    granary(repositories)
+}
+```
+
+Maven Central has no snapshots, so any `-SNAPSHOT` path gets a 404 straight
+away. Keep snapshot repositories out of the `central` mirror.
+
 To let anyone on your network download without a token, set
 `GRANARY_CLIENT_AUTH=off`; the configuration then needs only the URLs.
+
+### Setting up a machine with make
+
+`make use-granary GRANARY_URL=http://HOST` asks for a token once and points
+npm, pip, Cargo, Maven and Gradle at Granary. `make use-public` switches them
+back to the public registries (for example while Granary is down), `make
+status` shows where each one points and `make remove` undoes everything.
+Every file is backed up before its first change. Choose tools with `TOOLS`,
+for example `make use-granary TOOLS=maven`; `maven` covers both Maven and
+Gradle.
+
+For Maven the script adds the `<mirror>` and `<server>` above inside marked
+comment blocks in `~/.m2/settings.xml` (creating the file if needed), using
+`scripts/m2-settings.py`, which edits the XML rather than raw lines and needs
+`python3`. It refuses to run if you already have your own mirror for Central.
+For Gradle it writes `~/.gradle/init.d/granary.gradle`; `use-public` and
+`remove` delete it again.
 
 ## Web UI
 
@@ -215,6 +285,7 @@ All settings are environment variables.
 | `GRANARY_NPM_UPSTREAM` | `https://registry.npmjs.org` | Upstream npm registry |
 | `GRANARY_PYPI_INDEX` | `https://pypi.org/simple` | Upstream Simple API |
 | `GRANARY_PYPI_FILES` | `https://files.pythonhosted.org` | Host that PyPI file links point to |
+| `GRANARY_MAVEN_UPSTREAM` | `https://repo1.maven.org/maven2` | Upstream Maven repository (Maven 2 layout) |
 | `RUST_LOG` | `granary=info` | Log level (`granary=debug` logs every cache hit) |
 
 Granary honors the standard `HTTPS_PROXY` / `NO_PROXY` variables for its own
@@ -224,14 +295,22 @@ outbound requests, and reads extra trusted CAs from `SSL_CERT_FILE`.
 
 Every format comes down to two kinds of data:
 
-- **Files** (`.crate` archives, npm tarballs, wheels and sdists) never change
-  once published. Granary downloads each one once, streams it to disk, and
+- **Files** (`.crate` archives, npm tarballs, wheels and sdists, Maven jars,
+  POMs, Gradle `.module` files, signatures and checksums) never change once
+  published. Granary downloads each one once, streams it to disk, and
   serves it forever with `Cache-Control: immutable`.
-- **Metadata** (Cargo index entries, npm packuments, PyPI project pages) lists
+- **Metadata** (Cargo index entries, npm packuments, PyPI project pages,
+  Maven `maven-metadata.xml` and its checksums) lists
   the available versions and changes as new ones are published. It is cached
   for `GRANARY_META_TTL_SECS`, then revalidated with `If-None-Match` /
   `If-Modified-Since`. Download links inside it are rewritten to point back at
   Granary.
+
+For Maven, Granary fetches the `.sha1` that Central publishes next to each
+`.jar` and `.pom` and checks the download against it before caching; a
+mismatch is logged, nothing is cached and the client gets a 502. Maven and
+Gradle probe for many files that don't exist, so a 404 from upstream is
+remembered for five minutes.
 
 Concurrent requests for the same uncached item are coalesced into a single
 upstream download. Downloads are written to a temporary file and renamed into
@@ -241,8 +320,8 @@ place, so a crash never leaves a half-written package in the cache.
 
 ```text
 /data
-├── files/{cargo,npm,pypi}/…   immutable package files
-├── meta/{cargo,npm,pypi}/…    cached metadata (*.body + *.json info)
+├── files/{cargo,npm,pypi,maven}/…   immutable package files
+├── meta/{cargo,npm,pypi,maven}/…    cached metadata (*.body + *.json info)
 ├── state/                     users, tokens, sessions and audit log (granary.db),
 │                              cleanup settings, last-download times
 └── tmp/                       in-progress downloads (cleared at startup)
@@ -257,7 +336,7 @@ cached.
 ## Current limitations
 
 - **Read-only.** There is no `cargo publish` / `npm publish` / `twine upload`
-  yet; npm write requests are refused.
+  / `mvn deploy` yet; npm and Maven write requests are refused.
 - **No single sign-on yet.** Accounts live in Granary itself; LDAP and OpenID
   Connect aren't supported. Granary serves plain HTTP, so put it behind a
   reverse proxy with TLS if it's reachable from untrusted networks.
@@ -274,7 +353,7 @@ cached.
 ## Development
 
 ```sh
-cargo test           # unit tests
+cargo test           # unit tests, plus end-to-end tests against a mock upstream
 cargo clippy         # lints
 RUST_LOG=granary=debug cargo run
 ```

@@ -11,6 +11,8 @@ mod logbuf;
 mod metrics;
 mod net;
 mod store;
+#[cfg(test)]
+mod tests;
 mod ui;
 mod util;
 
@@ -46,6 +48,7 @@ pub fn app(state: AppState, sessions: SqliteSessionStore) -> Router {
         .merge(formats::cargo::router())
         .merge(formats::npm::router())
         .merge(formats::pypi::router())
+        .merge(formats::maven::router())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::client_guard,

@@ -45,6 +45,7 @@
   --cargo: #b7410e;
   --npm: #c12127;
   --pypi: #2f6da8;
+  --maven: #7a3fa8;
   --sans: ui-sans-serif, -apple-system, "Segoe UI Variable Text", "Segoe UI", system-ui,
     Roboto, "Helvetica Neue", Arial, sans-serif;
   --display: "Saira Condensed", "Arial Narrow", var(--sans);
@@ -85,6 +86,7 @@
     --cargo: #e3794a;
     --npm: #f0646a;
     --pypi: #7fb0e0;
+    --maven: #b88ae0;
     color-scheme: dark;
   }
 }
@@ -121,6 +123,7 @@
   --cargo: #e3794a;
   --npm: #f0646a;
   --pypi: #7fb0e0;
+  --maven: #b88ae0;
   color-scheme: dark;
 }
 
@@ -512,6 +515,7 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--primary)
 .fmt.cargo, .silo-col.cargo { --fmt-color: var(--cargo); }
 .fmt.npm, .silo-col.npm { --fmt-color: var(--npm); }
 .fmt.pypi, .silo-col.pypi { --fmt-color: var(--pypi); }
+.fmt.maven, .silo-col.maven { --fmt-color: var(--maven); }
 
 /* Sensor lights: green online, gold busy or warning, red fault, gray idle. */
 .dot {
@@ -827,6 +831,26 @@ details.setup summary:hover { text-decoration: underline; }
 .page-head h1.title-mono { font: 700 22px/1.25 var(--mono); }
 .summary-line { display: flex; gap: 8px 18px; flex-wrap: wrap; align-items: center; color: var(--muted); margin-top: 8px; }
 .summary-line b { color: var(--ink); font-weight: 700; }
+
+/* Maven browse: a plate row per group, its artifacts indented under it. */
+tr.group-row th {
+  background: var(--surface-2);
+  border-left: 3px solid var(--maven);
+  text-align: left;
+  padding-top: 7px;
+  padding-bottom: 7px;
+}
+tr.group-row:not(:first-child) th { border-top: 1px solid var(--line); }
+.group-filter {
+  all: unset;
+  cursor: pointer;
+  font: 600 12.5px/1.4 var(--mono);
+  color: var(--muted);
+}
+.group-filter:hover { color: var(--ink); text-decoration: underline; }
+.group-filter:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+tr.in-group > td:first-child { padding-left: 26px; }
+.setup-label { font: 600 13px/1.4 var(--sans); color: var(--muted); margin: 14px 0 0; }
 
 tr.files td { background: var(--surface-2); padding: 0; }
 tr.files table td { background: transparent; border-bottom: 1px solid var(--line); }
