@@ -42,6 +42,9 @@ pub struct Config {
     pub audit_days: u32,
     /// Never contact an upstream: serve only what is cached.
     pub offline: bool,
+    /// Byte budget for the cache (files plus metadata). Shown on the
+    /// Overview gauges; warm jobs stop before going past it.
+    pub cache_limit: Option<u64>,
 }
 
 /// An IP network such as `10.0.0.0/8` or `fd00::/8` (a bare address is a /32 or /128).
@@ -100,6 +103,27 @@ fn var(key: &str, default: &str) -> String {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+/// A size such as `20GB`, `1.5 TB`, `500MiB` or a plain number of bytes.
+/// KB, MB, GB and TB are powers of 1024, as the web UI shows sizes.
+pub fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let split = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let num: f64 = num.parse().ok()?;
+    let shift = match unit.trim().to_ascii_uppercase().as_str() {
+        "" | "B" => 0,
+        "K" | "KB" | "KIB" => 10,
+        "M" | "MB" | "MIB" => 20,
+        "G" | "GB" | "GIB" => 30,
+        "T" | "TB" | "TIB" => 40,
+        _ => return None,
+    };
+    let bytes = num * (1u64 << shift) as f64;
+    (bytes.is_finite() && bytes >= 1.0 && bytes < u64::MAX as f64).then_some(bytes as u64)
 }
 
 fn bool_var(key: &str, default: bool) -> anyhow::Result<bool> {
@@ -172,6 +196,12 @@ impl Config {
             ),
             trusted_proxies: parse_proxies(&var("GRANARY_TRUSTED_PROXIES", ""))?,
             offline: bool_var("GRANARY_OFFLINE", false)?,
+            cache_limit: match var("GRANARY_CACHE_LIMIT", "").as_str() {
+                "" => None,
+                s => Some(parse_size(s).with_context(|| {
+                    format!("GRANARY_CACHE_LIMIT: {s:?} is not a size like 500MB, 20GB or 1.5TB")
+                })?),
+            },
             audit_days: var("GRANARY_AUDIT_DAYS", "365")
                 .parse::<u32>()
                 .context("GRANARY_AUDIT_DAYS must be a whole number of days")?
@@ -183,6 +213,19 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes() {
+        assert_eq!(parse_size("20GB"), Some(20 << 30));
+        assert_eq!(parse_size("20 gib"), Some(20 << 30));
+        assert_eq!(parse_size("1.5TB"), Some(3 << 39));
+        assert_eq!(parse_size("500M"), Some(500 << 20));
+        assert_eq!(parse_size("4096"), Some(4096));
+        assert_eq!(parse_size("0"), None);
+        assert_eq!(parse_size("20 bananas"), None);
+        assert_eq!(parse_size("GB"), None);
+        assert_eq!(parse_size("-5GB"), None);
+    }
 
     #[test]
     fn ip_networks() {

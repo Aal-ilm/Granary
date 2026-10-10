@@ -1,6 +1,7 @@
 //! End-to-end tests: the whole app, with a mock upstream registry on
 //! localhost and a throwaway data directory.
 
+mod cache_limit;
 mod maven;
 mod offline;
 
@@ -109,6 +110,7 @@ pub struct Opts {
     pub client_auth: bool,
     pub meta_ttl: Duration,
     pub offline: bool,
+    pub cache_limit: Option<u64>,
 }
 
 impl Default for Opts {
@@ -117,6 +119,7 @@ impl Default for Opts {
             client_auth: false,
             meta_ttl: Duration::from_secs(300),
             offline: false,
+            cache_limit: None,
         }
     }
 }
@@ -140,6 +143,7 @@ impl Harness {
             client_auth,
             meta_ttl,
             offline,
+            cache_limit,
         } = opts;
         let mock = Mock::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -175,6 +179,7 @@ impl Harness {
             trusted_proxies: Vec::new(),
             audit_days: 365,
             offline,
+            cache_limit,
         };
         let store = Store::new(data.clone(), meta_ttl, offline).await.unwrap();
         let admin = Admin::new(&data, LogBuffer::default()).await.unwrap();
@@ -226,6 +231,71 @@ impl Harness {
             .unwrap()
             .to_vec();
         (status, headers, body)
+    }
+
+    /// Send a request as the web UI does: with a session cookie, the CSRF
+    /// header, and an optional JSON body.
+    pub async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        cookie: Option<&str>,
+        json: Option<serde_json::Value>,
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("x-granary-request", "1");
+        if let Some(c) = cookie {
+            req = req.header(header::COOKIE, c);
+        }
+        let body = match json {
+            Some(v) => {
+                req = req.header(header::CONTENT_TYPE, "application/json");
+                Body::from(v.to_string())
+            }
+            None => Body::empty(),
+        };
+        let resp = self
+            .app
+            .clone()
+            .oneshot(req.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, headers, body)
+    }
+
+    /// Sign in as the admin and return the session cookie.
+    pub async fn login(&self) -> String {
+        let (status, headers, body) = self
+            .send(
+                "POST",
+                "/api/auth/login",
+                None,
+                Some(serde_json::json!({"username": "admin", "password": "a long test password"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let set = headers[header::SET_COOKIE].to_str().unwrap();
+        set.split(';').next().unwrap().to_string()
+    }
+
+    /// GET a JSON API route as the signed-in admin.
+    pub async fn api(&self, cookie: &str, path: &str) -> serde_json::Value {
+        let (status, _, body) = self.send("GET", path, Some(cookie), None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{path}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        serde_json::from_slice(&body).unwrap()
     }
 
     pub async fn get(&self, path: &str) -> (StatusCode, HeaderMap, Vec<u8>) {

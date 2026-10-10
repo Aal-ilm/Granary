@@ -701,6 +701,7 @@ td.actions > * + * { margin-left: 6px; }
   border-top: 3px solid var(--gold);
   transition: height 1100ms cubic-bezier(0.2, 0.7, 0.2, 1);
 }
+.silo-scale { margin: 0; padding: 0 22px 12px; font-size: 12.5px; color: var(--muted); text-align: center; }
 .silo-label { text-align: center; line-height: 1.35; margin-top: 12px; }
 .silo-label .fmt { justify-content: center; }
 .silo-size {

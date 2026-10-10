@@ -109,6 +109,7 @@ mod tests {
             trusted_proxies: Vec::new(),
             audit_days: 365,
             offline: false,
+            cache_limit: None,
         }
     }
 }

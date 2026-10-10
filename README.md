@@ -273,6 +273,7 @@ All settings are environment variables.
 | `GRANARY_DATA_DIR` | `/data` in Docker, `./data` otherwise | Where the cache lives |
 | `GRANARY_PUBLIC_URL` | *(from request headers)* | Fixed external URL, e.g. `https://granary.lan`. Set it when clients reach Granary through a reverse proxy that doesn't send `X-Forwarded-Host` / `X-Forwarded-Proto` |
 | `GRANARY_META_TTL_SECS` | `300` | How long index/metadata responses are fresh before revalidation |
+| `GRANARY_CACHE_LIMIT` | *(none)* | Cache budget such as `500MB`, `20GB` or `1.5TB` (KB, MB, GB and TB are powers of 1024). The Overview gauges fill against it, or against the disk size when unset. It is a budget, not a hard cap: client downloads are never refused because of it |
 | `GRANARY_OFFLINE` | `off` | `on`: never contact an upstream registry; serve only what is cached (see [Offline mode](#offline-mode)) |
 | `GRANARY_CLIENT_AUTH` | `required` | `required`: package downloads need an access token or a signed-in session. `off`: anyone who can reach Granary can download |
 | `GRANARY_ADMIN_USER` | `admin` | Username of the first admin, created when there are no users |

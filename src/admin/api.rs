@@ -112,9 +112,12 @@ async fn overview(State(st): State<AppState>) -> Json<Value> {
     };
     let health = st.admin.health.lock().unwrap().clone();
 
+    let cache_used: u64 = repos.iter().map(|r| r.size + r.meta_size).sum();
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": now_secs().saturating_sub(st.admin.started_at),
+        "cache_limit": st.cfg.cache_limit,
+        "cache_used": cache_used,
         "repos": repos,
         "stats": {
             "file_hits": n(&s.file_hits),
@@ -697,6 +700,7 @@ async fn system(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
             {"key": "GRANARY_LISTEN", "label": "Listen address", "value": cfg.listen},
             {"key": "GRANARY_PUBLIC_URL", "label": "Public URL", "value": cfg.public_url.clone().unwrap_or_else(|| format!("{} (from request)", base_url(cfg, &headers)))},
             {"key": "GRANARY_DATA_DIR", "label": "Data directory", "value": data_dir.display().to_string()},
+            {"key": "GRANARY_CACHE_LIMIT", "label": "Cache budget", "value": cfg.cache_limit.map_or_else(|| "None (the whole disk)".to_string(), super::human_bytes)},
             {"key": "GRANARY_META_TTL_SECS", "label": "Metadata freshness", "value": format!("{} seconds", cfg.meta_ttl.as_secs())},
             {"key": "GRANARY_OFFLINE", "label": "Offline mode", "value": if cfg.offline { "On: only cached packages are served, upstreams are never contacted" } else { "Off" }},
             {"key": "GRANARY_CLIENT_AUTH", "label": "Package downloads", "value": if cfg.client_auth { "Need an access token" } else { "Open to anyone who can reach Granary" }},

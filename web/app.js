@@ -432,12 +432,20 @@ async function renderOverview({ isCurrent }) {
   const usedPct = disk && disk.total ? (used / disk.total) * 100 : 0;
   const health = Object.fromEntries((d.health || []).map((h) => [h.repo, h]));
 
+  // Gauges fill against the cache budget, or the whole disk without one.
+  const limit = d.cache_limit || null;
+  const capacity = limit || (disk ? disk.total : 0);
+  const against = limit ? 'cache budget' : 'disk';
+  const budgetPct = limit ? (d.cache_used / limit) * 100 : 0;
   const silos = d.repos
     .map((r) => {
       const share = total ? (r.size / total) * 100 : 0;
-      const fill = r.size ? Math.max(4, share) : 0;
+      const level = capacity ? (r.size / capacity) * 100 : share;
+      // Anything cached shows a visible level, clear of the empty mark.
+      const fill = r.size ? Math.min(100, Math.max(4, level)) : 0;
+      const levelText = capacity ? `, ${level < 1 && r.size ? 'under 1' : Math.round(level)}% of the ${against}` : '';
       return `
-      <a class="silo-col ${esc(r.repo)}" href="#/browse/${esc(r.repo)}" aria-label="${esc(REPOS[r.repo].label)}: ${esc(bytes(r.size))}, ${esc(plural(r.packages, 'package'))}">
+      <a class="silo-col ${esc(r.repo)}" href="#/browse/${esc(r.repo)}" aria-label="${esc(REPOS[r.repo].label)}: ${esc(bytes(r.size))}, ${esc(plural(r.packages, 'package'))}${esc(levelText)}" title="${esc(bytes(r.size))}${esc(levelText)}">
         <div class="silo"><div class="grain" data-fill="${fill.toFixed(1)}"></div></div>
         <div class="silo-label">
           ${chip(r.repo)}
@@ -480,12 +488,15 @@ async function renderOverview({ isCurrent }) {
     <section class="granary">
       <div class="panel">
         <div class="silos">${silos}</div>
+        ${capacity ? `<p class="silo-scale">Gauges are full at the ${esc(bytes(capacity))} ${esc(against)}${limit ? '' : ' (no <code>GRANARY_CACHE_LIMIT</code> set)'}.</p>` : ''}
         <div class="upstreams">${upstreams}</div>
       </div>
       <dl class="panel facts">
         <div class="fact"><dt>Served from cache</dt><dd class="num">${hitRate == null ? '-' : hitRate + '%'}<small>${esc(count(hits))} of ${esc(count(served))} file requests since start</small></dd></div>
         <div class="fact"><dt>Fetched from upstream</dt><dd class="num">${esc(count(d.stats.file_downloads))}<small>new files since start</small></dd></div>
         <div class="fact"><dt>Metadata refreshes</dt><dd class="num">${esc(count(d.stats.meta_refreshes))}<small>${d.stats.meta_stale_served ? esc(count(d.stats.meta_stale_served)) + ' served stale while upstream was down' : 'none served stale'}</small></dd></div>
+        ${limit ? `<div class="fact"><dt>Cache budget</dt><dd class="num">${esc(bytes(d.cache_used))}<small>of ${esc(bytes(limit))} used, files and metadata</small>
+          <div class="meter ${budgetPct > 95 ? 'full' : budgetPct > 85 ? 'high' : ''}" role="img" aria-label="${Math.round(budgetPct)}% of the cache budget used"><span data-pct="${Math.min(100, budgetPct).toFixed(1)}"></span></div></dd></div>` : ''}
         <div class="fact"><dt>Disk</dt><dd class="num">${disk ? esc(bytes(disk.free)) + ' free' : '-'}<small>${disk ? 'of ' + esc(bytes(disk.total)) : 'unknown'}</small>
           ${disk ? `<div class="meter ${usedPct > 95 ? 'full' : usedPct > 85 ? 'high' : ''}" role="img" aria-label="${Math.round(usedPct)}% of disk used"><span data-pct="${usedPct.toFixed(1)}"></span></div>` : ''}</dd></div>
         <div class="fact"><dt>Running for</dt><dd>${esc(duration(d.uptime_secs))}<small>version ${esc(d.version)}</small></dd></div>
