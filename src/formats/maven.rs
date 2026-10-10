@@ -183,8 +183,10 @@ async fn handle(State(st): State<AppState>, method: Method, uri: Uri) -> AppResu
         Kind::Metadata => metadata(&st, &rel).await,
         Kind::Release { verify } => release(&st, &rel, verify).await,
     };
+    // Only upstream's own 404s are remembered; an offline miss isn't one.
     if let Err(e) = &result
         && e.status == StatusCode::NOT_FOUND
+        && !st.store.offline()
     {
         st.store.remember_missing(&missing_key, NEGATIVE_TTL);
     }
@@ -200,7 +202,9 @@ async fn metadata(st: &AppState, rel: &str) -> AppResult<Response> {
 async fn release(st: &AppState, rel: &str, verify: bool) -> AppResult<Response> {
     let url = format!("{}/{rel}", st.cfg.maven_upstream);
     let ct = content_type(rel);
-    if !verify || st.store.has_file("maven", rel).await {
+    // Offline, there's no checksum to fetch; the store serves the file if it
+    // is cached and otherwise says it is offline.
+    if !verify || st.store.offline() || st.store.has_file("maven", rel).await {
         return st.store.file("maven", rel, &url, ct, None).await;
     }
 

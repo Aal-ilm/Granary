@@ -26,6 +26,17 @@ impl AppError {
         Self::new(StatusCode::BAD_REQUEST, message)
     }
 
+    /// Something isn't cached and offline mode forbids fetching it. A 404,
+    /// so package managers treat it like any other missing file.
+    pub fn offline(what: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            format!(
+                "{what} is not cached, and Granary is in offline mode (GRANARY_OFFLINE), so it was not fetched from upstream"
+            ),
+        )
+    }
+
     pub fn bad_gateway(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_GATEWAY, message)
     }

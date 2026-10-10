@@ -13,6 +13,11 @@
 //! upstream fetch happens and the others wait for its result. Downloads run
 //! as their own task, so a client that disconnects doesn't abort them.
 //!
+//! In offline mode (`GRANARY_OFFLINE`) the store never contacts an upstream:
+//! cached files are served, cached metadata is served however old it is, and
+//! anything else is a 404 that says Granary is offline. A 404 (not a 503)
+//! lets Maven, pip and npm carry on as they do for any missing file.
+//!
 //! When the format knows the registry's checksum for a file (Cargo's
 //! `cksum`, npm's `integrity`, PyPI's `sha256`, Maven's `.sha1`), the download is verified
 //! before it enters the cache, so a corrupted or tampered response from
@@ -137,6 +142,7 @@ pub struct Store {
     meta_client: reqwest::Client,
     file_client: reqwest::Client,
     meta_ttl: Duration,
+    offline: bool,
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     tmp_counter: AtomicU64,
     pub stats: Stats,
@@ -172,7 +178,7 @@ pub fn now_secs() -> u64 {
 }
 
 impl Store {
-    pub async fn new(root: PathBuf, meta_ttl: Duration) -> anyhow::Result<Self> {
+    pub async fn new(root: PathBuf, meta_ttl: Duration, offline: bool) -> anyhow::Result<Self> {
         tokio::fs::create_dir_all(root.join("tmp")).await?;
         // Leftover partial downloads from a crash are useless; clear them.
         let mut rd = tokio::fs::read_dir(root.join("tmp")).await?;
@@ -205,6 +211,7 @@ impl Store {
             meta_client,
             file_client,
             meta_ttl,
+            offline,
             locks: Mutex::new(HashMap::new()),
             tmp_counter: AtomicU64::new(0),
             stats: Stats::default(),
@@ -216,6 +223,11 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Whether upstream registries are off limits (`GRANARY_OFFLINE`).
+    pub fn offline(&self) -> bool {
+        self.offline
     }
 
     /// Client for uncached pass-through requests.
@@ -337,6 +349,10 @@ impl Store {
             return serve_file(&path, content_type).await;
         }
 
+        if self.offline {
+            return Err(AppError::offline(rel));
+        }
+
         // Download in a separate task: it finishes (and cleans up after
         // itself) even if this client disconnects, and later requests for
         // the same file then find it cached.
@@ -373,6 +389,9 @@ impl Store {
     /// Fetch a small upstream file (such as a checksum) without caching it.
     /// Returns `None` when upstream has no such file.
     pub async fn fetch_small(&self, url: &str, max: usize) -> AppResult<Option<Bytes>> {
+        if self.offline {
+            return Err(AppError::offline(url));
+        }
         let resp = self.file_client.get(url).send().await?;
         match resp.status() {
             s if s.is_success() => {}
@@ -497,6 +516,22 @@ impl Store {
         if let Some(m) = self.read_meta_if_fresh(&body_path, &info_path).await {
             self.stats.meta_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(m);
+        }
+        if self.offline {
+            // Offline: any cached copy is good enough, however old.
+            return match (
+                self.read_info(&info_path).await,
+                tokio::fs::read(&body_path).await,
+            ) {
+                (Some(info), Ok(body)) => {
+                    self.stats.meta_hits.fetch_add(1, Ordering::Relaxed);
+                    Ok(Meta {
+                        body: body.into(),
+                        content_type: info.content_type,
+                    })
+                }
+                _ => Err(AppError::offline(rel)),
+            };
         }
 
         let key = format!("meta:{ns}:{rel}:{variant}");

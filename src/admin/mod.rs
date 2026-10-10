@@ -142,6 +142,8 @@ pub struct UpstreamHealth {
     pub latency_ms: u64,
     pub error: Option<String>,
     pub checked_at: u64,
+    /// Not contacted because offline mode is on.
+    pub offline: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -453,6 +455,24 @@ pub async fn check_upstreams(st: &AppState) -> Vec<UpstreamHealth> {
             format!("{}/", cfg.maven_upstream),
         ),
     ];
+    if st.store.offline() {
+        // Offline mode: report each upstream as deliberately not contacted.
+        let results: Vec<UpstreamHealth> = targets
+            .into_iter()
+            .map(|(repo, _, url)| UpstreamHealth {
+                repo,
+                url,
+                ok: false,
+                status: None,
+                latency_ms: 0,
+                error: Some("offline mode".into()),
+                checked_at: now_secs(),
+                offline: true,
+            })
+            .collect();
+        *st.admin.health.lock().unwrap() = results.clone();
+        return results;
+    }
     let client = st.store.passthrough_client();
     let checks = targets.into_iter().map(|(repo, method, url)| async move {
         let start = Instant::now();
@@ -471,6 +491,7 @@ pub async fn check_upstreams(st: &AppState) -> Vec<UpstreamHealth> {
                 error: None,
                 checked_at: now_secs(),
                 url,
+                offline: false,
             },
             Err(e) => UpstreamHealth {
                 repo,
@@ -480,6 +501,7 @@ pub async fn check_upstreams(st: &AppState) -> Vec<UpstreamHealth> {
                 error: Some(short_error(&e)),
                 checked_at: now_secs(),
                 url,
+                offline: false,
             },
         }
     });
@@ -540,6 +562,10 @@ async fn run_task_with(st: &AppState, id: &str, sessions: Option<&SqliteSessionS
             let _ = st.admin.save_settings().await;
             (true, msg)
         }
+        "health" if st.store.offline() => {
+            check_upstreams(st).await;
+            (true, "offline mode: upstreams not contacted".to_string())
+        }
         "health" => {
             let r = check_upstreams(st).await;
             let up = r.iter().filter(|h| h.ok).count();
@@ -584,6 +610,11 @@ async fn run_task_with(st: &AppState, id: &str, sessions: Option<&SqliteSessionS
 /// Background loop that runs due tasks.
 pub fn spawn_scheduler(st: AppState, sessions: SqliteSessionStore) {
     tokio::spawn(async move {
+        if st.store.offline() {
+            // No network involved: just records that upstreams are off limits,
+            // so the web UI shows offline mode straight away.
+            check_upstreams(&st).await;
+        }
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         loop {
             tick.tick().await;

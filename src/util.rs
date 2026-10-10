@@ -108,6 +108,7 @@ mod tests {
             session_idle: std::time::Duration::from_secs(3600),
             trusted_proxies: Vec::new(),
             audit_days: 365,
+            offline: false,
         }
     }
 }

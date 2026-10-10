@@ -698,6 +698,7 @@ async fn system(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
             {"key": "GRANARY_PUBLIC_URL", "label": "Public URL", "value": cfg.public_url.clone().unwrap_or_else(|| format!("{} (from request)", base_url(cfg, &headers)))},
             {"key": "GRANARY_DATA_DIR", "label": "Data directory", "value": data_dir.display().to_string()},
             {"key": "GRANARY_META_TTL_SECS", "label": "Metadata freshness", "value": format!("{} seconds", cfg.meta_ttl.as_secs())},
+            {"key": "GRANARY_OFFLINE", "label": "Offline mode", "value": if cfg.offline { "On: only cached packages are served, upstreams are never contacted" } else { "Off" }},
             {"key": "GRANARY_CLIENT_AUTH", "label": "Package downloads", "value": if cfg.client_auth { "Need an access token" } else { "Open to anyone who can reach Granary" }},
             {"key": "GRANARY_SESSION_HOURS", "label": "Sign out after inactivity", "value": format!("{} hours", cfg.session_idle.as_secs() / 3600)},
             {"key": "GRANARY_COOKIE_SECURE", "label": "HTTPS-only session cookie", "value": if cfg.cookie_secure { "Yes" } else { "No" }},

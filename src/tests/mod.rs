@@ -2,6 +2,7 @@
 //! localhost and a throwaway data directory.
 
 mod maven;
+mod offline;
 
 use std::{
     collections::HashMap,
@@ -103,12 +104,43 @@ pub struct Harness {
     pub token: String,
 }
 
+/// Settings for a test instance.
+pub struct Opts {
+    pub client_auth: bool,
+    pub meta_ttl: Duration,
+    pub offline: bool,
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Self {
+            client_auth: false,
+            meta_ttl: Duration::from_secs(300),
+            offline: false,
+        }
+    }
+}
+
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 impl Harness {
     /// Start a mock upstream and build Granary against it. Maven's upstream
     /// is `http://<mock>/maven2`.
     pub async fn new(client_auth: bool, meta_ttl: Duration) -> Self {
+        Self::with(Opts {
+            client_auth,
+            meta_ttl,
+            ..Opts::default()
+        })
+        .await
+    }
+
+    pub async fn with(opts: Opts) -> Self {
+        let Opts {
+            client_auth,
+            meta_ttl,
+            offline,
+        } = opts;
         let mock = Mock::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
@@ -142,8 +174,9 @@ impl Harness {
             session_idle: Duration::from_secs(3600),
             trusted_proxies: Vec::new(),
             audit_days: 365,
+            offline,
         };
-        let store = Store::new(data.clone(), meta_ttl).await.unwrap();
+        let store = Store::new(data.clone(), meta_ttl, offline).await.unwrap();
         let admin = Admin::new(&data, LogBuffer::default()).await.unwrap();
         let db = auth::open_db(&data).await.unwrap();
         auth::ensure_admin(&db, "admin", Some("a long test password"))

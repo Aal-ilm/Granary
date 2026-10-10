@@ -51,6 +51,12 @@ async fn handle(
                 "Granary only forwards npm audit, search and ping requests",
             ));
         }
+        if st.store.offline() {
+            return Err(AppError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Granary is in offline mode (GRANARY_OFFLINE), so npm audit, search and ping are unavailable",
+            ));
+        }
         return passthrough(&st, method, &headers, &rest, uri.query(), body).await;
     }
     if method != Method::GET && method != Method::HEAD {

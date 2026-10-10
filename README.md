@@ -273,6 +273,7 @@ All settings are environment variables.
 | `GRANARY_DATA_DIR` | `/data` in Docker, `./data` otherwise | Where the cache lives |
 | `GRANARY_PUBLIC_URL` | *(from request headers)* | Fixed external URL, e.g. `https://granary.lan`. Set it when clients reach Granary through a reverse proxy that doesn't send `X-Forwarded-Host` / `X-Forwarded-Proto` |
 | `GRANARY_META_TTL_SECS` | `300` | How long index/metadata responses are fresh before revalidation |
+| `GRANARY_OFFLINE` | `off` | `on`: never contact an upstream registry; serve only what is cached (see [Offline mode](#offline-mode)) |
 | `GRANARY_CLIENT_AUTH` | `required` | `required`: package downloads need an access token or a signed-in session. `off`: anyone who can reach Granary can download |
 | `GRANARY_ADMIN_USER` | `admin` | Username of the first admin, created when there are no users |
 | `GRANARY_ADMIN_PASSWORD` | *(generated)* | That admin's password (12+ characters). Only used on first start |
@@ -290,6 +291,22 @@ All settings are environment variables.
 
 Granary honors the standard `HTTPS_PROXY` / `NO_PROXY` variables for its own
 outbound requests, and reads extra trusted CAs from `SSL_CERT_FILE`.
+
+### Offline mode
+
+Set `GRANARY_OFFLINE=on` when Granary has no route to the internet, or must
+not use one. It then never contacts an upstream registry, for Cargo, npm,
+PyPI and Maven alike:
+
+- Cached files are served as usual.
+- Cached metadata is served however old it is, without revalidation.
+- Anything not in the cache gets a 404 whose message says Granary is offline.
+  A 404 rather than a 5xx lets Maven, Gradle, pip and npm carry on as they do
+  for any missing file (for example, pip tries another version).
+- npm's audit, search and ping calls get a 503.
+- Upstream health checks are skipped, and the web UI shows offline mode.
+
+Fill the cache while online first, then switch offline mode on.
 
 ## How it works
 

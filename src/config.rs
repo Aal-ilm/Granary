@@ -40,6 +40,8 @@ pub struct Config {
     pub trusted_proxies: Vec<IpNet>,
     /// Delete audit log entries older than this many days.
     pub audit_days: u32,
+    /// Never contact an upstream: serve only what is cached.
+    pub offline: bool,
 }
 
 /// An IP network such as `10.0.0.0/8` or `fd00::/8` (a bare address is a /32 or /128).
@@ -98,6 +100,15 @@ fn var(key: &str, default: &str) -> String {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+fn bool_var(key: &str, default: bool) -> anyhow::Result<bool> {
+    match var(key, "").to_ascii_lowercase().as_str() {
+        "" => Ok(default),
+        "on" | "true" | "1" | "yes" => Ok(true),
+        "off" | "false" | "0" | "no" => Ok(false),
+        other => anyhow::bail!("{key} must be \"on\" or \"off\", not {other:?}"),
+    }
 }
 
 fn url_var(key: &str, default: &str) -> String {
@@ -160,6 +171,7 @@ impl Config {
                     * 3600,
             ),
             trusted_proxies: parse_proxies(&var("GRANARY_TRUSTED_PROXIES", ""))?,
+            offline: bool_var("GRANARY_OFFLINE", false)?,
             audit_days: var("GRANARY_AUDIT_DAYS", "365")
                 .parse::<u32>()
                 .context("GRANARY_AUDIT_DAYS must be a whole number of days")?

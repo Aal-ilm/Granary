@@ -145,7 +145,7 @@ async fn run() -> anyhow::Result<()> {
         .init();
 
     let cfg = Config::from_env()?;
-    let store = Store::new(cfg.data_dir.clone(), cfg.meta_ttl).await?;
+    let store = Store::new(cfg.data_dir.clone(), cfg.meta_ttl, cfg.offline).await?;
     let admin = Admin::new(&cfg.data_dir, logs).await?;
 
     let db = auth::open_db(&cfg.data_dir).await?;
@@ -182,6 +182,11 @@ async fn run() -> anyhow::Result<()> {
         tracing::info!(
             "trusting X-Forwarded-* headers from {} proxy range(s)",
             cfg.trusted_proxies.len()
+        );
+    }
+    if cfg.offline {
+        tracing::warn!(
+            "GRANARY_OFFLINE is on: Granary serves only what is cached and never contacts an upstream"
         );
     }
     if !cfg.client_auth {

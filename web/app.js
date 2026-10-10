@@ -31,6 +31,12 @@ const mavenName = (name) => {
  *  any alternatives (Gradle next to Maven). */
 const setupSnippets = (setup) => [{ label: '', file: setup.file, snippet: setup.snippet, after: setup.after }, ...(setup.more || [])];
 
+/** Shown on the Overview and Repositories pages while GRANARY_OFFLINE is on. */
+const offlineBanner = (health) =>
+  (health || []).some((h) => h.offline)
+    ? '<div class="banner"><span class="dot warn"></span><span>Offline mode is on. Granary serves only what is cached and never contacts the public registries. Turn off <code>GRANARY_OFFLINE</code> to fetch new packages.</span></div>'
+    : '';
+
 const chip = (repo) => `<span class="fmt ${esc(repo)}">${esc(REPOS[repo]?.label ?? repo)}</span>`;
 
 function bytes(n) {
@@ -445,7 +451,7 @@ async function renderOverview({ isCurrent }) {
 
   const upstreams = REPO_IDS.map((id) => {
     const h = health[id];
-    const state = !h ? ['', 'not checked yet'] : h.ok ? ['ok', `reachable, ${h.latency_ms} ms`] : ['bad', `unreachable (${h.error || 'HTTP ' + h.status})`];
+    const state = !h ? ['', 'not checked yet'] : h.offline ? ['', 'offline mode'] : h.ok ? ['ok', `reachable, ${h.latency_ms} ms`] : ['bad', `unreachable (${h.error || 'HTTP ' + h.status})`];
     return `<span class="status"><span class="dot ${state[0]}"></span>${esc(REPOS[id].upstream)} <span class="muted">${esc(state[1])}</span></span>`;
   }).join('');
 
@@ -470,6 +476,7 @@ async function renderOverview({ isCurrent }) {
     <div class="page-head">
       <div><h1>Overview</h1><p>${esc(plural(packages, 'package'))} cached, using ${esc(bytes(total))}.</p></div>
     </div>
+    ${offlineBanner(d.health)}
     <section class="granary">
       <div class="panel">
         <div class="silos">${silos}</div>
@@ -505,6 +512,7 @@ async function renderRepos({ isCurrent }) {
     .map((r) => {
       const h = r.health;
       const status = !h ? '<span class="status"><span class="dot"></span>Not checked yet</span>'
+        : h.offline ? '<span class="status"><span class="dot"></span>Offline mode</span>'
         : h.ok ? `<span class="status"><span class="dot ok"></span>Online</span>`
         : `<span class="status"><span class="dot bad"></span>Upstream unreachable</span>`;
       return `
@@ -545,6 +553,7 @@ async function renderRepos({ isCurrent }) {
     <div class="page-head">
       <div><h1>Repositories</h1><p>Each repository caches one public registry. Point your package manager at its URL.</p></div>
     </div>
+    ${offlineBanner(d.repos.map((r) => r.health))}
     <div class="panel">${blocks}</div>`);
 
   view().addEventListener('click', async (e) => {
@@ -1026,7 +1035,9 @@ async function renderSystem({ isCurrent }) {
   const upRows = REPO_IDS.map((id) => {
     const h = health.find((x) => x.repo === id);
     if (!h) return `<tr><td>${chip(id)}</td><td colspan="4" class="muted">Not checked yet</td></tr>`;
-    const status = h.ok
+    const status = h.offline
+      ? '<span class="status"><span class="dot"></span>Not contacted: offline mode</span>'
+      : h.ok
       ? `<span class="status"><span class="dot ok"></span>Reachable${h.status ? ` (HTTP ${h.status})` : ''}</span>`
       : `<span class="status"><span class="dot bad"></span>Unreachable: ${esc(h.error || 'HTTP ' + h.status)}</span>`;
     return `<tr><td>${chip(id)}</td><td class="mono">${esc(h.url)}</td><td>${status}</td><td class="r num">${esc(h.latency_ms)} ms</td><td>${timeTag(h.checked_at)}</td></tr>`;
@@ -1072,7 +1083,8 @@ async function renderSystem({ isCurrent }) {
     try {
       const r = await act(() => api('/api/system/check', { method: 'POST' }));
       const up = r.health.filter((h) => h.ok).length;
-      toast(`${up} of ${r.health.length} upstreams reachable`, up === r.health.length ? '' : 'error');
+      if (r.health.some((h) => h.offline)) toast('Offline mode is on, so upstreams were not contacted');
+      else toast(`${up} of ${r.health.length} upstreams reachable`, up === r.health.length ? '' : 'error');
       route();
     } catch (err) {
       toast(err.message, 'error');
