@@ -421,7 +421,10 @@ def check_request(req):
         if path not in FILES[eco]:
             return f"unexpected file {path!r}"
     for host in req.get("git_hosts") or []:
-        if not isinstance(host, str) or not host or any(not (c.isalnum() or c in ".-") for c in host):
+        # A host name, with a port for a Gitea that has one.
+        name, colon, port = host.partition(":") if isinstance(host, str) else ("", "", "")
+        bad_port = colon and not (port.isdigit() and 0 < int(port) < 65536)
+        if not name or any(not (c.isalnum() or c in ".-") for c in name) or bad_port:
             return "git_hosts must be host names"
     plats = req.get("platforms") or []
     if not plats or any(p not in PLATFORMS for p in plats):
