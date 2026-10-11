@@ -40,6 +40,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/cleanup/run", post(cleanup_run))
         .route("/api/tasks", get(tasks))
         .route("/api/tasks/{id}/run", post(task_run))
+        .route("/api/tasks/{id}/enabled", put(task_enabled))
         .route("/api/system", get(system))
         .route("/api/system/check", post(system_check))
         .route("/api/system/gitea/check", post(gitea_check))
@@ -81,9 +82,21 @@ pub(crate) async fn usage(st: &AppState, inv: &[Asset]) -> Vec<RepoUsage> {
     .await
     .unwrap_or_else(|_| vec![0; REPOS.len()]);
 
+    // The Go checksum and vulnerability databases count as Go's metadata.
+    let go_extra = {
+        let dirs = [
+            st.store.meta_dir("go-sumdb"),
+            st.store.files_dir("go-sumdb"),
+            st.store.meta_dir("go-vuln"),
+        ];
+        tokio::task::spawn_blocking(move || dirs.iter().map(|d| dir_size(d)).sum::<u64>())
+            .await
+            .unwrap_or(0)
+    };
     REPOS
         .iter()
         .zip(meta_sizes)
+        .map(|(repo, size)| (repo, if *repo == "go" { size + go_extra } else { size }))
         .map(|(repo, meta_size)| {
             let assets: Vec<&Asset> = inv.iter().filter(|a| a.repo == *repo).collect();
             let packages: std::collections::HashSet<&str> =
@@ -253,6 +266,17 @@ async fn repos(State(st): State<AppState>, who: Principal, headers: HeaderMap) -
                     "/maven",
                     vec![json!({"label": "Repository", "url": cfg.maven_upstream})],
                     maven_setup(&base, auth),
+                ),
+                "go" => (
+                    "proxy.golang.org",
+                    "Go",
+                    "/go",
+                    vec![
+                        json!({"label": "Proxy", "url": cfg.go_upstream}),
+                        json!({"label": "Checksum database", "url": cfg.go_sumdb}),
+                        json!({"label": "Vulnerability database", "url": cfg.go_vulndb}),
+                    ],
+                    go_setup(&base, &host, &scheme, auth),
                 ),
                 _ => (
                     "pypi.org",
@@ -474,9 +498,41 @@ pub fn version_cmp(a: &str, b: &str) -> Ordering {
     }
 }
 
+/// Go client setup. `go` sends tokens only over HTTPS, so with tokens
+/// required and Granary on plain HTTP, the setup says so instead.
+fn go_setup(base: &str, host: &str, scheme: &str, auth: bool) -> Value {
+    let snippet = format!("go env -w GOPROXY={base}/go GONOPROXY=\ngo env -u GOPRIVATE");
+    let vuln = json!({
+        "label": "vulnerability checks",
+        "file": "your shell",
+        "snippet": format!("export GOVULNDB={base}/go/vuln    # gopls\ngovulncheck -db {base}/go/vuln ./..."),
+    });
+    match (auth, scheme) {
+        (false, _) => json!({"file": "your shell", "snippet": snippet, "more": [vuln]}),
+        (true, "https") => json!({
+            "file": "your shell",
+            "snippet": snippet,
+            "after": "Go reads the token from ~/.netrc (below).",
+            "more": [
+                {"label": "token", "file": "~/.netrc (mode 600)", "snippet": format!("machine {host} login token password YOUR_TOKEN")},
+                vuln,
+            ],
+        }),
+        (true, _) => json!({
+            "file": "your shell",
+            "snippet": snippet,
+            "after": "Go only sends tokens over HTTPS, and Granary is on plain HTTP here, so Go clients can't sign in. Put Granary behind TLS (see the README), or set GRANARY_CLIENT_AUTH=off.",
+            "more": [vuln],
+        }),
+    }
+}
+
 fn upstream_page(st: &AppState, repo: &str, name: &str) -> Option<(String, String)> {
     let cfg = &st.cfg;
     match repo {
+        "go" if cfg.go_upstream == "https://proxy.golang.org" => {
+            Some(("pkg.go.dev".into(), format!("https://pkg.go.dev/{name}")))
+        }
         "cargo" if cfg.cargo_index == "https://index.crates.io" => Some((
             "crates.io".into(),
             format!("https://crates.io/crates/{name}"),
@@ -523,6 +579,7 @@ async fn component(
                 .map(|a| {
                     let p = a.inner_path();
                     let download = match (repo, a.private) {
+                        ("go", _) => format!("{base}/go/{p}.zip"),
                         ("cargo", false) => format!("{base}/cargo/dl/{}/{v}", a.package),
                         ("cargo", true) => format!("{base}/cargo-private/dl/{}/{v}", a.package),
                         ("npm", _) => format!("{base}/npm/{p}"),
@@ -743,6 +800,30 @@ async fn tasks(State(st): State<AppState>) -> Json<Value> {
     Json(json!({ "tasks": *st.admin.tasks.lock().unwrap() }))
 }
 
+#[derive(Deserialize)]
+struct EnabledBody {
+    enabled: bool,
+}
+
+/// Switch a task that can be switched on and off.
+async fn task_enabled(
+    State(st): State<AppState>,
+    auth: AuthSession,
+    Extension(ip): Extension<ClientIp>,
+    Path(id): Path<String>,
+    Json(body): Json<EnabledBody>,
+) -> AppResult<Json<Value>> {
+    let admin = require_admin(&auth)?.username.clone();
+    st.admin
+        .set_task_enabled(&id, body.enabled)
+        .await
+        .map_err(AppError::bad_request)?;
+    let what = if body.enabled { "on" } else { "off" };
+    tracing::info!("{admin} turned the {id} task {what}");
+    audit(&st, &admin, "task.enabled", &format!("{id}: {what}"), ip).await;
+    Ok(Json(json!({ "enabled": body.enabled })))
+}
+
 async fn task_run(
     State(st): State<AppState>,
     auth: AuthSession,
@@ -812,6 +893,10 @@ async fn system(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
             {"key": "GRANARY_CARGO_API", "label": "Cargo search", "value": cfg.cargo_api},
             {"key": "GRANARY_MAVEN_SEARCH", "label": "Maven search", "value": cfg.maven_search},
             {"key": "GRANARY_MAVEN_UPSTREAM", "label": "Maven repository", "value": cfg.maven_upstream},
+            {"key": "GRANARY_GO_UPSTREAM", "label": "Go module proxy", "value": cfg.go_upstream},
+            {"key": "GRANARY_GO_SUMDB", "label": "Go checksum database", "value": format!("{} ({})", cfg.go_sumdb, cfg.go_sumdb_key.name)},
+            {"key": "GRANARY_GO_ALLOW_UNVERIFIED", "label": "Go modules without a checksum record", "value": if cfg.go_allow_unverified { "Served unverified" } else { "Refused" }},
+            {"key": "GRANARY_GO_VULNDB", "label": "Go vulnerability database", "value": cfg.go_vulndb},
             {"key": "GRANARY_GITEA_URL", "label": "Gitea", "value": cfg.gitea.as_ref().map_or("Not connected", |g| g.url.as_str())},
             {"key": "GRANARY_PRIVATE_ACCESS", "label": "Private access", "value": match cfg.private_access {
                 Some(m) => format!("{}: {}", m.as_str(), m.describe()),

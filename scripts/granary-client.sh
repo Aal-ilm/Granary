@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Point this machine's npm, pip, Cargo, Maven, Gradle and git at Granary, or
+# Point this machine's npm, pip, Cargo, Maven, Gradle, git and Go at Granary, or
 # switch them back to the public registries, without retyping anything.
 #
 #   granary-client.sh use-granary   install through Granary
@@ -14,14 +14,15 @@
 #   GRANARY_URL     Granary's address, e.g. http://10.212.46.20:8480
 #                   (remembered after the first use-granary)
 #   GRANARY_TOKEN   access token; asked for once if not set, then remembered
-#   TOOLS           which tools to change, default "npm pip cargo maven git"
+#   TOOLS           which tools to change, default "npm pip cargo maven git go"
 #                   ("maven" covers both Maven and Gradle)
 #
 # Compatible with Bash 3.2 (macOS) and later. Only edits per-user config:
 # ~/.npmrc, your user pip.conf, $CARGO_HOME/config.toml, ~/.m2/settings.xml
 # $GRADLE_USER_HOME/init.d/granary.gradle and, for git, one include.path line
 # in ~/.gitconfig pointing at granary-client's own gitconfig (mode 600, which
-# holds the token). Each file is backed up before
+# holds the token), Go's settings through `go env -w`, and a marked block in
+# ~/.netrc for Go's token (HTTPS only). Each file is backed up before
 # its first change. settings.xml is edited by m2-settings.py (next to this
 # script, needs python3), which works on the XML rather than on raw lines.
 
@@ -35,7 +36,10 @@ M2_DIR="$HOME/.m2"
 GRADLE_DIR="${GRADLE_USER_HOME:-$HOME/.gradle}"
 GRADLE_INIT="$GRADLE_DIR/init.d/granary.gradle"
 GRADLE_MARK="// Managed by granary-client; 'make use-public' and 'make remove' delete it."
-TOOLS="${TOOLS:-npm pip cargo maven git}"
+TOOLS="${TOOLS:-npm pip cargo maven git go}"
+NETRC_FILE="${NETRC:-$HOME/.netrc}"
+NETRC_BEGIN="# >>> granary (managed by granary-client) >>>"
+NETRC_END="# <<< granary <<<"
 GIT_CFG="$STATE_DIR/gitconfig"
 GITNET_BEGIN="# >>> granary git (managed by granary-client) >>>"
 GITNET_END="# <<< granary git <<<"
@@ -582,6 +586,74 @@ git_status() {
   fi
 }
 
+# ---------------------------------------------------------------------- go
+
+# Go reads tokens from ~/.netrc, by host name, and only sends them over
+# HTTPS: over plain HTTP it refuses to send credentials at all.
+go_host() { printf '%s' "$URL" | sed -E 's#^[a-z]+://##; s#[/:].*$##'; }
+
+go_forget_token() {
+  [ -f "$NETRC_FILE" ] && strip_block "$NETRC_FILE" "$NETRC_BEGIN" "$NETRC_END"
+  return 0
+}
+
+go_use_granary() {
+  has go || { info "go: not installed, skipped"; return 0; }
+  go env -w "GOPROXY=$URL/go" "GONOPROXY="
+  # An empty GONOPROXY falls back to GOPRIVATE, which would send private
+  # modules around Granary.
+  if [ -n "$(go env GOPRIVATE)" ]; then
+    go env -w GONOPROXY=none
+    warn "go: GOPRIVATE is set, so GONOPROXY is set to 'none' to keep private modules going through Granary"
+  fi
+  case "$URL" in
+    https://*)
+      backup "$NETRC_FILE"
+      go_forget_token
+      (umask 077 && touch "$NETRC_FILE")
+      {
+        [ -s "$NETRC_FILE" ] && printf '\n'
+        printf '%s\nmachine %s login token password %s\n%s\n' "$NETRC_BEGIN" "$(go_host)" "$TOKEN" "$NETRC_END"
+      } >>"$NETRC_FILE"
+      chmod 600 "$NETRC_FILE"
+      ok "go   -> $URL/go (token in $NETRC_FILE)"
+      ;;
+    *)
+      ok "go   -> $URL/go"
+      local code
+      code="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$URL/go/golang.org/x/mod/@v/list" || true)"
+      if [ "$code" = "401" ]; then
+        warn "go: Granary needs a token, but Go only sends tokens over HTTPS. Use Granary's https:// address, or Go downloads will be refused"
+      fi
+      ;;
+  esac
+}
+
+# `go env -u` fails when Go's env file doesn't exist yet: nothing to undo.
+go_unset() {
+  [ -f "$(go env GOENV)" ] || return 0
+  go env -u GOPROXY GONOPROXY
+}
+
+go_use_public() {
+  has go || return 0
+  # Keep the token so switching back needs nothing.
+  go_unset
+  ok "go   -> https://proxy.golang.org (default)"
+}
+
+go_remove() {
+  has go || return 0
+  go_unset
+  go_forget_token
+  ok "go: Granary proxy and token removed"
+}
+
+go_status() {
+  has go || { info "go     not installed"; return 0; }
+  info "go     $(go env GOPROXY)"
+}
+
 # -------------------------------------------------------------- commands
 
 cmd_use_granary() {
@@ -651,7 +723,7 @@ cmd_status() {
 }
 
 for t in $TOOLS; do
-  case "$t" in npm | pip | cargo | maven | git) ;; *) die "unknown tool in TOOLS: $t (use npm, pip, cargo, maven, git)" ;; esac
+  case "$t" in npm | pip | cargo | maven | git | go) ;; *) die "unknown tool in TOOLS: $t (use npm, pip, cargo, maven, git, go)" ;; esac
 done
 
 case "${1:-}" in

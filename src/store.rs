@@ -185,6 +185,11 @@ pub struct Store {
 const MAX_MISSING: usize = 50_000;
 
 /// A metadata document, as stored from upstream (before any URL rewriting).
+/// A check on a whole downloaded file (blocking), before it is cached.
+/// `Ok(true)` when it verified a checksum, `Ok(false)` when it only checked
+/// the file's shape.
+pub type FileCheck = Box<dyn FnOnce(&Path) -> Result<bool, String> + Send>;
+
 pub struct Meta {
     pub body: Bytes,
     pub content_type: String,
@@ -402,6 +407,23 @@ impl Store {
         content_type: &'static str,
         expected: Option<Checksum>,
     ) -> AppResult<Response> {
+        self.file_checked(ns, rel, url, content_type, expected, None)
+            .await
+    }
+
+    /// [`Store::file`], with `check` run on the whole download before it
+    /// enters the cache (for checksums that can't be computed as the bytes
+    /// arrive, like a Go module zip's `h1:`). A failed check is an integrity
+    /// failure: nothing is cached and the client gets a 502.
+    pub async fn file_checked(
+        self: &Arc<Self>,
+        ns: &'static str,
+        rel: &str,
+        url: &str,
+        content_type: &'static str,
+        expected: Option<Checksum>,
+        check: Option<FileCheck>,
+    ) -> AppResult<Response> {
         let path = self.root.join("files").join(ns).join(safe_rel_path(rel)?);
 
         if tokio::fs::try_exists(&path).await? {
@@ -432,7 +454,7 @@ impl Store {
                         }
                         store.stats.file_misses.fetch_add(1, Ordering::Relaxed);
                         tracing::info!("{ns}: downloading {rel} from upstream");
-                        store.download(&url, &path, expected.as_ref()).await
+                        store.download(&url, &path, expected.as_ref(), check).await
                     })
                     .await
             })
@@ -502,7 +524,13 @@ impl Store {
         Ok(())
     }
 
-    async fn download(&self, url: &str, dest: &Path, expected: Option<&Checksum>) -> AppResult<()> {
+    async fn download(
+        &self,
+        url: &str,
+        dest: &Path,
+        expected: Option<&Checksum>,
+        check: Option<FileCheck>,
+    ) -> AppResult<()> {
         self.check_url(url)?;
         let resp = self
             .authorize(self.file_client.get(url), url)
@@ -522,6 +550,7 @@ impl Store {
             tokio::fs::create_dir_all(parent).await?;
         }
         let tmp = self.tmp_path();
+        let mut checked = false;
         let result: AppResult<()> = async {
             let mut file = tokio::fs::File::create(&tmp).await?;
             let mut hasher = expected.map(Hasher::new);
@@ -544,6 +573,24 @@ impl Store {
                     "the file from upstream does not match the registry's checksum, so it was not cached",
                 ));
             }
+            if let Some(check) = check {
+                let tmp = tmp.clone();
+                let result = tokio::task::spawn_blocking(move || check(&tmp))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("the check failed: {e}")));
+                match result {
+                    Ok(verified) => checked = verified,
+                    Err(why) => {
+                        self.stats.integrity_failures.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(
+                            "{url} failed its check ({why}); the download was discarded"
+                        );
+                        return Err(AppError::bad_gateway(format!(
+                            "the file from upstream failed its check, so it was not cached: {why}"
+                        )));
+                    }
+                }
+            }
             Ok(())
         }
         .await;
@@ -556,7 +603,7 @@ impl Store {
                         .bytes_cached
                         .fetch_add(m.len(), Ordering::Relaxed);
                 }
-                if expected.is_some() {
+                if expected.is_some() || checked {
                     tracing::info!("cached {url} (checksum verified)");
                 } else {
                     tracing::info!("cached {url} (registry published no checksum to verify)");
@@ -618,6 +665,58 @@ impl Store {
             self.refresh_meta(&body_path, &info_path, url, accept).await
         })
         .await
+    }
+
+    /// Store a metadata document as if it had just been fetched (for bulk
+    /// downloads, such as the Go vulnerability database's zip).
+    pub async fn put_meta(
+        &self,
+        ns: &str,
+        rel: &str,
+        variant: &str,
+        body: &[u8],
+        content_type: &str,
+    ) -> AppResult<()> {
+        let base = self.root.join("meta").join(ns).join(safe_rel_path(rel)?);
+        let name = base
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .ok_or_else(AppError::not_found)?;
+        let info = MetaInfo {
+            fetched_at: now_secs(),
+            content_type: content_type.to_string(),
+            etag: None,
+            last_modified: None,
+        };
+        self.write_atomic(&base.with_file_name(format!("{name}.{variant}.body")), body)
+            .await?;
+        self.write_atomic(
+            &base.with_file_name(format!("{name}.{variant}.json")),
+            &serde_json::to_vec(&info).unwrap(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// A cached metadata document however old, without contacting
+    /// upstream.
+    pub async fn cached_meta(&self, ns: &str, rel: &str, variant: &str) -> Option<Meta> {
+        let base = self
+            .root
+            .join("meta")
+            .join(ns)
+            .join(safe_rel_path(rel).ok()?);
+        let name = base.file_name()?.to_string_lossy().to_string();
+        let info = self
+            .read_info(&base.with_file_name(format!("{name}.{variant}.json")))
+            .await?;
+        let body = tokio::fs::read(base.with_file_name(format!("{name}.{variant}.body")))
+            .await
+            .ok()?;
+        Some(Meta {
+            body: body.into(),
+            content_type: info.content_type,
+        })
     }
 
     /// Whether a metadata document is cached (fresh or not).
@@ -901,6 +1000,7 @@ pub fn companions(ns: &str) -> &'static [&'static str] {
     match ns.strip_prefix("gitea-").unwrap_or(ns) {
         "pypi" => &[".metadata"],
         "maven" => &[".sha1", ".md5", ".sha256", ".sha512"],
+        "go" => &[".mod", ".info"],
         _ => &[],
     }
 }

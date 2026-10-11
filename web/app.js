@@ -18,6 +18,7 @@ const REPOS = {
   npm: { label: 'npm', upstream: 'registry.npmjs.org' },
   pypi: { label: 'PyPI', upstream: 'pypi.org' },
   maven: { label: 'Maven', upstream: 'Maven Central' },
+  go: { label: 'Go', upstream: 'proxy.golang.org' },
 };
 const REPO_IDS = Object.keys(REPOS);
 
@@ -360,8 +361,8 @@ const routes = [
   [/^\/$/, 'overview', renderOverview],
   [/^\/repos$/, 'repos', renderRepos],
   [/^\/browse\/git$/, 'browse', renderGitRepos],
-  [/^\/browse(?:\/(cargo|npm|pypi|maven))?$/, 'browse', renderBrowse],
-  [/^\/c\/(cargo|npm|pypi|maven)\/(.+)$/, 'browse', renderComponent],
+  [/^\/browse(?:\/(cargo|npm|pypi|maven|go))?$/, 'browse', renderBrowse],
+  [/^\/c\/(cargo|npm|pypi|maven|go)\/(.+)$/, 'browse', renderComponent],
   [/^\/get(?:\/(npm|cargo|pypi|maven))?$/, 'get', renderGet, { admin: true }],
   [/^\/templates$/, 'templates', renderTemplates],
   [/^\/templates\/new$/, 'templates', renderTemplateEditor, { admin: true }],
@@ -2047,7 +2048,8 @@ async function renderTasks({ isCurrent }) {
           : t.last_result
             ? `<span class="status"><span class="dot ${t.last_ok ? 'ok' : 'bad'}"></span>${esc(t.last_result)}</span>`
             : '<span class="muted">Not run yet</span>';
-        const schedule = t.enabled ? esc(t.schedule) : '<span class="muted">Off</span>' + (t.id === 'cleanup' ? ' <a href="#/cleanup">Turn on</a>' : '');
+        const toggle = t.id === 'go-vulndb' ? ` <button class="small admin-only" data-toggle-task="${t.id}" data-on="${t.enabled ? '0' : '1'}">${t.enabled ? 'Turn off' : 'Turn on'}</button>` : '';
+        const schedule = (t.enabled ? esc(t.schedule) : '<span class="muted">Off</span>' + (t.id === 'cleanup' ? ' <a href="#/cleanup">Turn on</a>' : '')) + toggle;
         return `<tr>
           <td><strong>${esc(t.name)}</strong><div class="muted">${esc(t.description)}</div></td>
           <td class="nowrap">${schedule}</td>
@@ -2070,6 +2072,16 @@ async function renderTasks({ isCurrent }) {
         <tbody id="task-rows">${rows}</tbody>
       </table></div>`);
     view().addEventListener('click', async (e) => {
+      const tg = e.target.closest('[data-toggle-task]');
+      if (tg) {
+        try {
+          await api(`/api/tasks/${tg.dataset.toggleTask}/enabled`, { method: 'PUT', body: { enabled: tg.dataset.on === '1' } });
+          draw().catch(() => {});
+        } catch (err) {
+          toast(err.message, 'error');
+        }
+        return;
+      }
       const b = e.target.closest('[data-run-task]');
       if (!b) return;
       if (b.dataset.runTask === 'cleanup') {

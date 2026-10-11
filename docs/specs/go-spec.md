@@ -66,13 +66,21 @@ proxy, and never connects to the database itself.
 - Before a `.zip` or `.mod` enters the cache, Granary checks it against the
   `h1:` hash in the checksum database's lookup record for that version
   (`$module $version h1:...` and `$module $version/go.mod h1:...`).
+- A lookup record is trusted only after its signed tree note verifies
+  against the database's public key, and the record is proved to be in that
+  tree from the log's tiles, as `go` does. A valid signature alone says
+  nothing about the record next to it. The key is `GRANARY_GO_SUMDB_KEY`
+  (`name+hash+key`, as in `GOSUMDB`), sum.golang.org's by default; its name
+  is the database's name at `/go/sumdb/<name>/`.
   - The zip's hash is `dirhash.Hash1` over its entry names (with the
     `$module@$version/` prefix) and contents.
   - The go.mod hash is `Hash1` over the single file `go.mod`.
 - A mismatch is logged and counted as an integrity failure. Nothing is
   cached, and the client gets a 502, as for the other formats.
-- When the database has no record (a 404 or 410 from it), the file is
-  cached unverified, and the log says so.
+- When the database has no record (a 404 or 410 from it), the download
+  fails closed: a 502, counted as an integrity failure, nothing cached.
+  `GRANARY_GO_ALLOW_UNVERIFIED=on` (default off) serves such modules
+  anyway, still checked to be well-formed zips of the right module.
 
 ### Vulnerability database mirror
 - Serve `/go/vuln/` as a mirror of `GRANARY_GO_VULNDB`, default
@@ -142,7 +150,10 @@ govulncheck -db https://HOST/go/vuln ./...             # govulncheck has only th
   invalid encodings and paths refused, 404 for both 404 and 410 upstream.
 - Verification: a `.zip` or `.mod` whose hash doesn't match the lookup
   record is refused and not cached; a correct one is cached and later
-  served without asking upstream.
+  served without asking upstream. A forged record with a genuine signed
+  tree, a wrong key and a tampered tile are refused; a module without a
+  record fails closed unless `GRANARY_GO_ALLOW_UNVERIFIED` is on. One test
+  verifies a real sum.golang.org lookup with its real key.
 - Checksum database: `supported` is 200 for sum.golang.org and 404 for
   other names; lookups and tiles are cached, `latest` is metadata.
 - Vulnerability database: the paths, `.gz` variants, and the daily task.
@@ -275,9 +286,12 @@ module was first fetched.
   downloads don't depend on the platform):
   - `GOPROXY` set to Granary only. Go won't send credentials over plain
     HTTP, and the warmer reaches Granary over plain HTTP on the internal
-    network, so the job's token needs another way in (for example in the
-    `GOPROXY` path, accepted only from the warmer's address). Settle this
-    in the plan for phase 3.
+    network, so the job's token needs another way in. Preferred: TLS on
+    the internal network between the warmer and Granary, which also
+    protects the other formats' warmer token. If the plan ends up with the
+    token in the `GOPROXY` path instead, it is redacted from every log and
+    error, and accepted only from the warmer's address together with the
+    warmer secret. Settle this in the plan for phase 3.
   - `GONOSUMDB` set to the private prefixes the job's starter may read,
     `GOFLAGS=-mod=mod`, and `GOTOOLCHAIN=local`, so a `toolchain` line never
     downloads another Go.

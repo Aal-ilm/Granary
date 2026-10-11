@@ -7,12 +7,13 @@ use serde::Serialize;
 
 use crate::{
     formats::{maven, pypi::normalize},
+    gomod,
     policy::Resource,
     store::companions,
 };
 
 /// The repositories Granary serves, in display order.
-pub const REPOS: [&str; 4] = ["cargo", "npm", "pypi", "maven"];
+pub const REPOS: [&str; 5] = ["cargo", "npm", "pypi", "maven", "go"];
 
 /// Each repository's cache namespace for private packages from Gitea. Paths
 /// there start with the Gitea owner.
@@ -96,6 +97,13 @@ pub fn classify(repo: &str, rel: &str) -> Option<(String, String)> {
             }
             let (group, artifact, version, _) = maven::coordinates(rel)?;
             Some((format!("{group}:{artifact}"), version.to_string()))
+        }
+        // `{module}/@v/{version}` (the zip; its .mod and .info sit next
+        // to it), both case-encoded.
+        "go" => {
+            let (module, version) = rel.split_once("/@v/")?;
+            let version = gomod::unescape(version).filter(|v| gomod::is_canonical(v))?;
+            Some((gomod::unescape(module)?, version))
         }
         _ => None,
     }
@@ -279,6 +287,7 @@ pub fn meta_key(repo: &str, name: &str) -> Option<String> {
                 group.replace('.', "/")
             ))
         }
+        "go" => Some(format!("{}/@v/list", gomod::escape(name))),
         _ => None,
     }
 }
@@ -310,12 +319,14 @@ pub fn meta_keys(repo: &str, name: &str) -> Vec<String> {
     let Some(key) = meta_key(repo, name) else {
         return Vec::new();
     };
-    if repo == "maven" {
-        let mut keys = vec![key.clone()];
-        keys.extend(companions("maven").iter().map(|ext| format!("{key}{ext}")));
-        keys
-    } else {
-        vec![key]
+    match repo {
+        "maven" => {
+            let mut keys = vec![key.clone()];
+            keys.extend(companions("maven").iter().map(|ext| format!("{key}{ext}")));
+            keys
+        }
+        "go" => vec![key, format!("{}/@latest", gomod::escape(name))],
+        _ => vec![key],
     }
 }
 

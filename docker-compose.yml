@@ -46,6 +46,10 @@ services:
       # GRANARY_GITEA_PYPI: "example-*=example-org"
       # GRANARY_GITEA_MAVEN: "com.example=example-org"
       # GRANARY_GITEA_CARGO: "example-org"
+      # Go modules come from proxy.golang.org and are verified against
+      # sum.golang.org. Go clients only send tokens over HTTPS, so put
+      # Granary behind TLS to use Go with GRANARY_CLIENT_AUTH=required.
+      # GRANARY_GO_ALLOW_UNVERIFIED: "off"
       # Granary refuses upstreams at private addresses. List internal
       # mirrors you set as upstreams here (the Gitea host is always allowed).
       # GRANARY_PRIVATE_HOSTS: "nexus.example.lan"

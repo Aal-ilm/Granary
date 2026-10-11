@@ -1,7 +1,7 @@
 # Granary
 
 A small, self-hostable caching proxy for package registries. Point Cargo, npm,
-pip, Maven and Gradle at Granary, and every package is downloaded from the
+pip, Maven, Gradle and Go at Granary, and every package is downloaded from the
 public registry once, then served from your own disk after that.
 
 - **Free and open source** (MIT or Apache-2.0), with no usage caps, no license
@@ -14,7 +14,8 @@ public registry once, then served from your own disk after that.
   don't break.
 - **Safe by design.** Granary checks every download against the
   registry's own checksum (Cargo's `cksum`, npm's `integrity`, PyPI's
-  `sha256`, Maven Central's `.sha1`) before caching it, so a corrupted or tampered response is never
+  `sha256`, Maven Central's `.sha1`, Go's checksum database) before caching
+  it, so a corrupted or tampered response is never
   stored or served. Clients check again on their side.
 - **Web UI built in.** Browse and search what's cached, delete packages, set
   cleanup rules, watch tasks, check upstream health and read logs. It's served
@@ -36,6 +37,7 @@ public registry once, then served from your own disk after that.
 | npm (registry.npmjs.org) | ✅ proxy | `/npm/` |
 | PyPI (Simple API, PEP 503/691) | ✅ proxy | `/pypi/simple/` |
 | Maven Central (Maven 2 layout, for Maven and Gradle) | ✅ proxy | `/maven` |
+| Go modules (GOPROXY protocol, checksum and vulnerability databases) | ✅ proxy | `/go` |
 | Git repos from GitHub, GitLab and Codeberg (smart HTTP, read-only) | ✅ cache | `/git/{host}/{owner}/{repo}.git` |
 | Docker / OCI | planned | |
 | Debian (apt) | planned | |
@@ -158,13 +160,15 @@ allprojects {
 Maven Central has no snapshots, so any `-SNAPSHOT` path gets a 404 straight
 away. Keep snapshot repositories out of the `central` mirror.
 
+**Go**: see [Go modules](#go-modules). Go only sends tokens over HTTPS.
+
 To let anyone on your network download without a token, set
 `GRANARY_CLIENT_AUTH=off`; the configuration then needs only the URLs.
 
 ### Setting up a machine with make
 
 `make use-granary GRANARY_URL=http://HOST` asks for a token once and points
-npm, pip, Cargo, Maven, Gradle and git at Granary. `make use-public` switches them
+npm, pip, Cargo, Maven, Gradle, git and Go at Granary. `make use-public` switches them
 back to the public registries (for example while Granary is down), `make
 status` shows where each one points and `make remove` undoes everything.
 Every file is backed up before its first change. Choose tools with `TOOLS`,
@@ -178,6 +182,75 @@ comment blocks in `~/.m2/settings.xml` (creating the file if needed), using
 For Gradle it writes `~/.gradle/init.d/granary.gradle`; `use-public` and
 `remove` delete it again. For git, see [Git repos](#git-repos).
 
+## Go modules
+
+Granary is a Go module proxy at `/go`, with proxy.golang.org behind it. It
+also serves the Go checksum database and mirrors the Go vulnerability
+database, so builds and vulnerability checks work without the internet.
+
+**Client setup.** Go only sends credentials over HTTPS: it refuses to pass
+a token to an `http://` proxy, and its netrc support only covers HTTPS. So
+with `GRANARY_CLIENT_AUTH=required` (the default), Go clients need Granary
+behind TLS (see [Running on TrueNAS SCALE](#running-on-truenas-scale) for a
+reverse proxy). Then:
+
+```sh
+go env -w GOPROXY=https://HOST/go GONOPROXY=
+go env -u GOPRIVATE
+printf 'machine HOST login token password TOKEN\n' >> ~/.netrc   # mode 600
+```
+
+- `GOPROXY` names Granary alone, without `,direct`, so a module Granary
+  doesn't have is never fetched from anywhere else.
+- `GONOPROXY` must be empty so that every module comes through Granary.
+  An empty `GONOPROXY` falls back to `GOPRIVATE`, so leave `GOPRIVATE`
+  unset; if you need it, set `GONOPROXY=none` instead.
+- No `GOSUMDB` setting is needed: `go` asks the proxy whether it serves the
+  checksum database, and from then on sends every checksum request through
+  Granary.
+- The token can also go in the URL, `https://token:TOKEN@HOST/go`, at the
+  cost of appearing in `go env`.
+- Over plain HTTP, Go works only with `GRANARY_CLIENT_AUTH=off`.
+
+`make use-granary TOOLS=go` does all of this, writing the token to a
+marked block in `~/.netrc` (mode 600) for an `https://` address. For
+vulnerability checks, point gopls and govulncheck at the mirror (govulncheck
+has no environment variable for it):
+
+```sh
+export GOVULNDB=https://HOST/go/vuln       # gopls
+govulncheck -db https://HOST/go/vuln ./...
+```
+
+**Verified downloads.** Before a module's `.zip` or `.mod` enters the cache,
+Granary checks its `h1:` hash against the checksum database's record for
+that version, as `go` does with `go.sum`. That record is trusted only after
+its signed tree note verifies against the database's public key
+(`GRANARY_GO_SUMDB_KEY`, sum.golang.org's by default) and the record is
+proved to be in that signed tree, using the log's tiles. A mismatch, a
+forged record or a module the database has no record of is refused with a
+502, counted as an integrity failure and not cached. Set
+`GRANARY_GO_ALLOW_UNVERIFIED=on` to serve public modules without a record
+anyway (they are still checked to be well-formed zips of the right module).
+
+**Caching.** Version lists and `@latest` are metadata, refreshed after
+`GRANARY_META_TTL_SECS`. A version's `.info`, `.mod` and `.zip` never change
+and are kept. Checksum database records and tiles are kept too; only its
+`latest` tree head is refreshed. Module paths are cached in Go's
+case-encoded form (`!m` for `M`), so the cache works on case-insensitive
+file systems. A module or version upstream doesn't have is a 404 (also for
+upstream's 410), which is what `go` expects. Zips over 500 MiB, or with more
+than that unpacked, and `go.mod` files over 16 MiB are refused.
+
+**Vulnerability database.** `/go/vuln/` mirrors vuln.go.dev's index files
+and reports, plain and gzipped, refreshed like other metadata. Only what was
+asked for is cached, unless you turn on **Download the Go vulnerability
+database** on the Tasks page: it stores the whole database every day, so
+checks work offline too.
+
+**Offline mode** serves everything cached, however old: modules, checksum
+database records, tiles and tree heads, and vulnerability reports.
+
 ## Web UI
 
 | Page | What it's for |
@@ -190,7 +263,7 @@ For Gradle it writes `~/.gradle/init.d/granary.gradle`; `use-public` and
 | Templates | Named sets of packages for a kind of project: browse, create (also from a git repo), edit, clone, delete, export, warm, schedule re-warms and download a starter project (see [Templates](#templates)) |
 | Jobs | Warm jobs with their status, live log, what they cached, and cancel (see [Warming](#warming-templates-with-the-warmer)) |
 | Cleanup | Delete packages nobody has downloaded in *N* days, per repository, with a dry-run preview and an optional daily schedule |
-| Tasks | Scheduled jobs (cleanup, upstream checks, saving download history) with last run, result and **Run now** |
+| Tasks | Scheduled jobs (cleanup, upstream checks, saving download history, the Go vulnerability database) with last run, result and **Run now** |
 | System | Upstream reachability and latency, disk space, and the active configuration |
 | Logs | Recent server events, filterable by level and text (admins only) |
 | Audit log | Sign-ins, account, token and user changes, deletions and settings changes, with who, when and from where; filterable and exportable as CSV (admins only) |
@@ -796,6 +869,11 @@ All settings are environment variables.
 | `GRANARY_PYPI_INDEX` | `https://pypi.org/simple` | Upstream Simple API |
 | `GRANARY_PYPI_FILES` | `https://files.pythonhosted.org` | Host that PyPI file links point to |
 | `GRANARY_MAVEN_UPSTREAM` | `https://repo1.maven.org/maven2` | Upstream Maven repository (Maven 2 layout) |
+| `GRANARY_GO_UPSTREAM` | `https://proxy.golang.org` | Upstream Go module proxy |
+| `GRANARY_GO_SUMDB` | `https://sum.golang.org` | Go checksum database that downloads are verified against and that Granary serves at `/go/sumdb/` |
+| `GRANARY_GO_SUMDB_KEY` | sum.golang.org's key | That database's public key (`name+hash+key`, as in `GOSUMDB`); its name is the database name clients use |
+| `GRANARY_GO_ALLOW_UNVERIFIED` | `off` | `on`: serve public Go modules the checksum database has no record of (see [Go modules](#go-modules)) |
+| `GRANARY_GO_VULNDB` | `https://vuln.go.dev` | Go vulnerability database mirrored at `/go/vuln/` |
 | `GRANARY_WARMER_URL` | *(none)* | The warmer service, e.g. `http://granary-warmer:9090`. Warming is off when unset |
 | `GRANARY_WARMER_SECRET` | *(none)* | Shared secret for the warmer (16+ characters); give the warmer the same value as `WARMER_SECRET` |
 | `GRANARY_WARMER_GRANARY_URL` | `http://granary:8080` | How the warmer reaches Granary |

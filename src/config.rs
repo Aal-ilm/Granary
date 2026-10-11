@@ -25,6 +25,17 @@ pub struct Config {
     pub pypi_files: String,
     /// Maven repository in the standard Maven 2 layout.
     pub maven_upstream: String,
+    /// Go module proxy upstream (GOPROXY protocol).
+    pub go_upstream: String,
+    /// The Go checksum database Granary fetches from and serves.
+    pub go_sumdb: String,
+    /// Its public key, which every lookup answer is verified against. The
+    /// key's name is the database's name.
+    pub go_sumdb_key: crate::sumdb::Verifier,
+    /// The Go vulnerability database to mirror.
+    pub go_vulndb: String,
+    /// Serve public modules the checksum database has no record of.
+    pub go_allow_unverified: bool,
     /// Allow "Get packages" to send search text to search hosts.
     pub search: bool,
     /// crates.io's web API, used only for search.
@@ -351,6 +362,15 @@ impl Config {
             pypi_index: url_var("GRANARY_PYPI_INDEX", "https://pypi.org/simple"),
             pypi_files: url_var("GRANARY_PYPI_FILES", "https://files.pythonhosted.org"),
             maven_upstream: url_var("GRANARY_MAVEN_UPSTREAM", "https://repo1.maven.org/maven2"),
+            go_upstream: url_var("GRANARY_GO_UPSTREAM", "https://proxy.golang.org"),
+            go_sumdb: url_var("GRANARY_GO_SUMDB", "https://sum.golang.org"),
+            go_sumdb_key: crate::sumdb::Verifier::parse(&var(
+                "GRANARY_GO_SUMDB_KEY",
+                crate::sumdb::SUM_GOLANG_ORG_KEY,
+            ))
+            .map_err(|e| anyhow::anyhow!("GRANARY_GO_SUMDB_KEY: {e}"))?,
+            go_vulndb: url_var("GRANARY_GO_VULNDB", "https://vuln.go.dev"),
+            go_allow_unverified: bool_var("GRANARY_GO_ALLOW_UNVERIFIED", false)?,
             search: bool_var("GRANARY_SEARCH", true)?,
             cargo_api: url_var("GRANARY_CARGO_API", "https://crates.io/api/v1"),
             maven_search: url_var(

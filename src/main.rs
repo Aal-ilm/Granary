@@ -8,6 +8,7 @@ mod egress;
 mod error;
 mod formats;
 mod gitea;
+mod gomod;
 mod inventory;
 mod jobs;
 mod logbuf;
@@ -17,6 +18,7 @@ mod net;
 mod policy;
 mod search;
 mod store;
+mod sumdb;
 mod templates;
 #[cfg(test)]
 mod tests;
@@ -61,6 +63,7 @@ pub fn app(state: AppState, sessions: SqliteSessionStore) -> Router {
         .merge(formats::pypi::router())
         .merge(formats::maven::router())
         .merge(formats::git::router())
+        .merge(formats::go::router())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::client_guard,

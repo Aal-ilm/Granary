@@ -47,6 +47,7 @@
   --pypi: #2f6da8;
   --maven: #7a3fa8;
   --git: #0d7c70;
+  --go: #00758d;
   --sans: ui-sans-serif, -apple-system, "Segoe UI Variable Text", "Segoe UI", system-ui,
     Roboto, "Helvetica Neue", Arial, sans-serif;
   --display: "Saira Condensed", "Arial Narrow", var(--sans);
@@ -89,6 +90,7 @@
     --pypi: #7fb0e0;
     --maven: #b88ae0;
     --git: #4cc3b4;
+    --go: #5cc8e0;
     color-scheme: dark;
   }
 }
@@ -127,6 +129,7 @@
   --pypi: #7fb0e0;
   --maven: #b88ae0;
   --git: #4cc3b4;
+  --go: #5cc8e0;
   color-scheme: dark;
 }
 
@@ -520,6 +523,7 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--primary)
 .fmt.pypi, .silo-col.pypi { --fmt-color: var(--pypi); }
 .fmt.maven, .silo-col.maven { --fmt-color: var(--maven); }
 .fmt.git, .silo-col.git { --fmt-color: var(--git); }
+.fmt.go, .silo-col.go { --fmt-color: var(--go); }
 
 /* Sensor lights: green online, gold busy or warning, red fault, gray idle. */
 .dot {

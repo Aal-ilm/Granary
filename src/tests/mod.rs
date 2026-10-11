@@ -6,6 +6,7 @@ mod git;
 mod git_templates;
 mod gitea;
 mod gitea_packages;
+mod go;
 mod jobs;
 mod maven;
 mod npm;
@@ -157,6 +158,12 @@ pub struct Opts {
     pub namespaces: crate::namespaces::Preset,
     /// Use this data directory (another harness's) instead of a new one.
     pub data: Option<PathBuf>,
+    /// The Go checksum database's key; the mock serves a test log signed
+    /// with it at `/sumdb`.
+    pub go_sumdb_key: Option<String>,
+    pub go_allow_unverified: bool,
+    /// Use the real proxy.golang.org, sum.golang.org and vuln.go.dev.
+    pub go_real: bool,
 }
 
 /// The shared secret test warmers expect.
@@ -185,6 +192,9 @@ impl Default for Opts {
             private_hosts: vec!["127.0.0.1".into(), "localhost".into()],
             namespaces: Default::default(),
             data: None,
+            go_sumdb_key: None,
+            go_allow_unverified: false,
+            go_real: false,
         }
     }
 }
@@ -225,6 +235,9 @@ impl Harness {
             private_hosts,
             namespaces,
             data: reuse,
+            go_sumdb_key,
+            go_allow_unverified,
+            go_real,
         } = opts;
         // Bind first so the config can name Granary's own address.
         let own = if serve {
@@ -267,6 +280,28 @@ impl Harness {
             pypi_index: format!("{base}/simple"),
             pypi_files: format!("{base}/files"),
             maven_upstream: format!("{base}/maven2"),
+            go_upstream: if go_real {
+                "https://proxy.golang.org".into()
+            } else {
+                format!("{base}/goproxy")
+            },
+            go_sumdb: if go_real {
+                "https://sum.golang.org".into()
+            } else {
+                format!("{base}/sumdb")
+            },
+            go_sumdb_key: crate::sumdb::Verifier::parse(
+                go_sumdb_key
+                    .as_deref()
+                    .unwrap_or(crate::sumdb::SUM_GOLANG_ORG_KEY),
+            )
+            .unwrap(),
+            go_vulndb: if go_real {
+                "https://vuln.go.dev".into()
+            } else {
+                format!("{base}/vuln")
+            },
+            go_allow_unverified,
             search,
             cargo_api: format!("{base}/crates-api"),
             maven_search: format!("{base}/solr/select"),

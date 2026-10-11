@@ -82,6 +82,9 @@ pub struct CleanupReport {
 pub struct Settings {
     pub cleanup: CleanupPolicy,
     pub last_cleanup: Option<CleanupReport>,
+    /// Download the whole Go vulnerability database every day.
+    #[serde(default)]
+    pub go_vulndb: bool,
 }
 
 // ------------------------------------------------------------------- tasks
@@ -253,6 +256,20 @@ impl Admin {
                 3600,
                 60,
             ),
+            {
+                let mut t = task(
+                    "go-vulndb",
+                    "Download the Go vulnerability database",
+                    "Stores all of vuln.go.dev, so vulnerability checks work offline. Without it, only reports that were asked for are cached.",
+                    DAY,
+                    600,
+                );
+                t.enabled = settings.go_vulndb;
+                if !t.enabled {
+                    t.next_run = None;
+                }
+                t
+            },
         ];
         Ok(Self {
             settings: Mutex::new(settings),
@@ -310,6 +327,24 @@ impl Admin {
 
     pub fn invalidate_inventory(&self) {
         *self.inventory.lock().unwrap() = None;
+    }
+
+    /// Turn a task that can be switched on and off on or off.
+    pub async fn set_task_enabled(&self, id: &str, enabled: bool) -> Result<(), String> {
+        match id {
+            "go-vulndb" => self.settings.lock().unwrap().go_vulndb = enabled,
+            _ => return Err("this task can't be switched on or off here".into()),
+        }
+        {
+            let mut tasks = self.tasks.lock().unwrap();
+            if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
+                t.enabled = enabled;
+                t.next_run = enabled.then(|| now_secs() + 60);
+            }
+        }
+        self.save_settings()
+            .await
+            .map_err(|e| format!("could not save the setting: {e}"))
     }
 
     /// Enable or disable the scheduled cleanup task to match the policy.
@@ -483,6 +518,7 @@ pub async fn check_upstreams(st: &AppState) -> Vec<UpstreamHealth> {
             reqwest::Method::HEAD,
             format!("{}/", cfg.maven_upstream),
         ),
+        ("go", reqwest::Method::HEAD, format!("{}/", cfg.go_upstream)),
     ];
     if st.store.offline() {
         // Offline mode: report each upstream as deliberately not contacted.
@@ -634,6 +670,10 @@ async fn run_task_with(st: &AppState, id: &str, sessions: Option<&SqliteSessionS
                 (Err(e), _) | (_, Err(e)) => (false, format!("Could not clean up: {e}")),
             }
         }
+        "go-vulndb" => match crate::formats::go::sync_vulndb(st).await {
+            Ok(msg) => (true, msg),
+            Err(e) => (false, format!("Could not download it: {e}")),
+        },
         "flush" => match st.store.flush_access().await {
             Ok(true) => (true, "Saved".into()),
             Ok(false) => (true, "Nothing new to save".into()),
