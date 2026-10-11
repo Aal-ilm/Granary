@@ -57,6 +57,9 @@ pub struct RunResult {
     /// Lockfiles the tools wrote: path -> contents.
     #[serde(default)]
     pub lockfiles: HashMap<String, String>,
+    /// Things that went differently than asked without failing the run.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Why a run stopped early.

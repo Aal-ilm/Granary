@@ -57,6 +57,9 @@ fn summary(t: &Template) -> Value {
         "allow_sdist": t.input.allow_sdist,
         "counts": t.input.counts(),
         "source": t.source.as_ref().map(|s| s.summary()),
+        "last_warm_warnings": t.last_warm_warnings.as_deref()
+            .and_then(|w| serde_json::from_str::<Vec<String>>(w).ok())
+            .unwrap_or_default(),
         "updated_at": t.updated_at,
         "last_warmed_at": t.last_warmed_at,
         "schedule": t.schedule,
@@ -269,6 +272,29 @@ async fn starter(
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
     let t = load(&st, id).await?;
+    let base = base_url(&st.cfg, &headers);
+    // A template made from a repo: the repo's own manifests and lockfiles at
+    // the pinned commit, instead of generated ones.
+    if let Some(source) = &t.source {
+        let zip = Starter {
+            template: &t.input,
+            manifests: super::starter::repo_manifests(&source.files),
+            lockfiles: std::collections::HashMap::new(),
+            warmed_at: None,
+            base_url: &base,
+            warmer_granary_url: &st.cfg.warmer_granary_url,
+            client_auth: st.cfg.client_auth,
+            from_repo: Some((&source.url, &source.commit)),
+        }
+        .zip()
+        .map_err(|e| {
+            AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("building the starter zip: {e}"),
+            )
+        })?;
+        return Ok(starter_response(&t, zip));
+    }
     let (lockfiles, warmed_at) = crate::jobs::last_lockfiles(&st.auth.db, id).await;
     // Maven lines without a version: the pom.xml from the last warm already
     // has them all; otherwise use the latest stable release.
@@ -298,7 +324,6 @@ async fn starter(
         versions.insert(ga, version);
     }
     let manifests = build::manifests(&t.input, &versions).map_err(AppError::bad_request)?;
-    let base = base_url(&st.cfg, &headers);
     let zip = Starter {
         template: &t.input,
         manifests,
@@ -307,6 +332,7 @@ async fn starter(
         base_url: &base,
         warmer_granary_url: &st.cfg.warmer_granary_url,
         client_auth: st.cfg.client_auth,
+        from_repo: None,
     }
     .zip()
     .map_err(|e| {
@@ -315,18 +341,23 @@ async fn starter(
             format!("building the starter zip: {e}"),
         )
     })?;
+    Ok(starter_response(&t, zip))
+}
+
+/// A starter zip as a download named after the template.
+fn starter_response(t: &Template, zip: Vec<u8>) -> Response {
     let disposition = format!(
         "attachment; filename=\"{}-starter.zip\"",
         slug(&t.input.name)
     );
-    Ok((
+    (
         [
             (header::CONTENT_TYPE, "application/zip".to_string()),
             (header::CONTENT_DISPOSITION, disposition),
         ],
         zip,
     )
-        .into_response())
+        .into_response()
 }
 
 #[derive(Deserialize)]

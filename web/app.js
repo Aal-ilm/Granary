@@ -1074,7 +1074,8 @@ async function renderTemplates({ query, isCurrent }) {
         <div class="tpl-counts">${packageCounts(t.counts)}</div>
         <div class="tpl-tags">${t.tags.map((x) => `<a class="tag" href="${tagLink(x)}">${esc(x)}</a>`).join('')}</div>
         <div class="tpl-foot">
-          <span class="muted">Last warmed ${t.last_warmed_at ? timeTag(t.last_warmed_at) : '<span>never</span>'}${t.schedule !== 'off' ? `, re-warms ${esc(t.schedule)}` : ''}</span>
+          <span class="muted">Last warmed ${t.last_warmed_at ? timeTag(t.last_warmed_at) : '<span>never</span>'}${t.schedule !== 'off' ? `, re-warms ${esc(t.schedule)}` : ''}
+            ${t.last_warm_warnings?.length ? `<span class="status warned" title="${esc(t.last_warm_warnings.join('\n'))}"><span class="dot warn"></span>${esc(plural(t.last_warm_warnings.length, 'warning'))}</span>` : ''}</span>
           <span class="page-actions">
             ${warmer.available ? `<button class="small primary admin-only" data-warm="${t.id}">Warm</button>` : ''}
             ${t.builtin ? '' : `<a class="btn small admin-only" href="#/templates/${t.id}/edit">Edit</a>`}
@@ -1216,6 +1217,7 @@ async function renderTemplate({ params, isCurrent }) {
           ${t.builtin ? '<span class="kind">Built-in</span>' : t.source ? '<span class="kind custom">From repo</span>' : '<span class="kind custom">Custom</span>'}
           ${t.tags.map((x) => `<a class="tag" href="#/templates?tag=${esc(encodeURIComponent(x))}">${esc(x)}</a>`).join('')}
           <span>Last warmed ${t.last_warmed_at ? timeTag(t.last_warmed_at) : 'never'}</span>
+          ${t.last_warm_warnings?.length ? `<span class="status"><span class="dot warn"></span>${esc(plural(t.last_warm_warnings.length, 'warning'))}</span>` : ''}
         </div>
         ${t.description ? `<p>${esc(t.description)}</p>` : ''}
       </div>
@@ -1243,10 +1245,11 @@ async function renderTemplate({ params, isCurrent }) {
     </dl>
     ${t.schedule !== 'off' && !warmer.available ? '<p class="page-note">Scheduled re-warms wait until the warmer is available.</p>' : ''}
     ${warmerNote(warmer)}
+    ${warningsBanner('The last warm finished with warnings', t.last_warm_warnings)}
     ${sections}
     ${jobs.jobs.length ? `<section><h2>Recent warm jobs</h2><div class="panel table-wrap"><table>
       <thead><tr><th>Job</th><th>Status</th><th>Queued</th><th>Newly cached</th></tr></thead>
-      <tbody>${jobs.jobs.slice(0, 5).map((j) => `<tr><td><a href="#/jobs/${j.id}">#${esc(j.id)}</a></td><td>${jobStatus(j.status)}</td><td>${timeTag(j.created_at)}</td><td class="num">${esc(jobAdded(j))}</td></tr>`).join('')}</tbody>
+      <tbody>${jobs.jobs.slice(0, 5).map((j) => `<tr><td><a href="#/jobs/${j.id}">#${esc(j.id)}</a></td><td>${jobStatus(j)}</td><td>${timeTag(j.created_at)}</td><td class="num">${esc(jobAdded(j))}</td></tr>`).join('')}</tbody>
     </table></div></section>` : ''}`);
   view().addEventListener('click', (e) => templateAction(e));
   $('#tpl-schedule')?.addEventListener('change', async (e) => {
@@ -1446,10 +1449,18 @@ const JOB_STATES = {
   failed: ['bad', 'Failed'],
   cancelled: ['', 'Cancelled'],
 };
-const jobStatus = (s) => {
-  const [dot, label] = JOB_STATES[s] || ['', s];
+/** A job's state: its status, or "Done with warnings" when it has any. */
+const jobState = (j) =>
+  j.status === 'done' && j.warnings?.length ? ['warn', 'Done with warnings'] : JOB_STATES[j.status] || ['', j.status];
+const jobStatus = (j) => {
+  const [dot, label] = jobState(j);
   return `<span class="status"><span class="dot ${dot}"></span>${esc(label)}</span>`;
 };
+/** A banner listing warnings, or nothing. */
+const warningsBanner = (title, warnings) =>
+  warnings?.length
+    ? `<div class="banner warnings"><span class="dot warn"></span><div><strong>${esc(title)}</strong><ul>${warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div></div>`
+    : '';
 const jobActive = (j) => j.status === 'queued' || j.status === 'running';
 const jobDuration = (j) => (j.started_at ? duration((j.finished_at || Date.now() / 1000) - j.started_at) : '-');
 const jobAdded = (j) =>
@@ -1485,7 +1496,7 @@ async function renderJobs({ isCurrent }) {
       (j) => `<tr>
         <td class="num">#${esc(j.id)}</td>
         <td><a href="#/jobs/${j.id}">${esc(j.title)}</a> <span class="muted">${j.kind === 'git' ? 'repo' : j.kind}</span></td>
-        <td>${jobStatus(j.status)}</td>
+        <td>${jobStatus(j)}</td>
         <td>${timeTag(j.created_at)} <span class="muted">by ${esc(j.created_by)}</span></td>
         <td class="num hide-sm">${esc(jobDuration(j))}</td>
         <td class="num">${esc(jobAdded(j))}</td>
@@ -1535,12 +1546,13 @@ async function renderJob({ params, isCurrent }) {
     <div class="crumbs"><a href="#/jobs">Jobs</a>${j.template_id ? ` <span aria-hidden="true">/</span> <a href="#/templates/${j.template_id}">Template</a>` : ''}</div>
     <div class="page-head">
       <div><h1>${esc(j.title)}</h1>
-        <div class="summary-line">${jobStatus(j.status)}<span>Job #${esc(j.id)}</span><span>Queued ${timeTag(j.created_at)} by ${esc(j.created_by)}</span></div></div>
+        <div class="summary-line">${jobStatus(j)}<span>Job #${esc(j.id)}</span><span>Queued ${timeTag(j.created_at)} by ${esc(j.created_by)}</span></div></div>
       <div class="page-actions">${jobActive(j) ? `<button class="admin-only" data-cancel-job="${j.id}">Cancel job</button>` : ''}</div>
     </div>
     ${j.message ? `<div class="banner"><span class="dot ${j.status === 'failed' ? 'bad' : ''}"></span><span>${esc(j.message[0].toUpperCase() + j.message.slice(1))}</span></div>` : ''}
+    ${warningsBanner(j.status === 'done' ? 'Done, with warnings' : 'Warnings', j.warnings)}
     <dl class="panel panel-pad tpl-facts">
-      <div><dt>Status</dt><dd>${esc(JOB_STATES[j.status]?.[1] || j.status)}</dd></div>
+      <div><dt>Status</dt><dd>${esc(jobState(j)[1])}</dd></div>
       <div><dt>Running time</dt><dd>${esc(jobDuration(j))}</dd></div>
       <div><dt>${j.kind === 'git' ? 'New repos' : 'New packages'}</dt><dd class="num">${j.new_packages == null ? '-' : esc(count(j.new_packages))}</dd></div>
       ${j.kind === 'git' ? '' : `<div><dt>New files</dt><dd class="num">${j.new_files == null ? '-' : esc(count(j.new_files))}</dd></div>`}

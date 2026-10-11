@@ -32,11 +32,12 @@ pub(super) struct Plan {
     pub lines: usize,
     pub delay: Duration,
     pub lockfiles: HashMap<String, String>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Default)]
 pub(super) struct Fake {
-    plan: Arc<Mutex<Plan>>,
+    pub plan: Arc<Mutex<Plan>>,
     pub runs: Arc<Mutex<Vec<Value>>>,
     deletes: Arc<Mutex<Vec<i64>>>,
     active: Arc<AtomicUsize>,
@@ -83,7 +84,7 @@ async fn fake_run(State(f): State<Fake>, headers: HeaderMap, body: Bytes) -> Res
     }
     let result = format!(
         "##granary {}",
-        json!({"ok": true, "lockfiles": plan.lockfiles})
+        json!({"ok": true, "lockfiles": plan.lockfiles, "warnings": plan.warnings})
     );
     let stream = futures_util::stream::unfold(
         (0usize, guard, out, plan, result),
@@ -455,6 +456,68 @@ async fn template_warm_records_results() {
         .find(|t| t["name"] == "warmer")
         .expect("warmer token listed");
     assert_eq!(warmer["system"], true);
+}
+
+async fn warm_and_wait(h: &Harness, cookie: &str, template: i64) -> Value {
+    let (_, _, out) = h
+        .send(
+            "POST",
+            &format!("/api/templates/{template}/warm"),
+            Some(cookie),
+            None,
+        )
+        .await;
+    let id = serde_json::from_slice::<Value>(&out).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    wait_for(h, cookie, id, &["done", "failed"]).await
+}
+
+#[tokio::test]
+async fn warnings_finish_a_job_as_done_with_warnings() {
+    let plan = Plan {
+        warnings: vec!["Cargo.lock in fuzz doesn't match its Cargo.toml".into()],
+        ..Plan::default()
+    };
+    let (h, fake, cookie) = with_fake(plan, Opts::default()).await;
+    let (_, _, out) = h
+        .send(
+            "POST",
+            "/api/templates",
+            Some(&cookie),
+            Some(json!({"name": "W", "npm": "\"zod\": \"latest\""})),
+        )
+        .await;
+    let tid = serde_json::from_slice::<Value>(&out).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let d = warm_and_wait(&h, &cookie, tid).await;
+    assert_eq!(d["job"]["status"], "done", "warnings don't fail the job");
+    assert_eq!(
+        d["job"]["warnings"],
+        json!(["Cargo.lock in fuzz doesn't match its Cargo.toml"])
+    );
+    let log: Vec<&str> = d["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["line"].as_str().unwrap())
+        .collect();
+    assert!(log.iter().any(|l| l.contains("1 warning")), "{log:?}");
+    let list = h.api(&cookie, "/api/jobs").await;
+    assert_eq!(list["jobs"][0]["warnings"].as_array().unwrap().len(), 1);
+    let t = h.api(&cookie, &format!("/api/templates/{tid}")).await;
+    assert_eq!(
+        t["last_warm_warnings"],
+        json!(["Cargo.lock in fuzz doesn't match its Cargo.toml"])
+    );
+
+    // A clean warm clears the template's warnings.
+    fake.plan.lock().unwrap().warnings.clear();
+    let d = warm_and_wait(&h, &cookie, tid).await;
+    assert_eq!(d["job"]["warnings"], json!([]));
+    let t = h.api(&cookie, &format!("/api/templates/{tid}")).await;
+    assert_eq!(t["last_warm_warnings"], json!([]));
 }
 
 #[tokio::test]

@@ -215,6 +215,40 @@ async fn previews_and_saves_a_workspace_repo() {
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
 
+    // The starter holds the repo's own manifests and lockfiles at their paths.
+    let (status, _, zip) = h
+        .send(
+            "GET",
+            &format!("/api/templates/{id}/starter"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(zip)).unwrap();
+    let mut names: Vec<String> = (0..z.len())
+        .map(|i| z.by_index(i).unwrap().name().unwrap().to_string())
+        .collect();
+    names.sort();
+    for want in [
+        "mono/Cargo.lock",
+        "mono/Cargo.toml",
+        "mono/crates/core/Cargo.toml",
+        "mono/web/package-lock.json",
+        "mono/web/packages/ui/package.json",
+        "mono/requirements.txt",
+        "mono/.cargo/config.toml",
+    ] {
+        assert!(names.iter().any(|n| n == want), "{want} in {names:?}");
+    }
+    let mut core = String::new();
+    std::io::Read::read_to_string(
+        &mut z.by_name("mono/crates/core/Cargo.toml").unwrap(),
+        &mut core,
+    )
+    .unwrap();
+    assert_eq!(core, CORE, "the repo's file, not a generated one");
+
     // Admins only.
     let viewer = h.viewer_login().await;
     let (status, _, _) = h
@@ -541,5 +575,172 @@ async fn real_warmer_runs_npm_ci_in_the_checkout() {
         log.iter().all(|l| !l.contains("gran_")),
         "no token in the log"
     );
+    let _ = child.kill().await;
+}
+
+/// A Cargo git dependency in a repo template's lockfile is fetched by the
+/// real warmer through Granary's git cache. Skipped without git, python3
+/// and cargo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_warmer_fetches_cargo_git_dependencies_through_granary() {
+    let have = |cmd: &str| {
+        std::process::Command::new(cmd)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if !have("git") || !have("python3") || !have("cargo") {
+        return eprintln!("skipping: git, python3 and cargo are needed");
+    }
+    let up = Upstream::start().await;
+    let dep = up.create(
+        "acme",
+        "gitdep",
+        &[
+            (
+                "Cargo.toml",
+                b"[package]\nname = \"gitdep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", b"pub fn hello() {}\n"),
+        ],
+    );
+    let sha = super::git::ok(super::git::client_git(&["rev-parse", "HEAD"], &dep))
+        .trim()
+        .to_string();
+    let lock = format!(
+        "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"gitdep\",\n]\n\n[[package]]\nname = \"gitdep\"\nversion = \"0.1.0\"\nsource = \"git+https://github.com/acme/gitdep#{sha}\"\n"
+    );
+    up.create(
+        "acme",
+        "app",
+        &[
+            (
+                "Cargo.toml",
+                b"[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ngitdep = { git = \"https://github.com/acme/gitdep\" }\n",
+            ),
+            ("Cargo.lock", lock.as_bytes()),
+            ("src/main.rs", b"fn main() { gitdep::hello() }\n"),
+        ],
+    );
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut child = tokio::process::Command::new("python3")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/warmer/warmer.py"))
+        .env("WARMER_SECRET", super::WARMER_SECRET)
+        .env("WARMER_LISTEN", format!("127.0.0.1:{port}"))
+        .env("WARMER_ALLOW_FROM", "127.0.0.1")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let h = Harness::with(Opts {
+        warmer_url: Some(format!("http://127.0.0.1:{port}")),
+        git_upstream: Some(up.url.clone()),
+        serve: true,
+        ..Opts::default()
+    })
+    .await;
+    let cookie = h.login().await;
+    let start = std::time::Instant::now();
+    while h.api(&cookie, "/api/warmer").await["available"] != true {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "warmer did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let p = preview(&h, &cookie, "https://github.com/acme/app", "").await;
+    assert_eq!(p["git_deps"][0]["url"], "https://github.com/acme/gitdep");
+    // Leave the git dependency uncached on purpose: the warm must fetch it.
+    let gitdep = h.data.join("git/github.com/acme/gitdep.git");
+    let (status, _, body) = h
+        .send(
+            "POST",
+            "/api/templates/from-repo",
+            Some(&cookie),
+            Some(json!({"url": p["url"], "commit": p["commit"], "name": "App", "platforms": ["linux-x86_64"]})),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let id = serde_json::from_slice::<Value>(&body).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    // The save queued a clone of the dependency; let it finish, then remove
+    // it, so only the warm itself can bring it back.
+    let start = std::time::Instant::now();
+    while !gitdep.exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "git dependency never cached"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (status, _, _) = h
+        .send(
+            "DELETE",
+            "/api/git/repos?host=github.com&owner=acme&name=gitdep",
+            Some(&cookie),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!gitdep.exists());
+
+    let (_, _, body) = h
+        .send(
+            "POST",
+            &format!("/api/templates/{id}/warm"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+    let job = serde_json::from_slice::<Value>(&body).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let start = std::time::Instant::now();
+    let d = loop {
+        let d = h.api(&cookie, &format!("/api/jobs/{job}")).await;
+        if ["done", "failed"].contains(&d["job"]["status"].as_str().unwrap()) {
+            break d;
+        }
+        assert!(start.elapsed() < Duration::from_secs(180), "warm job stuck");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let log: Vec<&str> = d["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["line"].as_str().unwrap())
+        .collect();
+    assert_eq!(d["job"]["status"], "done", "{log:#?}");
+    assert!(
+        log.iter().any(|l| l.contains("cargo fetch --locked")),
+        "{log:#?}"
+    );
+    let via = format!(
+        "From {}/git/github.com/acme/gitdep",
+        h.url.as_ref().unwrap()
+    );
+    assert!(
+        log.iter().any(|l| l.starts_with(&via)),
+        "git dependency fetched through Granary: {log:#?}"
+    );
+    assert!(
+        gitdep.exists(),
+        "Granary cached the git dependency again while serving the warm"
+    );
+    assert_eq!(d["job"]["warnings"], json!([]));
     let _ = child.kill().await;
 }

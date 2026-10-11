@@ -363,6 +363,9 @@ pub struct Template {
     /// Set for templates made with "New from repo".
     #[serde(skip)]
     pub source: Option<RepoSource>,
+    /// Warnings from the latest successful warm (a JSON list), if any.
+    #[serde(serialize_with = "crate::jobs::warnings_list")]
+    pub last_warm_warnings: Option<String>,
 }
 
 /// Where a "New from repo" template came from, and the files read there.
@@ -420,6 +423,7 @@ struct Row {
     last_warmed_at: Option<i64>,
     schedule: String,
     source: Option<String>,
+    last_warm_warnings: Option<String>,
 }
 
 impl From<Row> for Template {
@@ -444,17 +448,19 @@ impl From<Row> for Template {
             last_warmed_at: r.last_warmed_at,
             schedule: r.schedule,
             source: r.source.and_then(|s| serde_json::from_str(&s).ok()),
+            last_warm_warnings: r.last_warm_warnings,
         }
     }
 }
 
-const COLUMNS: &str = "id, builtin_key, name, description, tags, platforms, allow_sdist, cargo, npm, pypi, maven, created_at, updated_at, last_warmed_at, schedule, source";
+const COLUMNS: &str = "id, builtin_key, name, description, tags, platforms, allow_sdist, cargo, npm, pypi, maven, created_at, updated_at, last_warmed_at, schedule, source, last_warm_warnings";
 
 /// Columns added after templates first shipped.
 pub async fn migrate(db: &SqlitePool) -> sqlx::Result<()> {
     crate::auth::add_column(db, "templates", "schedule", "TEXT NOT NULL DEFAULT 'off'").await?;
     crate::auth::add_column(db, "templates", "schedule_queued_at", "INTEGER").await?;
-    crate::auth::add_column(db, "templates", "source", "TEXT").await
+    crate::auth::add_column(db, "templates", "source", "TEXT").await?;
+    crate::auth::add_column(db, "templates", "last_warm_warnings", "TEXT").await
 }
 
 /// Record (or replace) where a repo template came from.

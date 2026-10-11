@@ -31,6 +31,47 @@ pub struct Starter<'a> {
     /// The address the warmer used, which lockfiles may contain.
     pub warmer_granary_url: &'a str,
     pub client_auth: bool,
+    /// For a template made from a repo: its URL and the pinned commit. The
+    /// manifests are then the repo's own files at that commit.
+    pub from_repo: Option<(&'a str, &'a str)>,
+}
+
+/// Tool settings never copied from a repo, so they can't send installs
+/// somewhere other than Granary (the same files the warmer removes).
+fn is_tool_config(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let in_cargo_dir = path.split('/').rev().nth(1) == Some(".cargo");
+    matches!(
+        name,
+        ".npmrc" | ".yarnrc" | ".yarnrc.yml" | "rust-toolchain" | "rust-toolchain.toml"
+    ) || (in_cargo_dir && matches!(name, "config" | "config.toml"))
+}
+
+/// A repo template's own manifests and lockfiles, one entry per ecosystem.
+pub fn repo_manifests(files: &std::collections::BTreeMap<String, String>) -> Vec<Manifest> {
+    let mut by_eco: Vec<Manifest> = Vec::new();
+    for (path, text) in files {
+        if is_tool_config(path) {
+            continue;
+        }
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let eco = match name {
+            "Cargo.toml" | "Cargo.lock" => Eco::Cargo,
+            "package.json" | "package-lock.json" => Eco::Npm,
+            "pyproject.toml" => Eco::Pypi,
+            n if n.starts_with("requirements") && n.ends_with(".txt") => Eco::Pypi,
+            "pom.xml" | "build.gradle" | "build.gradle.kts" => Eco::Maven,
+            _ => continue,
+        };
+        match by_eco.iter_mut().find(|m| m.eco == eco) {
+            Some(m) => m.files.push((path.clone(), text.clone())),
+            None => by_eco.push(Manifest {
+                eco,
+                files: vec![(path.clone(), text.clone())],
+            }),
+        }
+    }
+    by_eco
 }
 
 impl Starter<'_> {
@@ -45,7 +86,13 @@ impl Starter<'_> {
                 let warmed = locks
                     .and_then(|l| l.get(path))
                     .filter(|_| m.eco == Eco::Maven);
-                out.push((path.clone(), warmed.unwrap_or(text).clone()));
+                let text = warmed.unwrap_or(text);
+                let text = if path.ends_with("package-lock.json") {
+                    self.portable_npm_lock(text)
+                } else {
+                    text.clone()
+                };
+                out.push((path.clone(), text));
             }
             if let Some(locks) = locks {
                 for (path, text) in locks {
@@ -168,10 +215,15 @@ impl Starter<'_> {
             base = self.base_url,
             used = used.join(", "),
         );
-        s.push_str(match self.warmed_at {
-            Some(_) => "The lockfiles come from the template's last successful warm, so they\nlist versions Granary already has cached.\n\n",
-            None => "The template has not been warmed yet, so there are no lockfiles; the\npackage tools will pick versions when you first install.\n\n",
-        });
+        match self.from_repo {
+            Some((url, commit)) => s.push_str(&format!(
+                "The manifests and lockfiles are the repo's own, from {url} at commit\n{commit}. Tool settings from the repo (.npmrc, .cargo/config.toml,\nrust-toolchain.toml) are left out; Granary's client configuration is added.\n\n"
+            )),
+            None => s.push_str(match self.warmed_at {
+                Some(_) => "The lockfiles come from the template's last successful warm, so they\nlist versions Granary already has cached.\n\n",
+                None => "The template has not been warmed yet, so there are no lockfiles; the\npackage tools will pick versions when you first install.\n\n",
+            }),
+        }
         if self.client_auth {
             s.push_str(&format!(
                 "ACCESS TOKEN\n\nThis zip contains no access token. Create one in Granary under Access\ntokens, then either:\n\n  * run `make use-granary GRANARY_URL={}` from Granary's source folder,\n    which sets up Cargo, npm, pip, Maven and Gradle for your user, or\n  * set GRANARY_TOKEN to the token in your shell. The project's .npmrc and\n    .mvn/settings.xml read it from there. For Cargo also set\n    CARGO_REGISTRIES_GRANARY_TOKEN, and for pip set PIP_INDEX_URL as\n    pip.conf explains.\n\n",
@@ -181,6 +233,13 @@ impl Starter<'_> {
             s.push_str("This Granary doesn't need an access token for downloads.\n\n");
         }
         s.push_str("FILES\n\n");
+        if self.from_repo.is_some() {
+            for m in &self.manifests {
+                let paths: Vec<&str> = m.files.iter().map(|(p, _)| p.as_str()).collect();
+                s.push_str(&format!("  {}: {}\n", m.eco.label(), paths.join(", ")));
+            }
+            return s;
+        }
         for m in &self.manifests {
             let line = match m.eco {
                 Eco::Cargo => {
@@ -246,6 +305,80 @@ mod tests {
         }
     }
 
+    #[test]
+    fn repo_starters_use_the_repo_files() {
+        let t = template();
+        let files: std::collections::BTreeMap<String, String> = [
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+            ("Cargo.lock", "version = 4\n"),
+            ("crates/core/Cargo.toml", "[package]\nname = \"core\"\n"),
+            ("web/package.json", "{}"),
+            (
+                "web/package-lock.json",
+                r#"{"resolved":"http://granary:8080/npm/x/-/x-1.tgz"}"#,
+            ),
+            ("web/.npmrc", "registry=http://evil.invalid/\n"),
+            (
+                "rust-toolchain.toml",
+                "[toolchain]\nchannel = \"nightly\"\n",
+            ),
+            ("requirements.txt", "httpx\n"),
+        ]
+        .into_iter()
+        .map(|(p, t)| (p.to_string(), t.to_string()))
+        .collect();
+        let s = Starter {
+            template: &t,
+            manifests: repo_manifests(&files),
+            lockfiles: HashMap::new(),
+            warmed_at: None,
+            base_url: "https://granary.lan",
+            warmer_granary_url: "http://granary:8080",
+            client_auth: true,
+            from_repo: Some((
+                "https://github.com/acme/mono",
+                "0123456789abcdef0123456789abcdef01234567",
+            )),
+        };
+        let out = unzip(&s.zip().unwrap());
+        let mut names: Vec<&str> = out.keys().map(String::as_str).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "team-service/.cargo/config.toml",
+                "team-service/.npmrc",
+                "team-service/Cargo.lock",
+                "team-service/Cargo.toml",
+                "team-service/README.txt",
+                "team-service/crates/core/Cargo.toml",
+                "team-service/pip.conf",
+                "team-service/requirements.txt",
+                "team-service/web/package-lock.json",
+                "team-service/web/package.json",
+            ],
+            "the repo's files at their paths, without its tool settings"
+        );
+        assert_eq!(
+            out["team-service/Cargo.toml"],
+            "[workspace]\nmembers = [\"crates/*\"]\n"
+        );
+        assert!(
+            out["team-service/web/package-lock.json"]
+                .contains("https://registry.npmjs.org/x/-/x-1.tgz")
+        );
+        assert!(
+            !out.values()
+                .any(|v| v.contains("evil.invalid") || v.contains("nightly"))
+        );
+        let readme = &out["team-service/README.txt"];
+        assert!(readme.contains("github.com/acme/mono at commit"));
+        assert!(
+            readme.contains("web/package-lock.json, web/package.json"),
+            "{readme}"
+        );
+    }
+
     fn starter<'a>(t: &'a TemplateInput, auth: bool, locks: bool) -> Starter<'a> {
         let versions = HashMap::from([(
             "com.google.guava:guava".to_string(),
@@ -280,6 +413,7 @@ mod tests {
             base_url: "https://granary.lan",
             warmer_granary_url: "http://granary:8080",
             client_auth: auth,
+            from_repo: None,
         }
     }
 

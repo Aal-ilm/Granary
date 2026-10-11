@@ -1274,3 +1274,11 @@ dialog .line-errors { color: var(--muted); max-height: 160px; overflow: auto; }
 #repo-form input[type="text"], #repo-save-form input[type="text"] { width: 100%; max-width: 560px; }
 #repo-save-form { margin-top: 18px; }
 #repo-preview details.setup { margin-top: 8px; }
+
+/* ---------------------------------------------------------- warnings */
+
+.banner.warnings { align-items: flex-start; }
+.banner.warnings .dot { margin-top: 6px; }
+.banner.warnings ul { margin: 4px 0 0; padding-left: 18px; }
+.banner.warnings li + li { margin-top: 2px; }
+.status.warned { margin-left: 8px; color: var(--ink); cursor: help; }

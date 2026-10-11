@@ -363,9 +363,13 @@ Granary's git cache (never from upstream) and runs `cargo fetch --locked`
 or `npm ci --ignore-scripts` (once per platform) in each lockfile's folder.
 Tool settings in the repo (`.cargo/config.toml`, `.npmrc`,
 `rust-toolchain.toml`) are removed from the checkout first, so they can't
-send downloads elsewhere. A lockfile that no longer matches its manifest is
-reported in the log and installed without it. Ecosystems without a lockfile
-are warmed from the template's lines as usual.
+send downloads elsewhere. A lockfile that no longer matches its manifest
+(common for fuzz targets and examples) is installed without it, caching the
+newest matching versions instead; the job then finishes as **done with
+warnings**, shown on the job page and on the template's card and page.
+Ecosystems without a lockfile are warmed from the template's lines as usual,
+and a repo whose lockfiles carry everything (for example, only git
+dependencies) can be saved with no package lines at all.
 
 **Resync from repo** on a repo template reads the repo again (a branch
 moves to its newest commit) and, after the same preview, replaces the
@@ -388,6 +392,11 @@ up to install through your Granary:
   crates.io source replacement, a project `.npmrc` with the registry line,
   a `pip.conf` snippet, and `.mvn/settings.xml` with `.mvn/maven.config`
 - `README.txt`
+
+For a [template made from a repo](#templates-from-repos), the starter holds
+the repo's own manifests and lockfiles at their paths, as read at the
+template's commit, instead of generated ones; the repo's own tool settings
+are left out and Granary's client configuration is added.
 
 The zip never contains a token. `.npmrc` and `.mvn/settings.xml` read it
 from the `GRANARY_TOKEN` environment variable, and README.txt explains how

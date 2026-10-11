@@ -102,6 +102,12 @@ class Job:
         self.secrets = [s for s in secrets if s]
         self.proc = None
         self.cancelled = False
+        # Things that went differently than asked but didn't fail the run.
+        self.warnings = []
+
+    def warn(self, message):
+        self.warnings.append(message)
+        self.emit(message)
 
     def mask(self, text):
         for s in self.secrets:
@@ -265,7 +271,8 @@ def warm_cargo(job, req, d, env):
         # A lockfile that's out of date with its manifests (common for fuzz
         # targets and examples) can't be used as it is; cache the newest
         # matching versions instead of failing.
-        job.emit("Cargo.lock doesn't match its Cargo.toml, so the newest matching versions are fetched instead.")
+        rel = req["repo"]["dir"] or "the repo root"
+        job.warn(f"Cargo.lock in {rel} doesn't match its Cargo.toml, so the newest matching versions were cached instead of the locked ones.")
         return job.run(["cargo", "fetch"], folder, env), {}
     ok = job.run(["cargo", "generate-lockfile"], d, env) and job.run(["cargo", "fetch"], d, env)
     return ok, lockfiles(d, ["Cargo.lock"])
@@ -292,7 +299,10 @@ def warm_npm(job, req, d, env):
             if job.run(["npm", "ci"] + flags, folder, env):
                 continue
             # npm ci refuses a lockfile that's out of step with package.json.
-            job.emit("package-lock.json doesn't match package.json, so npm install picks the versions instead.")
+            rel = req["repo"]["dir"] or "the repo root"
+            note = f"package-lock.json in {rel} doesn't match package.json, so npm install picked the versions instead of the locked ones."
+            if note not in job.warnings:
+                job.warn(note)
             ok = job.run(["npm", "install"] + flags, folder, env) and ok
         return ok, {}
     ok = True
@@ -449,8 +459,8 @@ def run_job(req, emit):
         )
         ok, locks = WARMERS[req["ecosystem"]](job, req, d, env)
         if ok:
-            return {"ok": True, "lockfiles": locks}
-        return {"ok": False, "error": "a tool exited with an error; see the log above", "lockfiles": locks}
+            return {"ok": True, "lockfiles": locks, "warnings": job.warnings}
+        return {"ok": False, "error": "a tool exited with an error; see the log above", "lockfiles": locks, "warnings": job.warnings}
     except Cancelled:
         return {"ok": False, "error": "cancelled"}
     finally:

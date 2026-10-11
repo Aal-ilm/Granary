@@ -108,6 +108,9 @@ struct Outcome {
     status: Status,
     message: Option<String>,
     lockfiles: HashMap<String, HashMap<String, String>>,
+    /// What went differently than asked without failing the job, such as a
+    /// lockfile that had to be installed without being used as it was.
+    warnings: Vec<String>,
 }
 
 impl Outcome {
@@ -116,8 +119,18 @@ impl Outcome {
             status: Status::Failed,
             message: Some(message.into()),
             lockfiles: HashMap::new(),
+            warnings: Vec::new(),
         }
     }
+}
+
+/// Stored warnings (a JSON list in a text column) as a list in responses.
+pub fn warnings_list<S: serde::Serializer>(v: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
+    let list: Vec<String> = v
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+    s.collect_seq(list)
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -135,9 +148,11 @@ pub struct JobRow {
     pub new_packages: Option<i64>,
     pub new_files: Option<i64>,
     pub new_bytes: Option<i64>,
+    #[serde(serialize_with = "warnings_list")]
+    pub warnings: Option<String>,
 }
 
-pub const JOB_COLUMNS: &str = "id, kind, template_id, title, status, message, created_by, created_at, started_at, finished_at, new_packages, new_files, new_bytes";
+pub const JOB_COLUMNS: &str = "id, kind, template_id, title, status, message, created_by, created_at, started_at, finished_at, new_packages, new_files, new_bytes, warnings";
 
 /// Queue a job. Returns its id.
 /// What a warm job installs: a template, and for templates made from a
@@ -449,8 +464,20 @@ async fn run(st: &AppState, id: i64, cancel: CancellationToken) {
 
     let lockfiles =
         (!outcome.lockfiles.is_empty()).then(|| serde_json::to_string(&outcome.lockfiles).unwrap());
+    let warnings =
+        (!outcome.warnings.is_empty()).then(|| serde_json::to_string(&outcome.warnings).unwrap());
+    if !outcome.warnings.is_empty() {
+        log.push(
+            db,
+            &format!(
+                "Finished with {} warning(s); see above.",
+                outcome.warnings.len()
+            ),
+        )
+        .await;
+    }
     let _ = sqlx::query(
-        "UPDATE jobs SET status = ?, message = ?, finished_at = ?, new_packages = ?, new_files = ?, new_bytes = ?, lockfiles = ?
+        "UPDATE jobs SET status = ?, message = ?, finished_at = ?, new_packages = ?, new_files = ?, new_bytes = ?, lockfiles = ?, warnings = ?
          WHERE id = ?",
     )
     .bind(outcome.status.as_str())
@@ -460,14 +487,18 @@ async fn run(st: &AppState, id: i64, cancel: CancellationToken) {
     .bind(new.len() as i64)
     .bind(bytes as i64)
     .bind(lockfiles)
+    .bind(&warnings)
     .bind(id)
     .execute(db)
     .await;
     if outcome.status == Status::Done {
+        // The template card shows the latest warm's warnings, or none.
         let _ = sqlx::query(
-            "UPDATE templates SET last_warmed_at = ? WHERE id = (SELECT template_id FROM jobs WHERE id = ? AND kind = 'template')",
+            "UPDATE templates SET last_warmed_at = ?, last_warm_warnings = ?
+             WHERE id = (SELECT template_id FROM jobs WHERE id = ? AND kind = 'template')",
         )
         .bind(now_secs() as i64)
+        .bind(&warnings)
         .bind(id)
         .execute(db)
         .await;
@@ -602,6 +633,7 @@ async fn run_inner(
     let deadline = tokio::time::Instant::now() + st.cfg.warm_timeout;
     let mut lockfiles = HashMap::new();
     let mut failures = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     for step in steps {
         let eco = step.eco();
         let label = step.label();
@@ -630,11 +662,13 @@ async fn run_inner(
         };
         match warmer::run(st, &req, log, cancel, deadline, budget).await {
             Ok(r) if r.ok => {
+                warnings.extend(r.warnings);
                 let mut locks = r.lockfiles;
                 locks.extend(warmed_pom);
                 lockfiles.insert(eco.as_str().to_string(), locks);
             }
             Ok(r) => {
+                warnings.extend(r.warnings.clone());
                 let why = r
                     .error
                     .unwrap_or_else(|| "the tools reported an error".into());
@@ -646,6 +680,7 @@ async fn run_inner(
                     status: Status::Cancelled,
                     message: Some("Cancelled while running".into()),
                     lockfiles: HashMap::new(),
+                    warnings,
                 };
             }
             Err(warmer::Stop::Timeout) => {
@@ -671,12 +706,14 @@ async fn run_inner(
             status: Status::Done,
             message: None,
             lockfiles,
+            warnings,
         }
     } else {
         Outcome {
             status: Status::Failed,
             message: Some(failures.join("; ")),
             lockfiles,
+            warnings,
         }
     }
 }
@@ -905,6 +942,13 @@ async fn finish_git(
 /// can't change a CHECK constraint in place, so the table is rebuilt with
 /// every job kept. Foreign keys are off meanwhile so job logs survive.
 pub async fn migrate(db: &SqlitePool) -> sqlx::Result<()> {
+    allow_git_jobs(db).await?;
+    // Added after the rebuild above, which copies columns by position from
+    // older databases.
+    crate::auth::add_column(db, "jobs", "warnings", "TEXT").await
+}
+
+async fn allow_git_jobs(db: &SqlitePool) -> sqlx::Result<()> {
     let sql: Option<(String,)> =
         sqlx::query_as("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'jobs'")
             .fetch_optional(db)
