@@ -220,7 +220,7 @@ impl MockGitea {
 
 /// A test CA (its PEM) and a server config with a certificate it signed
 /// for localhost.
-fn test_tls() -> (String, Arc<rustls::ServerConfig>) {
+pub(super) fn test_tls() -> (String, Arc<rustls::ServerConfig>) {
     use rcgen::{
         BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose, SanType,
     };

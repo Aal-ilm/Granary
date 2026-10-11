@@ -9,6 +9,8 @@ mod error;
 mod formats;
 mod gitea;
 mod gomod;
+mod goprivate;
+mod gozip;
 mod inventory;
 mod jobs;
 mod logbuf;
@@ -52,6 +54,7 @@ pub struct AppState {
     pub policy: Arc<policy::Policy>,
     pub gitea: Arc<gitea::Gitea>,
     pub namespaces: Arc<namespaces::Namespaces>,
+    pub goprivate: Arc<goprivate::GoPrivate>,
 }
 
 pub fn app(state: AppState, sessions: SqliteSessionStore) -> Router {
@@ -142,11 +145,56 @@ fn main() -> anyhow::Result<()> {
                 disable_2fa,
             ))
         }
+        Some("go-unpin") => {
+            let (Some(module), Some(version)) = (args.get(2), args.get(3)) else {
+                anyhow::bail!("usage: granary go-unpin <module> <version>");
+            };
+            let cfg = Config::from_env()?;
+            tokio::runtime::Runtime::new()?.block_on(go_unpin(&cfg, module, version))
+        }
         Some(other) => anyhow::bail!(
-            "unknown command {other:?}. Commands: healthcheck, reset-password <username> [--disable-2fa]"
+            "unknown command {other:?}. Commands: healthcheck, reset-password <username> [--disable-2fa], go-unpin <module> <version>"
         ),
         None => run(),
     }
+}
+
+/// `granary go-unpin <module> <version>`: forget the hashes pinned for a
+/// private Go module version that was republished on purpose, and remove
+/// its cached files, so the next download pins what the source has now.
+async fn go_unpin(cfg: &Config, module: &str, version: &str) -> anyhow::Result<()> {
+    let db = auth::open_db(&cfg.data_dir).await?;
+    let removed = goprivate::unpin(&db, module, version).await?;
+    let (m, v) = (gomod::escape(module), gomod::escape(version));
+    let root = cfg.data_dir.join("files/go-private");
+    let mut files = 0;
+    if let Ok(mut sources) = tokio::fs::read_dir(&root).await {
+        while let Ok(Some(source)) = sources.next_entry().await {
+            for ext in ["", ".mod", ".info"] {
+                let path = source.path().join(format!("{m}/@v/{v}{ext}"));
+                if tokio::fs::remove_file(&path).await.is_ok() {
+                    files += 1;
+                }
+            }
+        }
+    }
+    audit::record(
+        &db,
+        "cli",
+        "go.unpin",
+        &format!("{module}@{version} ({removed} pins, {files} cached files)"),
+        None,
+        true,
+    )
+    .await;
+    if removed == 0 && files == 0 {
+        println!("Nothing was pinned or cached for {module}@{version}.");
+    } else {
+        println!(
+            "Forgot {removed} pinned hash(es) and removed {files} cached file(s) for {module}@{version}. The next download pins what its source has now."
+        );
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -200,6 +248,7 @@ async fn run() -> anyhow::Result<()> {
     let policy = policy::Policy::load(&db, cfg.private_access).await?;
     let namespaces =
         namespaces::Namespaces::load(&db, cfg.gitea.is_some(), &cfg.namespace_env).await?;
+    let goprivate = goprivate::GoPrivate::load(&db, cfg.go_private_env.clone()).await?;
     let backend = Backend::new(db).await?;
     tracing::info!(
         data_dir = %store.root().display(),
@@ -251,6 +300,7 @@ async fn run() -> anyhow::Result<()> {
         auth: backend,
         policy: Arc::new(policy),
         namespaces: Arc::new(namespaces),
+        goprivate: Arc::new(goprivate),
     };
     {
         let st = state.clone();

@@ -588,9 +588,12 @@ git_status() {
 
 # ---------------------------------------------------------------------- go
 
-# Go reads tokens from ~/.netrc, by host name, and only sends them over
-# HTTPS: over plain HTTP it refuses to send credentials at all.
-go_host() { printf '%s' "$URL" | sed -E 's#^[a-z]+://##; s#[/:].*$##'; }
+# Go reads tokens from ~/.netrc and only sends them over HTTPS: over plain
+# HTTP it refuses to send credentials at all. Go 1.24 and later look the
+# machine up as host:port when the address has a port; earlier versions use
+# the host name alone. Both forms are written.
+go_hostport() { printf '%s' "$URL" | sed -E 's#^[a-z]+://##; s#/.*$##'; }
+go_host() { go_hostport | sed -E 's#:[0-9]+$##'; }
 
 go_forget_token() {
   [ -f "$NETRC_FILE" ] && strip_block "$NETRC_FILE" "$NETRC_BEGIN" "$NETRC_END"
@@ -606,6 +609,15 @@ go_use_granary() {
     go env -w GONOPROXY=none
     warn "go: GOPRIVATE is set, so GONOPROXY is set to 'none' to keep private modules going through Granary"
   fi
+  # Private modules aren't in the public checksum database. Granary lists
+  # their prefixes to tokens with private access (only over HTTPS, where Go
+  # can send the token at all).
+  local private
+  private="$(curl -fsS -m 5 -H "Authorization: Bearer $TOKEN" "$URL/go/private-prefixes" 2>/dev/null | tr '\n' ',' | sed 's/,$//' || true)"
+  if [ -n "$private" ]; then
+    go env -w "GONOSUMDB=$private"
+    info "go: GONOSUMDB set to $private"
+  fi
   case "$URL" in
     https://*)
       backup "$NETRC_FILE"
@@ -613,7 +625,11 @@ go_use_granary() {
       (umask 077 && touch "$NETRC_FILE")
       {
         [ -s "$NETRC_FILE" ] && printf '\n'
-        printf '%s\nmachine %s login token password %s\n%s\n' "$NETRC_BEGIN" "$(go_host)" "$TOKEN" "$NETRC_END"
+        printf '%s\n' "$NETRC_BEGIN"
+        if [ "$(go_hostport)" != "$(go_host)" ]; then
+          printf 'machine %s login token password %s\n' "$(go_hostport)" "$TOKEN"
+        fi
+        printf 'machine %s login token password %s\n%s\n' "$(go_host)" "$TOKEN" "$NETRC_END"
       } >>"$NETRC_FILE"
       chmod 600 "$NETRC_FILE"
       ok "go   -> $URL/go (token in $NETRC_FILE)"
@@ -645,6 +661,7 @@ go_use_public() {
 go_remove() {
   has go || return 0
   go_unset
+  if [ -f "$(go env GOENV)" ]; then go env -u GONOSUMDB; fi
   go_forget_token
   ok "go: Granary proxy and token removed"
 }

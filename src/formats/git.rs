@@ -682,6 +682,76 @@ pub fn valid_ref(r: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
 }
 
+/// Run a read-only git command in a cached repo. `None` when git exits
+/// with an error (an unknown revision, a missing file).
+pub async fn out(st: &AppState, id: &RepoId, args: &[&str]) -> AppResult<Option<Vec<u8>>> {
+    git_out(st, id, args).await
+}
+
+/// A file's bytes at a commit, if it exists and is at most `max` bytes.
+pub async fn read_blob(
+    st: &AppState,
+    id: &RepoId,
+    commit: &str,
+    path: &str,
+    max: u64,
+) -> AppResult<Option<Vec<u8>>> {
+    let object = format!("{commit}:{path}");
+    let Some(size) = git_out(st, id, &["cat-file", "-s", "--end-of-options", &object]).await?
+    else {
+        return Ok(None);
+    };
+    let size: u64 = String::from_utf8_lossy(&size)
+        .trim()
+        .parse()
+        .unwrap_or(u64::MAX);
+    if size > max {
+        return Ok(None);
+    }
+    git_out(st, id, &["cat-file", "blob", "--end-of-options", &object]).await
+}
+
+/// `git archive` of a commit as a zip at `dest`, the way the go command
+/// asks for one: every entry under `prefix/`, only `subdir` when given, and
+/// line endings as committed. Like the go command, it first switches off
+/// `export-subst` and `export-ignore` in the repo's `info/attributes`, so a
+/// `.gitattributes` file can't change what a version contains.
+pub async fn archive_zip(
+    st: &AppState,
+    id: &RepoId,
+    commit: &str,
+    subdir: &str,
+    dest: &Path,
+) -> AppResult<bool> {
+    const ATTRIBUTES: &str = "\n* -export-subst -export-ignore\n";
+    let info = id.dir(st).join("info");
+    let attributes = info.join("attributes");
+    let current = tokio::fs::read_to_string(&attributes)
+        .await
+        .unwrap_or_default();
+    if !current.contains(ATTRIBUTES.trim()) {
+        tokio::fs::create_dir_all(&info).await?;
+        tokio::fs::write(&attributes, format!("{current}{ATTRIBUTES}")).await?;
+    }
+    let mut cmd = git(st);
+    cmd.arg("-C")
+        .arg(id.dir(st))
+        .args(["-c", "core.autocrlf=input", "-c", "core.eol=lf"])
+        .args(["archive", "--format=zip", "--prefix=prefix/", "-o"])
+        .arg(dest)
+        .arg(commit);
+    if !subdir.is_empty() {
+        cmd.arg("--").arg(subdir);
+    }
+    let out = cmd.output().await.map_err(|e| {
+        AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not run git: {e}"),
+        )
+    })?;
+    Ok(out.status.success())
+}
+
 async fn git_out(st: &AppState, id: &RepoId, args: &[&str]) -> AppResult<Option<Vec<u8>>> {
     let out = git(st)
         .arg("-C")

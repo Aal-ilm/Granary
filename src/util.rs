@@ -128,6 +128,7 @@ pub mod tests {
             go_sumdb_key: crate::sumdb::Verifier::parse(crate::sumdb::SUM_GOLANG_ORG_KEY).unwrap(),
             go_vulndb: "https://vuln.go.dev".into(),
             go_allow_unverified: false,
+            go_private_env: None,
             cache_limit: None,
             gitea: None,
             extra_ca: None,

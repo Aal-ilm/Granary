@@ -46,6 +46,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/system/gitea/check", post(gitea_check))
         .route("/api/system/private-access", put(set_private_access))
         .route("/api/system/gitea/namespaces", put(set_namespaces))
+        .route("/api/system/go-private", put(set_go_private))
         .route("/api/logs", get(logs))
 }
 
@@ -201,6 +202,12 @@ async fn repos(State(st): State<AppState>, who: Principal, headers: HeaderMap) -
     let auth = st.cfg.client_auth;
     let (inv, _) = visible(&st, &who).await;
     let usage = usage(&st, &inv).await;
+    // Private Go module prefixes, for GONOSUMDB, to those who may read them.
+    let go_nosumdb = if st.policy.has_private_access(&who) {
+        st.goprivate.patterns().join(",")
+    } else {
+        String::new()
+    };
     // The private Cargo registry, for those who may use it.
     let private_cargo = st.namespaces.cargo_owner().is_some_and(|owner| {
         st.policy.can_read_private(
@@ -276,7 +283,7 @@ async fn repos(State(st): State<AppState>, who: Principal, headers: HeaderMap) -
                         json!({"label": "Checksum database", "url": cfg.go_sumdb}),
                         json!({"label": "Vulnerability database", "url": cfg.go_vulndb}),
                     ],
-                    go_setup(&base, &host, &scheme, auth),
+                    go_setup(&base, &host, &scheme, auth, &go_nosumdb),
                 ),
                 _ => (
                     "pypi.org",
@@ -498,10 +505,26 @@ pub fn version_cmp(a: &str, b: &str) -> Ordering {
     }
 }
 
+/// netrc lines for Go. Go 1.24 and later look a machine up as `host:port`
+/// when the address has a port; earlier versions use the host name alone.
+fn netrc_lines(host: &str) -> String {
+    let line = |machine: &str| format!("machine {machine} login token password YOUR_TOKEN");
+    match host.rsplit_once(':') {
+        Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) && !name.ends_with(']') => {
+            format!("{}\n{}", line(host), line(name))
+        }
+        _ => line(host),
+    }
+}
+
 /// Go client setup. `go` sends tokens only over HTTPS, so with tokens
 /// required and Granary on plain HTTP, the setup says so instead.
-fn go_setup(base: &str, host: &str, scheme: &str, auth: bool) -> Value {
-    let snippet = format!("go env -w GOPROXY={base}/go GONOPROXY=\ngo env -u GOPRIVATE");
+fn go_setup(base: &str, host: &str, scheme: &str, auth: bool, nosumdb: &str) -> Value {
+    let mut snippet = format!("go env -w GOPROXY={base}/go GONOPROXY=\ngo env -u GOPRIVATE");
+    if !nosumdb.is_empty() {
+        // Private modules aren't in the public checksum database.
+        snippet.push_str(&format!("\ngo env -w GONOSUMDB={nosumdb}"));
+    }
     let vuln = json!({
         "label": "vulnerability checks",
         "file": "your shell",
@@ -514,7 +537,7 @@ fn go_setup(base: &str, host: &str, scheme: &str, auth: bool) -> Value {
             "snippet": snippet,
             "after": "Go reads the token from ~/.netrc (below).",
             "more": [
-                {"label": "token", "file": "~/.netrc (mode 600)", "snippet": format!("machine {host} login token password YOUR_TOKEN")},
+                {"label": "token", "file": "~/.netrc (mode 600)", "snippet": netrc_lines(host)},
                 vuln,
             ],
         }),
@@ -897,6 +920,11 @@ async fn system(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
             {"key": "GRANARY_GO_SUMDB", "label": "Go checksum database", "value": format!("{} ({})", cfg.go_sumdb, cfg.go_sumdb_key.name)},
             {"key": "GRANARY_GO_ALLOW_UNVERIFIED", "label": "Go modules without a checksum record", "value": if cfg.go_allow_unverified { "Served unverified" } else { "Refused" }},
             {"key": "GRANARY_GO_VULNDB", "label": "Go vulnerability database", "value": cfg.go_vulndb},
+            {"key": "GRANARY_GO_PRIVATE", "label": "Go private modules", "value": match &cfg.go_private_env {
+                Some(rules) if rules.is_empty() => "None (set here)".to_string(),
+                Some(rules) => rules.iter().map(|r| format!("{}={}", r.pattern, r.source.label())).collect::<Vec<_>>().join(", "),
+                None => "Not set (chosen on this page)".to_string(),
+            }},
             {"key": "GRANARY_GITEA_URL", "label": "Gitea", "value": cfg.gitea.as_ref().map_or("Not connected", |g| g.url.as_str())},
             {"key": "GRANARY_PRIVATE_ACCESS", "label": "Private access", "value": match cfg.private_access {
                 Some(m) => format!("{}: {}", m.as_str(), m.describe()),
@@ -912,7 +940,92 @@ async fn system(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
             "namespaces": namespaces_json(&st),
         })),
         "private_access": private_access_json(&st),
+        "go_private": go_private_json(&st),
     }))
+}
+
+fn go_private_json(st: &AppState) -> Value {
+    let rules: Vec<Value> = st
+        .goprivate
+        .rules()
+        .iter()
+        .map(|r| json!({"pattern": r.pattern, "source": r.source.label()}))
+        .collect();
+    // Gitea has had a Go registry since 1.20.
+    let gitea_registry = st.gitea.status().and_then(|s| s.version).map(|v| {
+        let mut parts = v.split('.').map(|p| {
+            p.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<u64>()
+                .unwrap_or(0)
+        });
+        (parts.next().unwrap_or(0), parts.next().unwrap_or(0)) >= (1, 20)
+    });
+    json!({
+        "rules": rules,
+        "locked": st.goprivate.locked(),
+        "env": crate::goprivate::ENV,
+        "gitea": st.cfg.gitea.is_some(),
+        "gitea_registry": gitea_registry,
+    })
+}
+
+#[derive(Deserialize)]
+struct GoPrivateRule {
+    pattern: String,
+    #[serde(default)]
+    source: String,
+}
+
+#[derive(Deserialize)]
+struct GoPrivateBody {
+    rules: Vec<GoPrivateRule>,
+}
+
+/// Replace the private Go module prefixes, unless the environment sets them.
+async fn set_go_private(
+    State(st): State<AppState>,
+    auth: AuthSession,
+    Extension(ip): Extension<ClientIp>,
+    Json(body): Json<GoPrivateBody>,
+) -> AppResult<Json<Value>> {
+    let admin = require_admin(&auth)?.username.clone();
+    let locked = st.goprivate.locked();
+    let mut rules = Vec::new();
+    for r in body.rules {
+        rules.push(crate::goprivate::Rule {
+            pattern: r.pattern,
+            source: crate::goprivate::Source::parse(&r.source).map_err(AppError::bad_request)?,
+        });
+    }
+    st.goprivate.set(&st.auth.db, rules).await.map_err(|e| {
+        AppError::new(
+            if locked {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            e,
+        )
+    })?;
+    let summary: Vec<String> = st
+        .goprivate
+        .rules()
+        .iter()
+        .map(|r| format!("{}={}", r.pattern, r.source.label()))
+        .collect();
+    tracing::info!(
+        "{admin} set the private Go module prefixes: {}",
+        if summary.is_empty() {
+            "none".to_string()
+        } else {
+            summary.join(", ")
+        }
+    );
+    audit(&st, &admin, "system.go_private", &summary.join(", "), ip).await;
+    st.admin.invalidate_inventory();
+    Ok(Json(go_private_json(&st)))
 }
 
 fn private_access_json(st: &AppState) -> Value {

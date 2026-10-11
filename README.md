@@ -200,6 +200,10 @@ go env -u GOPRIVATE
 printf 'machine HOST login token password TOKEN\n' >> ~/.netrc   # mode 600
 ```
 
+If Granary's address has a port, add a second line with `machine HOST:PORT`:
+Go 1.24 and later look the machine up with its port, earlier versions
+without.
+
 - `GOPROXY` names Granary alone, without `,direct`, so a module Granary
   doesn't have is never fetched from anywhere else.
 - `GONOPROXY` must be empty so that every module comes through Granary.
@@ -250,6 +254,76 @@ checks work offline too.
 
 **Offline mode** serves everything cached, however old: modules, checksum
 database records, tiles and tree heads, and vulnerability reports.
+
+### Private Go modules
+
+Modules of your own come through the same proxy, from your own sources
+only. Under **System → Go private modules**, list the module path prefixes
+that are private, in the syntax of `GONOSUMDB` (Go's `path.Match` globs,
+matched against a path's leading elements), each with its source:
+
+| Source | Modules come from |
+|---|---|
+| `git` (the default) | The repository the path names: its first three elements are `host/owner/repo`, the rest is the module's directory. The host must be an allowed git host, such as your Gitea |
+| `git:<host>/<owner>` | The same, for a vanity prefix: `go.example.com=git:gitea.example.lan/acme` reads `go.example.com/tool` from `gitea.example.lan/acme/tool` |
+| `gitea:<owner>` | Gitea's Go registry for that owner (Gitea 1.20 and later) |
+
+`GRANARY_GO_PRIVATE` sets the list instead (`pattern[=source],...`) and
+locks it on the System page.
+
+**The rule.** A module matching a private prefix is only ever served from
+its source. It is never fetched from proxy.golang.org, and nothing about
+it is sent to the checksum database: a checksum lookup for it is answered
+with a 404 that says to add the prefix to `GONOSUMDB`. A version its source
+doesn't have is a 404. In the other direction, a module matching no prefix
+never reaches a private source. Private modules follow
+[private access](#private-access) on every request, cached or not and
+offline too, are cached apart from public ones (`go-private/`), and carry
+the **Private** badge in Browse.
+
+**Client setup.** Add the prefixes to `GONOSUMDB`, so `go` doesn't ask the
+public checksum database about them, and keep `GOPRIVATE` unset so they
+still come through Granary:
+
+```sh
+go env -w GONOSUMDB=gitea.example.lan,go.example.com
+```
+
+`make use-granary TOOLS=go` does this from Granary's own list
+(`/go/private-prefixes`, shown only to tokens with private access), and
+the Repositories page includes the line. Private modules need a token, so
+they need Granary behind HTTPS.
+
+**Zips from git.** For `git` sources, Granary builds each version's zip
+from the repository's cached mirror exactly as `go` does when it downloads
+from the repository itself, so the `h1:` hash in `go.sum` is the same
+either way:
+
+- versions are tags (`v1.2.3`, or `sub/v1.2.3` for a module in a
+  subdirectory), with `/v2` modules at the root or in a `v2` directory,
+  `+incompatible` versions, and pseudo-versions for untagged commits,
+  checked against their commit's time and ancestor tag;
+- vendored packages, directories with their own `go.mod`, and symbolic
+  links are left out; a module in a subdirectory without a `LICENSE` gets
+  the repository's;
+- `.gitattributes` `export-ignore` and `export-subst` have no effect, as
+  with `go`.
+
+Offline, versions not built yet are still built from mirrors that are
+cached.
+
+**Pinned versions.** There is no checksum database for private modules, so
+Granary keeps its own record: the `h1:` of a version's zip and `go.mod`
+the first time it builds or fetches them. If the same version later gives
+a different hash (a tag was moved, or Gitea serves different bytes), the
+new one is refused with a 502, counted as an integrity failure, and
+written to the audit log with the module, version and both hashes. The
+copy already cached keeps being served. If a version really was
+republished on purpose, forget its pin and cached files:
+
+```sh
+docker compose exec granary granary go-unpin gitea.example.lan/acme/tool v1.2.3
+```
 
 ## Web UI
 
@@ -874,6 +948,7 @@ All settings are environment variables.
 | `GRANARY_GO_SUMDB_KEY` | sum.golang.org's key | That database's public key (`name+hash+key`, as in `GOSUMDB`); its name is the database name clients use |
 | `GRANARY_GO_ALLOW_UNVERIFIED` | `off` | `on`: serve public Go modules the checksum database has no record of (see [Go modules](#go-modules)) |
 | `GRANARY_GO_VULNDB` | `https://vuln.go.dev` | Go vulnerability database mirrored at `/go/vuln/` |
+| `GRANARY_GO_PRIVATE` | *(set on the System page)* | Private Go module prefixes, `pattern[=source],...`, e.g. `gitea.example.lan,go.example.com=git:gitea.example.lan/acme`. When set, the System page can't change the list (see [Private Go modules](#private-go-modules)) |
 | `GRANARY_WARMER_URL` | *(none)* | The warmer service, e.g. `http://granary-warmer:9090`. Warming is off when unset |
 | `GRANARY_WARMER_SECRET` | *(none)* | Shared secret for the warmer (16+ characters); give the warmer the same value as `WARMER_SECRET` |
 | `GRANARY_WARMER_GRANARY_URL` | `http://granary:8080` | How the warmer reaches Granary |

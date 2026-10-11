@@ -7,6 +7,7 @@ mod git_templates;
 mod gitea;
 mod gitea_packages;
 mod go;
+mod go_private;
 mod jobs;
 mod maven;
 mod npm;
@@ -164,6 +165,8 @@ pub struct Opts {
     pub go_allow_unverified: bool,
     /// Use the real proxy.golang.org, sum.golang.org and vuln.go.dev.
     pub go_real: bool,
+    /// Private Go module prefixes, as GRANARY_GO_PRIVATE would set them.
+    pub go_private: Option<String>,
 }
 
 /// The shared secret test warmers expect.
@@ -195,6 +198,7 @@ impl Default for Opts {
             go_sumdb_key: None,
             go_allow_unverified: false,
             go_real: false,
+            go_private: None,
         }
     }
 }
@@ -238,6 +242,7 @@ impl Harness {
             go_sumdb_key,
             go_allow_unverified,
             go_real,
+            go_private,
         } = opts;
         // Bind first so the config can name Granary's own address.
         let own = if serve {
@@ -302,6 +307,7 @@ impl Harness {
                 format!("{base}/vuln")
             },
             go_allow_unverified,
+            go_private_env: go_private.map(|raw| crate::goprivate::parse_rules(&raw).unwrap()),
             search,
             cargo_api: format!("{base}/crates-api"),
             maven_search: format!("{base}/solr/select"),
@@ -361,6 +367,9 @@ impl Harness {
             crate::namespaces::Namespaces::load(&db, cfg.gitea.is_some(), &cfg.namespace_env)
                 .await
                 .unwrap();
+        let goprivate = crate::goprivate::GoPrivate::load(&db, cfg.go_private_env.clone())
+            .await
+            .unwrap();
         let backend = auth::Backend::new(db).await.unwrap();
         let user = backend.list_users().await.unwrap().remove(0);
         let (_, token) = backend.create_token(user.id, "test", None).await.unwrap();
@@ -373,6 +382,7 @@ impl Harness {
             auth: backend,
             policy: Arc::new(policy),
             namespaces: Arc::new(namespaces),
+            goprivate: Arc::new(goprivate),
         };
         crate::jobs::spawn_runner(state.clone());
         let app = crate::app(state.clone(), sessions);
@@ -480,6 +490,21 @@ impl Harness {
 
     pub fn upstream_base(&self) -> &str {
         &self.base
+    }
+
+    /// Sign in as an existing account; returns the session cookie.
+    pub async fn sign_in(&self, username: &str, password: &str) -> String {
+        let (status, headers, _) = self
+            .send(
+                "POST",
+                "/api/auth/login",
+                None,
+                Some(serde_json::json!({"username": username, "password": password})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let set = headers[header::SET_COOKIE].to_str().unwrap();
+        set.split(';').next().unwrap().to_string()
     }
 
     /// Create a viewer account and sign in as it; returns the session cookie.

@@ -17,11 +17,12 @@ pub const REPOS: [&str; 5] = ["cargo", "npm", "pypi", "maven", "go"];
 
 /// Each repository's cache namespace for private packages from Gitea. Paths
 /// there start with the Gitea owner.
-pub const PRIVATE: [(&str, &str); 4] = [
+pub const PRIVATE: [(&str, &str); 5] = [
     ("cargo", "gitea-cargo"),
     ("npm", "gitea-npm"),
     ("pypi", "gitea-pypi"),
     ("maven", "gitea-maven"),
+    ("go", "go-private"),
 ];
 
 /// The private cache namespace of a repository.
@@ -112,9 +113,17 @@ pub fn classify(repo: &str, rel: &str) -> Option<(String, String)> {
 impl Asset {
     /// The access policy's description of a private package.
     pub fn resource(&self) -> Option<Resource> {
-        self.owner
-            .as_deref()
-            .map(|o| Resource::gitea_package(self.repo, o, &self.package))
+        let owner = self.owner.as_deref()?;
+        if self.ns == "go-private" {
+            // The first path element is the module's source.
+            let source = if owner.starts_with("gitea-") {
+                crate::policy::Source::Gitea
+            } else {
+                crate::policy::Source::Git
+            };
+            return Some(Resource::private_module(source, owner, &self.package));
+        }
+        Some(Resource::gitea_package(self.repo, owner, &self.package))
     }
 
     /// The path under the repository's own URL space: for a private file,

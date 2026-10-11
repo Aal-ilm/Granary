@@ -333,6 +333,32 @@ impl Store {
         f.await
     }
 
+    /// A fresh path under the store's `tmp` folder, for building a file
+    /// before [`Store::adopt_file`] moves it into the cache.
+    pub fn new_tmp_path(&self) -> PathBuf {
+        self.tmp_path()
+    }
+
+    /// Move a finished file into the cache (atomically, on the same file
+    /// system), unless one is already there.
+    pub async fn adopt_file(&self, ns: &str, rel: &str, tmp: &Path) -> AppResult<()> {
+        let dest = self.files_dir(ns).join(safe_rel_path(rel)?);
+        if tokio::fs::try_exists(&dest).await? {
+            let _ = tokio::fs::remove_file(tmp).await;
+            return Ok(());
+        }
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::rename(tmp, &dest).await?;
+        if let Ok(m) = tokio::fs::metadata(&dest).await {
+            self.stats
+                .bytes_cached
+                .fetch_add(m.len(), Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     fn tmp_path(&self) -> PathBuf {
         let n = self.tmp_counter.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
@@ -1000,7 +1026,7 @@ pub fn companions(ns: &str) -> &'static [&'static str] {
     match ns.strip_prefix("gitea-").unwrap_or(ns) {
         "pypi" => &[".metadata"],
         "maven" => &[".sha1", ".md5", ".sha256", ".sha512"],
-        "go" => &[".mod", ".info"],
+        "go" | "go-private" => &[".mod", ".info"],
         _ => &[],
     }
 }

@@ -36,6 +36,9 @@ pub struct Config {
     pub go_vulndb: String,
     /// Serve public modules the checksum database has no record of.
     pub go_allow_unverified: bool,
+    /// Private Go module prefixes set by the environment; `None` when the
+    /// System page controls them.
+    pub go_private_env: Option<Vec<crate::goprivate::Rule>>,
     /// Allow "Get packages" to send search text to search hosts.
     pub search: bool,
     /// crates.io's web API, used only for search.
@@ -371,6 +374,13 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("GRANARY_GO_SUMDB_KEY: {e}"))?,
             go_vulndb: url_var("GRANARY_GO_VULNDB", "https://vuln.go.dev"),
             go_allow_unverified: bool_var("GRANARY_GO_ALLOW_UNVERIFIED", false)?,
+            go_private_env: match std::env::var(crate::goprivate::ENV) {
+                Ok(raw) => Some(
+                    crate::goprivate::parse_rules(&raw)
+                        .map_err(|e| anyhow::anyhow!("{}: {e}", crate::goprivate::ENV))?,
+                ),
+                Err(_) => None,
+            },
             search: bool_var("GRANARY_SEARCH", true)?,
             cargo_api: url_var("GRANARY_CARGO_API", "https://crates.io/api/v1"),
             maven_search: url_var(

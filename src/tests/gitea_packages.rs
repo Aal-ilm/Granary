@@ -40,7 +40,7 @@ async fn granary(g: &MockGitea, list: &[(Eco, &str)], opts: Opts) -> Harness {
 }
 
 /// A token with private access, made by the admin.
-async fn private_token(h: &Harness) -> String {
+pub(super) async fn private_token(h: &Harness) -> String {
     let cookie = h.login().await;
     let (status, _, body) = h
         .send(
@@ -58,7 +58,7 @@ async fn private_token(h: &Harness) -> String {
 }
 
 /// A viewer's token, without private access.
-async fn viewer_token(h: &Harness) -> String {
+pub(super) async fn viewer_token(h: &Harness) -> String {
     let cookie = h.viewer_login().await;
     let (_, _, body) = h
         .send(

@@ -66,6 +66,8 @@ impl Mode {
 #[serde(rename_all = "lowercase")]
 pub enum Source {
     Gitea,
+    /// A git repository named by a private Go module prefix.
+    Git,
 }
 
 /// What kind of private content.
@@ -95,6 +97,18 @@ impl Resource {
             },
             owner: owner.to_string(),
             name: name.to_string(),
+        }
+    }
+
+    /// A private Go module, from Gitea's Go registry or a git repository.
+    pub fn private_module(source: Source, owner: &str, module: &str) -> Self {
+        Self {
+            source,
+            kind: Kind::Package {
+                format: "go".to_string(),
+            },
+            owner: owner.to_string(),
+            name: module.to_string(),
         }
     }
 

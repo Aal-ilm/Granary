@@ -245,6 +245,7 @@ pub async fn open_db(data_dir: &Path) -> anyhow::Result<SqlitePool> {
         crate::templates::SCHEMA,
         crate::jobs::SCHEMA,
         crate::jobs::LOG_SCHEMA,
+        crate::goprivate::SCHEMA,
     ] {
         sqlx::query(stmt).execute(&pool).await?;
     }

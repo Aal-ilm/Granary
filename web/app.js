@@ -2137,6 +2137,32 @@ function namespaceForm(n) {
   </form>`;
 }
 
+/** Private Go module prefixes: editable unless set by the environment. */
+function goPrivateSection(g) {
+  const editable = isAdmin() && !g.locked;
+  const rows = [...g.rules, { pattern: '', source: '' }]
+    .map((r, i) => `<div class="inline-form" data-gop-row>
+      <div class="field grow"><label class="${i ? 'sr-only' : ''}">Module path prefix</label><input type="text" data-gop-pattern value="${esc(r.pattern)}" placeholder="gitea.example.lan or go.example.com/team/*" spellcheck="false" ${editable ? '' : 'disabled'}></div>
+      <div class="field grow"><label class="${i ? 'sr-only' : ''}">Source</label><input type="text" data-gop-source value="${esc(r.source)}" placeholder="git, git:host/owner or gitea:owner" spellcheck="false" ${editable ? '' : 'disabled'}></div>
+    </div>`)
+    .join('');
+  const registry = !g.gitea ? '' : g.gitea_registry == null
+    ? '<p class="muted">Gitea has not been checked yet, so it is not known whether it has a Go registry.</p>'
+    : g.gitea_registry
+    ? '<p class="muted">The connected Gitea has a Go registry, so <code>gitea:owner</code> sources work.</p>'
+    : '<p class="muted">The connected Gitea is too old to have a Go registry; use git sources.</p>';
+  return `
+    <section>
+      <h2>Go private modules</h2>
+      <p class="muted">Module paths that are private, in the syntax of <code>GONOSUMDB</code>. A matching module is only ever served from its source, never from the public proxy or the checksum database, and follows private access. The source is <code>git</code> (the repository the path names, the default), <code>git:host/owner</code> for a vanity prefix, or <code>gitea:owner</code> for Gitea's Go registry.</p>
+      <form class="panel panel-pad ns-form" id="gop-form">
+        ${rows}
+        ${g.locked ? `<p class="muted">Locked: set by <code>${esc(g.env)}</code> in the environment.</p>` : editable ? '<p><button class="small" type="submit">Save</button> <span class="muted">Clear a row to remove it.</span></p>' : ''}
+      </form>
+      ${registry}
+    </section>`;
+}
+
 /** The Gitea connection's facts: address, status, version and token owner. */
 function giteaFacts(g) {
   const s = g.status;
@@ -2209,6 +2235,7 @@ async function renderSystem({ isCurrent }) {
     </div>
     ${giteaSection}
     ${accessSection}
+    ${goPrivateSection(d.go_private)}
     <section>
       <h2>Upstream registries</h2>
       <div class="panel table-wrap"><table>
@@ -2252,6 +2279,21 @@ async function renderSystem({ isCurrent }) {
     b.textContent = 'Test connection';
   });
   view().addEventListener('submit', async (e) => {
+    const gop = e.target.closest('#gop-form');
+    if (gop) {
+      e.preventDefault();
+      const rules = $$('[data-gop-row]', gop)
+        .map((row) => ({ pattern: $('[data-gop-pattern]', row).value.trim(), source: $('[data-gop-source]', row).value.trim() }))
+        .filter((r) => r.pattern);
+      try {
+        await api('/api/system/go-private', { method: 'PUT', body: { rules } });
+        toast('Go private modules saved');
+        route();
+      } catch (err) {
+        toast(err.message, 'error');
+      }
+      return;
+    }
     const form = e.target.closest('[data-ns-format]');
     if (!form) return;
     e.preventDefault();

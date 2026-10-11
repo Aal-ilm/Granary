@@ -135,7 +135,9 @@ govulncheck -db https://HOST/go/vuln ./...             # govulncheck has only th
   netrc only apply to HTTPS. With `GRANARY_CLIENT_AUTH=required`, Go
   clients need Granary behind TLS. Give the token in netrc
   (`machine HOST login token password TOKEN`) or in the URL
-  (`https://token:TOKEN@HOST/go`).
+  (`https://token:TOKEN@HOST/go`). When the address has a port, netrc
+  needs `machine HOST:PORT` for Go 1.24 and later, and the bare host for
+  earlier versions; write both.
 - Granary answers an anonymous request on `/go/` with a 401 and a Basic
   challenge, so netrc credentials are sent.
 - Over plain HTTP, Go works only with `GRANARY_CLIENT_AUTH=off`, and then
@@ -202,8 +204,10 @@ Build module zips the way `go` builds them when it downloads from the
 repository directly, so the `h1:` hash Granary's zip gives is the one `go`
 would compute itself. Clients' `go.sum` lines then match whichever way a
 module was first fetched.
-- File list from `git archive` at the revision, so `.gitattributes`
-  `export-ignore` applies as it does for `go`.
+- File list from `git archive` at the revision. Like `go`, switch off
+  `export-subst` and `export-ignore` first (in the mirror's
+  `info/attributes`), so a `.gitattributes` file can't change what a
+  version contains.
 - Keep only the module's subdirectory. Without a `LICENSE` there, add the
   repository root's `LICENSE`, as `go` does.
 - Apply `golang.org/x/mod/zip`'s rules exactly:
@@ -234,6 +238,19 @@ module was first fetched.
 - A zip, once built, is kept like any cached file and never rebuilt, so
   its hash never changes.
 
+### Pins
+There is no checksum database for private modules, so Granary pins on
+first sight, for both sources:
+- Record the `h1:` of a version's zip and go.mod the first time it is
+  built from git or fetched from Gitea.
+- If a later build or fetch of the same version gives a different hash (a
+  moved tag, or Gitea serving different bytes), keep serving the cached
+  original, refuse the new one with a 502, count an integrity failure,
+  and write an integrity warning to the audit log naming the module, the
+  version and both hashes.
+- `granary go-unpin <module> <version>` forgets a version's pins and
+  cached files, for a version republished on purpose.
+
 ### Tests
 - The rule both ways: private paths never reach proxy.golang.org or the
   checksum database (checked from the mock upstreams' request logs);
@@ -247,7 +264,10 @@ module was first fetched.
   - `/v2` both ways (subdirectory and major-version branch);
   - `+incompatible`;
   - vendor directories under go 1.23 and go 1.24;
-  - a nested module, a symbolic link, and an `export-ignore` file.
+  - a nested module, a symbolic link, and an `export-ignore` file (which
+    stays in the zip, as with `go`).
+- Pins: a moved tag, and Gitea changing a version's zip. The cached copy
+  keeps being served; a rebuild or refetch is refused and logged.
 - Versions: `list`, `@latest` with and without tags, branch and commit
   queries, pseudo-version checks.
 - Gitea's Go registry as a source, against the mock Gitea.

@@ -50,6 +50,10 @@ services:
       # sum.golang.org. Go clients only send tokens over HTTPS, so put
       # Granary behind TLS to use Go with GRANARY_CLIENT_AUTH=required.
       # GRANARY_GO_ALLOW_UNVERIFIED: "off"
+      # Private Go modules, served only from your own sources (or set them
+      # on the System page): the repository a path names, a mapped vanity
+      # prefix, or Gitea's Go registry.
+      # GRANARY_GO_PRIVATE: "gitea.example.lan,go.example.com=git:gitea.example.lan/acme"
       # Granary refuses upstreams at private addresses. List internal
       # mirrors you set as upstreams here (the Gitea host is always allowed).
       # GRANARY_PRIVATE_HOSTS: "nexus.example.lan"

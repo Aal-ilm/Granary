@@ -22,16 +22,18 @@
 use axum::{
     Router,
     extract::State,
-    http::{Method, StatusCode, Uri, header},
+    http::{HeaderMap, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::any,
 };
 use bytes::Bytes;
 
+use super::go_private;
 use crate::{
     AppState,
     error::{AppError, AppResult},
     gomod,
+    policy::Principal,
     store::FileCheck,
     sumdb::{self, Tile},
 };
@@ -49,7 +51,13 @@ fn missing(why: impl Into<String>) -> AppError {
     AppError::new(StatusCode::NOT_FOUND, why)
 }
 
-async fn handle(State(st): State<AppState>, method: Method, uri: Uri) -> AppResult<Response> {
+async fn handle(
+    State(st): State<AppState>,
+    who: Principal,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> AppResult<Response> {
     if method != Method::GET && method != Method::HEAD {
         return Err(AppError::new(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -67,8 +75,34 @@ async fn handle(State(st): State<AppState>, method: Method, uri: Uri) -> AppResu
     if let Some(r) = rest.strip_prefix("vuln/") {
         return vuln(&st, r).await;
     }
+    if rest == "private-prefixes" {
+        // For GONOSUMDB, to those who may read private modules.
+        let mut body = String::new();
+        if st.policy.has_private_access(&who) {
+            for p in st.goprivate.patterns() {
+                body.push_str(&p);
+                body.push('\n');
+            }
+        }
+        return Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response());
+    }
     if let Some(escmod) = rest.strip_suffix("/@latest") {
-        module_path(escmod)?;
+        let module = module_path(escmod)?;
+        if let Some(route) = st.goprivate.route(&module) {
+            return go_private::serve(
+                &st,
+                go_private::Asker {
+                    who: &who,
+                    headers: &headers,
+                    path: uri.path(),
+                },
+                &module,
+                escmod,
+                "@latest",
+                route,
+            )
+            .await;
+        }
         let url = format!("{}/{escmod}/@latest", st.cfg.go_upstream);
         let meta = st
             .store
@@ -80,6 +114,22 @@ async fn handle(State(st): State<AppState>, method: Method, uri: Uri) -> AppResu
         return Err(missing("not a Go module proxy path"));
     };
     let module = module_path(escmod)?;
+    // A private module only ever comes from its own source.
+    if let Some(route) = st.goprivate.route(&module) {
+        return go_private::serve(
+            &st,
+            go_private::Asker {
+                who: &who,
+                headers: &headers,
+                path: uri.path(),
+            },
+            &module,
+            escmod,
+            file,
+            route,
+        )
+        .await;
+    }
     if file == "list" {
         let url = format!("{}/{escmod}/@v/list", st.cfg.go_upstream);
         let meta = st
@@ -374,6 +424,12 @@ async fn sumdb_proxy(st: &AppState, rest: &str) -> AppResult<Response> {
         let module = module_path(escmod)?;
         let version = gomod::unescape(escver).ok_or_else(|| missing("invalid version"))?;
         gomod::check(&module, &version).map_err(missing)?;
+        // Nothing about a private module goes to the checksum database.
+        if st.goprivate.route(&module).is_some() {
+            return Err(missing(format!(
+                "{module} is a private module, which the checksum database is never asked about. Add its prefix to GONOSUMDB (go env -w GONOSUMDB=...)"
+            )));
+        }
         return match lookup_body(st, escmod, escver).await? {
             Some(body) => Ok((text, body).into_response()),
             None => Err(missing(format!(
