@@ -483,10 +483,13 @@ reverse proxy, monitoring, upgrades and recovery.
 Both compose files run Granary as an unprivileged user with a read-only
 root filesystem, no Linux capabilities and `no-new-privileges`.
 
-The image is built on Google's distroless base, which contains only the C
-runtime libraries and CA certificates Granary needs: no shell, package
-manager or other tools. SQLite is compiled into the binary. CI scans the
-image with Trivy and the dependencies with `cargo audit` (also weekly).
+The image is built on [Wolfi](https://github.com/wolfi-dev), a minimal
+glibc base whose packages follow upstream security fixes closely, with only
+git (for the git cache) and CA certificates added. SQLite is compiled into
+the binary. CI scans the image with Trivy and the dependencies with
+`cargo audit`. The base image isn't pinned, and CI rebuilds and republishes
+the latest release's image every week, so it picks up security fixes even
+when Granary's code hasn't changed.
 
 ## Configuration
 
