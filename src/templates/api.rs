@@ -4,19 +4,23 @@
 use axum::{
     Extension, Json, Router,
     extract::{Path, Query, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{PLATFORMS, Template, TemplateInput, default_platforms, lines, manifest};
+use super::{
+    PLATFORMS, SCHEDULES, Template, TemplateInput, build, default_platforms, lines, manifest,
+    starter::Starter,
+};
 use crate::{
     AppState,
     auth::{AuthSession, require_admin},
     error::{AppError, AppResult},
     net::ClientIp,
+    util::base_url,
 };
 
 pub fn router() -> Router<AppState> {
@@ -27,6 +31,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/templates/{id}", get(one).put(update).delete(delete))
         .route("/api/templates/{id}/clone", post(clone))
         .route("/api/templates/{id}/export", get(export))
+        .route("/api/templates/{id}/starter", get(starter))
+        .route("/api/templates/{id}/schedule", put(schedule))
 }
 
 fn db_error(e: sqlx::Error) -> AppError {
@@ -52,6 +58,7 @@ fn summary(t: &Template) -> Value {
         "counts": t.input.counts(),
         "updated_at": t.updated_at,
         "last_warmed_at": t.last_warmed_at,
+        "schedule": t.schedule,
     })
 }
 
@@ -251,6 +258,109 @@ async fn export(State(st): State<AppState>, Path(id): Path<i64>) -> AppResult<Re
         t.input.to_toml(),
     )
         .into_response())
+}
+
+/// A zip with a minimal project for the template, set up for this Granary.
+/// It never contains a token.
+async fn starter(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> AppResult<Response> {
+    let t = load(&st, id).await?;
+    let (lockfiles, warmed_at) = crate::jobs::last_lockfiles(&st.auth.db, id).await;
+    // Maven lines without a version: the pom.xml from the last warm already
+    // has them all; otherwise use the latest stable release.
+    let warmed_pom = lockfiles
+        .get("maven")
+        .is_some_and(|l| l.contains_key("pom.xml"));
+    let mut versions = std::collections::HashMap::new();
+    for ga in build::unversioned_maven(&t.input) {
+        let version = if warmed_pom {
+            // Not used: the warmed pom.xml replaces the generated one.
+            Some("0".to_string())
+        } else {
+            crate::search::lookup(&st, lines::Eco::Maven, &ga)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|v| v.latest)
+        };
+        let Some(version) = version else {
+            return Err(AppError::new(
+                StatusCode::CONFLICT,
+                format!(
+                    "no version of {ga} is known yet; warm the template first, or give {ga} a version"
+                ),
+            ));
+        };
+        versions.insert(ga, version);
+    }
+    let manifests = build::manifests(&t.input, &versions).map_err(AppError::bad_request)?;
+    let base = base_url(&st.cfg, &headers);
+    let zip = Starter {
+        template: &t.input,
+        manifests,
+        lockfiles,
+        warmed_at,
+        base_url: &base,
+        warmer_granary_url: &st.cfg.warmer_granary_url,
+        client_auth: st.cfg.client_auth,
+    }
+    .zip()
+    .map_err(|e| {
+        AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("building the starter zip: {e}"),
+        )
+    })?;
+    let disposition = format!(
+        "attachment; filename=\"{}-starter.zip\"",
+        slug(&t.input.name)
+    );
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/zip".to_string()),
+            (header::CONTENT_DISPOSITION, disposition),
+        ],
+        zip,
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+struct ScheduleBody {
+    schedule: String,
+}
+
+/// Set how often a template is warmed again on its own. Works for
+/// built-in templates too: the schedule is this Granary's, not the template's.
+async fn schedule(
+    State(st): State<AppState>,
+    auth: AuthSession,
+    Extension(ip): Extension<ClientIp>,
+    Path(id): Path<i64>,
+    Json(body): Json<ScheduleBody>,
+) -> AppResult<Json<Value>> {
+    let admin = require_admin(&auth)?.username.clone();
+    if !SCHEDULES.iter().any(|(s, _)| *s == body.schedule) {
+        return Err(AppError::bad_request(
+            "schedule must be off, daily or weekly",
+        ));
+    }
+    let t = load(&st, id).await?;
+    super::set_schedule(&st.auth.db, id, &body.schedule)
+        .await
+        .map_err(db_error)?;
+    audit(
+        &st,
+        &admin,
+        "template.schedule",
+        &format!("{}: {}", t.input.name, body.schedule),
+        ip,
+    )
+    .await;
+    Ok(Json(json!({ "schedule": body.schedule })))
 }
 
 #[derive(Deserialize)]

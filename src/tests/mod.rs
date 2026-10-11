@@ -6,6 +6,7 @@ mod jobs;
 mod maven;
 mod offline;
 mod search;
+mod starter;
 mod templates;
 
 use std::{
@@ -103,6 +104,7 @@ impl Mock {
 
 pub struct Harness {
     pub app: Router,
+    pub state: AppState,
     /// The mock upstream's base URL, e.g. http://127.0.0.1:1234.
     base: String,
     db: sqlx::SqlitePool,
@@ -263,6 +265,7 @@ impl Harness {
         }
         Self {
             base,
+            state: state.clone(),
             db: state.auth.db.clone(),
             app,
             mock,

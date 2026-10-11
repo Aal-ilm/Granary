@@ -9,6 +9,7 @@ pub mod api;
 pub mod build;
 pub mod lines;
 pub mod manifest;
+pub mod starter;
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -32,6 +33,11 @@ pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS templates (
     updated_at INTEGER NOT NULL,
     last_warmed_at INTEGER
 )";
+
+/// How often a template is warmed again on its own: (id, seconds between).
+/// The schedule belongs to this Granary, not to the template's content, so
+/// it can be set on built-in templates too and isn't exported.
+pub const SCHEDULES: [(&str, u64); 3] = [("off", 0), ("daily", 86_400), ("weekly", 7 * 86_400)];
 
 /// Platforms a template can be warmed for: (id, label).
 pub const PLATFORMS: [(&str, &str); 5] = [
@@ -350,6 +356,8 @@ pub struct Template {
     pub created_at: i64,
     pub updated_at: i64,
     pub last_warmed_at: Option<i64>,
+    /// "off", "daily" or "weekly".
+    pub schedule: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -368,6 +376,7 @@ struct Row {
     created_at: i64,
     updated_at: i64,
     last_warmed_at: Option<i64>,
+    schedule: String,
 }
 
 impl From<Row> for Template {
@@ -390,11 +399,27 @@ impl From<Row> for Template {
             created_at: r.created_at,
             updated_at: r.updated_at,
             last_warmed_at: r.last_warmed_at,
+            schedule: r.schedule,
         }
     }
 }
 
-const COLUMNS: &str = "id, builtin_key, name, description, tags, platforms, allow_sdist, cargo, npm, pypi, maven, created_at, updated_at, last_warmed_at";
+const COLUMNS: &str = "id, builtin_key, name, description, tags, platforms, allow_sdist, cargo, npm, pypi, maven, created_at, updated_at, last_warmed_at, schedule";
+
+/// Columns added after templates first shipped.
+pub async fn migrate(db: &SqlitePool) -> sqlx::Result<()> {
+    crate::auth::add_column(db, "templates", "schedule", "TEXT NOT NULL DEFAULT 'off'").await?;
+    crate::auth::add_column(db, "templates", "schedule_queued_at", "INTEGER").await
+}
+
+pub async fn set_schedule(db: &SqlitePool, id: i64, schedule: &str) -> sqlx::Result<bool> {
+    let r = sqlx::query("UPDATE templates SET schedule = ? WHERE id = ?")
+        .bind(schedule)
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(r.rows_affected() == 1)
+}
 
 pub async fn list(db: &SqlitePool) -> sqlx::Result<Vec<Template>> {
     let rows: Vec<Row> = sqlx::query_as(sqlx::AssertSqlSafe(format!(

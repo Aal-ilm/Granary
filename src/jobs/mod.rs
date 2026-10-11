@@ -200,7 +200,12 @@ pub fn spawn_runner(st: AppState) {
         .bind(now_secs() as i64)
         .execute(&st.auth.db)
         .await;
+        let mut last_schedule_check: Option<Instant> = None;
         loop {
+            if last_schedule_check.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                last_schedule_check = Some(Instant::now());
+                queue_scheduled(&st).await;
+            }
             start_due(&st).await;
             tokio::select! {
                 _ = st.admin.jobs.wake.notified() => {}
@@ -506,6 +511,11 @@ async fn run_inner(
         let label = m.eco.label();
         log.push(db, &format!("--- {label} ({})", spec.platforms.join(", ")))
             .await;
+        // Maven has no lockfile; keep the pom.xml that was warmed, with
+        // every version filled in, for the template's starter.
+        let warmed_pom = (m.eco == Eco::Maven)
+            .then(|| m.files.iter().find(|(p, _)| p == "pom.xml").cloned())
+            .flatten();
         let req = warmer::RunRequest {
             job: id,
             ecosystem: m.eco,
@@ -518,7 +528,9 @@ async fn run_inner(
         };
         match warmer::run(st, &req, log, cancel, deadline, budget).await {
             Ok(r) if r.ok => {
-                lockfiles.insert(m.eco.as_str().to_string(), r.lockfiles);
+                let mut locks = r.lockfiles;
+                locks.extend(warmed_pom);
+                lockfiles.insert(m.eco.as_str().to_string(), locks);
             }
             Ok(r) => {
                 let why = r
@@ -564,5 +576,141 @@ async fn run_inner(
             message: Some(failures.join("; ")),
             lockfiles,
         }
+    }
+}
+
+/// Whether a template on a schedule is due: its interval has passed since
+/// it was last warmed or last queued by the schedule, whichever is later.
+pub fn schedule_due(
+    schedule: &str,
+    last_warmed: Option<i64>,
+    last_queued: Option<i64>,
+    now: i64,
+) -> bool {
+    let Some(&(_, every)) = crate::templates::SCHEDULES
+        .iter()
+        .find(|(id, secs)| *id == schedule && *secs > 0)
+    else {
+        return false;
+    };
+    let last = last_warmed.max(last_queued).unwrap_or(0);
+    now - last >= every as i64
+}
+
+/// Queue a warm job for every scheduled template that is due. Nothing is
+/// queued while the warmer is unavailable or offline mode is on; the
+/// templates are simply picked up once it's back.
+pub async fn queue_scheduled(st: &AppState) -> usize {
+    if st.cfg.offline || st.cfg.warmer_url.is_none() {
+        return 0;
+    }
+    let due: Vec<(i64, String, Option<i64>, Option<i64>)> = match sqlx::query_as(
+        "SELECT t.id, t.schedule, t.last_warmed_at, t.schedule_queued_at FROM templates t
+         WHERE t.schedule != 'off'
+         AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.template_id = t.id AND j.status IN ('queued', 'running'))",
+    )
+    .fetch_all(&st.auth.db)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("template schedule: {e}");
+            return 0;
+        }
+    };
+    let now = now_secs() as i64;
+    let due: Vec<i64> = due
+        .into_iter()
+        .filter(|(_, schedule, warmed, queued)| schedule_due(schedule, *warmed, *queued, now))
+        .map(|(id, ..)| id)
+        .collect();
+    if due.is_empty() || !warmer::health(st).await.available {
+        return 0;
+    }
+    let mut queued = 0;
+    for id in due {
+        let Ok(Some(t)) = crate::templates::get(&st.auth.db, id).await else {
+            continue;
+        };
+        let _ = sqlx::query("UPDATE templates SET schedule_queued_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(id)
+            .execute(&st.auth.db)
+            .await;
+        match enqueue(
+            st,
+            "template",
+            Some(id),
+            &t.input.name,
+            &t.input,
+            "schedule",
+        )
+        .await
+        {
+            Ok(job) => {
+                tracing::info!(
+                    "{}: scheduled {} warm queued as job {job}",
+                    t.input.name,
+                    t.schedule
+                );
+                queued += 1;
+            }
+            Err(e) => tracing::warn!("{}: could not queue the scheduled warm: {e}", t.input.name),
+        }
+    }
+    queued
+}
+
+/// The lockfiles from a template's last successful warm, per ecosystem,
+/// and when that warm finished.
+pub async fn last_lockfiles(
+    db: &SqlitePool,
+    template_id: i64,
+) -> (HashMap<String, HashMap<String, String>>, Option<i64>) {
+    let row: Option<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT lockfiles, finished_at FROM jobs WHERE template_id = ? AND kind = 'template' AND status = 'done'
+         AND lockfiles IS NOT NULL ORDER BY id DESC LIMIT 1",
+    )
+    .bind(template_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    match row {
+        Some((json, at)) => (serde_json::from_str(&json).unwrap_or_default(), at),
+        None => (HashMap::new(), None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::schedule_due;
+
+    #[test]
+    fn schedules() {
+        let day = 86_400;
+        assert!(!schedule_due("off", None, None, 10 * day));
+        assert!(
+            schedule_due("daily", None, None, 10 * day),
+            "never warmed: due now"
+        );
+        assert!(!schedule_due(
+            "daily",
+            Some(10 * day),
+            None,
+            10 * day + 3600
+        ));
+        assert!(schedule_due("daily", Some(10 * day), None, 11 * day));
+        // Queued (even if that run failed) counts, so a broken template
+        // isn't retried every minute.
+        assert!(!schedule_due(
+            "daily",
+            Some(day),
+            Some(10 * day),
+            10 * day + 60
+        ));
+        assert!(!schedule_due("weekly", Some(10 * day), None, 16 * day));
+        assert!(schedule_due("weekly", Some(10 * day), None, 17 * day));
+        assert!(!schedule_due("hourly", None, None, 10 * day));
     }
 }

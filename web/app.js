@@ -1075,12 +1075,13 @@ async function renderTemplates({ query, isCurrent }) {
         <div class="tpl-counts">${packageCounts(t.counts)}</div>
         <div class="tpl-tags">${t.tags.map((x) => `<a class="tag" href="${tagLink(x)}">${esc(x)}</a>`).join('')}</div>
         <div class="tpl-foot">
-          <span class="muted">Last warmed ${t.last_warmed_at ? timeTag(t.last_warmed_at) : '<span>never</span>'}</span>
+          <span class="muted">Last warmed ${t.last_warmed_at ? timeTag(t.last_warmed_at) : '<span>never</span>'}${t.schedule !== 'off' ? `, re-warms ${esc(t.schedule)}` : ''}</span>
           <span class="page-actions">
             ${warmer.available ? `<button class="small primary admin-only" data-warm="${t.id}">Warm</button>` : ''}
             ${t.builtin ? '' : `<a class="btn small admin-only" href="#/templates/${t.id}/edit">Edit</a>`}
             <button class="small admin-only" data-clone="${t.id}">Clone</button>
             <a class="btn small" href="/api/templates/${t.id}/export" download>Export</a>
+            <button class="small" data-starter="${t.id}">Download starter</button>
             ${t.builtin ? '' : `<button class="small danger admin-only" data-delete="${t.id}" data-name="${esc(t.name)}">Delete</button>`}
           </span>
         </div>
@@ -1118,8 +1119,15 @@ async function renderTemplates({ query, isCurrent }) {
   view().addEventListener('click', (e) => templateAction(e));
 }
 
-/** Warm, clone and delete buttons, on the list and on a template's page. */
+/** Warm, starter, clone and delete buttons, on the list and on a template's page. */
 async function templateAction(e) {
+  const starter = e.target.closest('[data-starter]');
+  if (starter) {
+    starter.disabled = true;
+    await downloadStarter(starter.dataset.starter);
+    starter.disabled = false;
+    return;
+  }
   const warm = e.target.closest('[data-warm]');
   if (warm) {
     warm.disabled = true;
@@ -1157,6 +1165,31 @@ async function templateAction(e) {
   }
 }
 
+/** Fetch a template's starter zip and save it, or say why it can't be made. */
+async function downloadStarter(id) {
+  let res;
+  try {
+    res = await fetch(`/api/templates/${id}/starter`, { credentials: 'same-origin' });
+  } catch {
+    return toast('Granary is not responding. Check that the server is running.', 'error');
+  }
+  if (!res.ok) {
+    const text = (await res.text()).trim();
+    return toast(text ? text[0].toUpperCase() + text.slice(1) + '.' : `Couldn't make the starter (HTTP ${res.status}).`, 'error');
+  }
+  const name = /filename="([^"]+)"/.exec(res.headers.get('Content-Disposition') || '')?.[1] || 'starter.zip';
+  const url = URL.createObjectURL(await res.blob());
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+const SCHEDULE_LABELS = { off: 'Off', daily: 'Daily', weekly: 'Weekly' };
+
 async function renderTemplate({ params, isCurrent }) {
   const [t, list, warmer, jobs] = await Promise.all([
     api(`/api/templates/${params[0]}`),
@@ -1192,13 +1225,20 @@ async function renderTemplate({ params, isCurrent }) {
         ${t.builtin ? '' : `<a class="btn admin-only" href="#/templates/${t.id}/edit">Edit</a>`}
         <button class="admin-only" data-clone="${t.id}">Clone</button>
         <a class="btn" href="/api/templates/${t.id}/export" download>Export</a>
+        <button data-starter="${t.id}">Download starter</button>
         ${t.builtin ? '' : `<button class="danger admin-only" data-delete="${t.id}" data-name="${esc(t.name)}">Delete</button>`}
       </div>
     </div>
     <dl class="panel panel-pad tpl-facts">
       <div><dt>Platforms</dt><dd>${t.platforms.map((p) => esc(label(p))).join(', ')}</dd></div>
       <div><dt>Source distributions</dt><dd>${t.allow_sdist ? 'Allowed (building one can run code)' : 'Wheels only'}</dd></div>
+      <div><dt><label for="tpl-schedule">Re-warm automatically</label></dt><dd>${
+        isAdmin()
+          ? `<select id="tpl-schedule">${Object.entries(SCHEDULE_LABELS).map(([id, label]) => `<option value="${id}" ${t.schedule === id ? 'selected' : ''}>${label}</option>`).join('')}</select>`
+          : esc(SCHEDULE_LABELS[t.schedule] || t.schedule)
+      }</dd></div>
     </dl>
+    ${t.schedule !== 'off' && !warmer.available ? '<p class="page-note">Scheduled re-warms wait until the warmer is available.</p>' : ''}
     ${warmerNote(warmer)}
     ${sections}
     ${jobs.jobs.length ? `<section><h2>Recent warm jobs</h2><div class="panel table-wrap"><table>
@@ -1206,6 +1246,17 @@ async function renderTemplate({ params, isCurrent }) {
       <tbody>${jobs.jobs.slice(0, 5).map((j) => `<tr><td><a href="#/jobs/${j.id}">#${esc(j.id)}</a></td><td>${jobStatus(j.status)}</td><td>${timeTag(j.created_at)}</td><td class="num">${esc(jobAdded(j))}</td></tr>`).join('')}</tbody>
     </table></div></section>` : ''}`);
   view().addEventListener('click', (e) => templateAction(e));
+  $('#tpl-schedule')?.addEventListener('change', async (e) => {
+    const sel = e.target;
+    sel.disabled = true;
+    try {
+      await act(() => api(`/api/templates/${t.id}/schedule`, { method: 'PUT', body: { schedule: sel.value } }));
+      toast(sel.value === 'off' ? 'Scheduled re-warms turned off' : `${t.name} will be warmed again ${sel.value === 'daily' ? 'every day' : 'every week'}`);
+    } catch (err) {
+      toast(err.message, 'error');
+    }
+    sel.disabled = false;
+  });
 }
 
 async function renderTemplateEditor({ params, isCurrent }) {

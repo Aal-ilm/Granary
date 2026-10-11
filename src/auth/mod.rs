@@ -210,6 +210,7 @@ pub async fn open_db(data_dir: &Path) -> anyhow::Result<SqlitePool> {
     }
     // Columns added after the first release.
     add_column(&pool, "tokens", "system", "INTEGER NOT NULL DEFAULT 0").await?;
+    crate::templates::migrate(&pool).await?;
     Ok(pool)
 }
 

@@ -183,7 +183,7 @@ For Gradle it writes `~/.gradle/init.d/granary.gradle`; `use-public` and
 | Browse | Every cached package, filterable and sortable by size, versions, cache date and last download; the sidebar search covers all repositories |
 | Package detail | Each cached version and file, with download and delete |
 | Get packages | Search a registry and cache a version before anyone needs it (admins only; see [Getting packages ahead of time](#getting-packages-ahead-of-time)) |
-| Templates | Named sets of packages for a kind of project: browse, create, edit, clone, delete, export and warm (see [Templates](#templates)) |
+| Templates | Named sets of packages for a kind of project: browse, create, edit, clone, delete, export, warm, schedule re-warms and download a starter project (see [Templates](#templates)) |
 | Jobs | Warm jobs with their status, live log, what they cached, and cancel (see [Warming](#warming-templates-with-the-warmer)) |
 | Cleanup | Delete packages nobody has downloaded in *N* days, per repository, with a dry-run preview and an optional daily schedule |
 | Tasks | Scheduled jobs (cleanup, upstream checks, saving download history) with last run, result and **Run now** |
@@ -275,6 +275,28 @@ Viewers can see templates and export them; creating, editing, cloning,
 deleting and warming them needs an admin. Every change is recorded in the
 audit log.
 
+### Download starter
+
+**Download starter** gives a zip with a minimal project for a template, set
+up to install through your Granary:
+
+- the manifests (`Cargo.toml`, `package.json`, `requirements.txt`,
+  `pom.xml`), for the ecosystems the template uses
+- the lockfiles from the template's last successful warm, if it has one:
+  `Cargo.lock`, `package-lock.json` (with URLs pointing at
+  registry.npmjs.org, which npm maps onto whatever registry is configured),
+  `requirements.lock.txt` (the versions that were cached) and, for Maven,
+  the `pom.xml` that was warmed, with every version filled in
+- client configuration for this Granary: `.cargo/config.toml` with the
+  crates.io source replacement, a project `.npmrc` with the registry line,
+  a `pip.conf` snippet, and `.mvn/settings.xml` with `.mvn/maven.config`
+- `README.txt`
+
+The zip never contains a token. `.npmrc` and `.mvn/settings.xml` read it
+from the `GRANARY_TOKEN` environment variable, and README.txt explains how
+to set it, or to run `make use-granary`, for Cargo and pip. Anyone signed in
+can download a starter.
+
 ## Warming templates with the warmer
 
 **Warm** fills the cache with everything a template needs, including every
@@ -316,6 +338,17 @@ token Granary creates for it, listed under **Access tokens** as `warmer` with
 a System badge. That token can only download packages (it is refused for
 `/metrics`), is never stored in plain text, and is made again automatically
 if you revoke it. Tokens are masked in job logs.
+
+**Scheduled re-warms.** On a template's page, **Re-warm automatically** can
+be set to daily or weekly, so new versions are cached before the network is
+cut off. Granary checks every minute and queues a template when that long
+has passed since it was last warmed (or last queued, so a template that
+keeps failing isn't retried every minute). A template that was never warmed
+is queued straight away. Schedules wait while the warmer is unavailable or
+offline mode is on, and pick up when it's back. The schedule belongs to your
+Granary, not to the template's content: built-in templates can be scheduled,
+and exports don't include it. Scheduled jobs show `schedule` as who queued
+them.
 
 **Jobs.** Warm jobs wait in a queue and at most `GRANARY_WARM_JOBS` (2) run
 at once. A job's page streams the tools' output and, when it ends, shows how

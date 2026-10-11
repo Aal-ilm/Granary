@@ -26,18 +26,18 @@ use super::{Harness, Opts, Upstream, WARMER_SECRET};
 
 /// What the fake warmer does for each run.
 #[derive(Clone, Default)]
-struct Plan {
+pub(super) struct Plan {
     /// Granary paths to download (with the job's token) before streaming.
-    fetch: Vec<String>,
-    lines: usize,
-    delay: Duration,
-    lockfiles: HashMap<String, String>,
+    pub fetch: Vec<String>,
+    pub lines: usize,
+    pub delay: Duration,
+    pub lockfiles: HashMap<String, String>,
 }
 
 #[derive(Clone, Default)]
-struct Fake {
+pub(super) struct Fake {
     plan: Arc<Mutex<Plan>>,
-    runs: Arc<Mutex<Vec<Value>>>,
+    pub runs: Arc<Mutex<Vec<Value>>>,
     deletes: Arc<Mutex<Vec<i64>>>,
     active: Arc<AtomicUsize>,
     max_active: Arc<AtomicUsize>,
@@ -138,7 +138,7 @@ async fn fake_warmer(plan: Plan) -> (Fake, String) {
     (fake, url)
 }
 
-async fn with_fake(plan: Plan, opts: Opts) -> (Harness, Fake, String) {
+pub(super) async fn with_fake(plan: Plan, opts: Opts) -> (Harness, Fake, String) {
     let (fake, url) = fake_warmer(plan).await;
     let h = Harness::with(Opts {
         warmer_url: Some(url),
@@ -171,7 +171,7 @@ async fn warm_package(h: &Harness, cookie: &str, name: &str) -> i64 {
 }
 
 /// Wait until the job reaches one of these states; returns the job.
-async fn wait_for(h: &Harness, cookie: &str, id: i64, states: &[&str]) -> Value {
+pub(super) async fn wait_for(h: &Harness, cookie: &str, id: i64, states: &[&str]) -> Value {
     let start = Instant::now();
     loop {
         let d = h.api(cookie, &format!("/api/jobs/{id}")).await;
@@ -499,7 +499,7 @@ async fn warming_needs_the_warmer() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
-fn set_tiny_package(h: &Harness, tgz: &[u8]) {
+pub(super) fn set_tiny_package(h: &Harness, tgz: &[u8]) {
     use base64::{Engine, engine::general_purpose::STANDARD};
     let integrity = format!("sha512-{}", STANDARD.encode(sha2::Sha512::digest(tgz)));
     let base = h.upstream_base();

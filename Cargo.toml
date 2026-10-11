@@ -1,6 +1,6 @@
 [package]
 name = "granary"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "A small, self-hostable caching proxy for Cargo, npm, PyPI and Maven"
 license = "MIT OR Apache-2.0"
@@ -37,6 +37,7 @@ totp-rs = { version = "6.0.0", features = ["qr", "gen_secret", "otpauth"] }
 tower-sessions = "0.14"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+zip = { version = "9.0.1", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
