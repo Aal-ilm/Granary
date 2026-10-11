@@ -122,6 +122,7 @@ pub mod tests {
             trusted_proxies: Vec::new(),
             audit_days: 365,
             offline: false,
+            npm_rewrite_tarballs: true,
             cache_limit: None,
         }
     }

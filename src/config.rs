@@ -70,6 +70,10 @@ pub struct Config {
     pub audit_days: u32,
     /// Never contact an upstream: serve only what is cached.
     pub offline: bool,
+    /// Point npm packuments' tarball URLs at Granary. When off, they keep
+    /// the upstream's URLs, so lockfiles written through Granary stay
+    /// portable.
+    pub npm_rewrite_tarballs: bool,
     /// Byte budget for the cache (files plus metadata). Shown on the
     /// Overview gauges; warm jobs stop before going past it.
     pub cache_limit: Option<u64>,
@@ -309,6 +313,7 @@ impl Config {
             ),
             trusted_proxies: parse_proxies(&var("GRANARY_TRUSTED_PROXIES", ""))?,
             offline: bool_var("GRANARY_OFFLINE", false)?,
+            npm_rewrite_tarballs: bool_var("GRANARY_NPM_REWRITE_TARBALLS", true)?,
             cache_limit: match var("GRANARY_CACHE_LIMIT", "").as_str() {
                 "" => None,
                 s => Some(parse_size(s).with_context(|| {

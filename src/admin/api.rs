@@ -721,6 +721,7 @@ async fn system(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
             {"key": "GRANARY_CARGO_INDEX", "label": "Cargo index", "value": cfg.cargo_index},
             {"key": "GRANARY_CARGO_DL", "label": "Cargo downloads", "value": cfg.cargo_dl},
             {"key": "GRANARY_NPM_UPSTREAM", "label": "npm registry", "value": cfg.npm_upstream},
+            {"key": "GRANARY_NPM_REWRITE_TARBALLS", "label": "npm tarball URLs", "value": if cfg.npm_rewrite_tarballs { "Rewritten to point at Granary" } else { "Kept as the registry lists them, so lockfiles stay portable" }},
             {"key": "GRANARY_PYPI_INDEX", "label": "PyPI index", "value": cfg.pypi_index},
             {"key": "GRANARY_PYPI_FILES", "label": "PyPI files", "value": cfg.pypi_files},
             {"key": "GRANARY_SEARCH", "label": "Package search", "value": if !cfg.search { "Off: exact name lookup only" } else if cfg.offline { "On, but offline mode allows exact lookups of cached packages only" } else { "On" }},

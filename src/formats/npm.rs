@@ -107,6 +107,11 @@ async fn packument(st: &AppState, headers: &HeaderMap, name: &str) -> AppResult<
     let url = format!("{}/{}", st.cfg.npm_upstream, name.replace('/', "%2f"));
     let meta = st.store.meta("npm", name, variant, &url, accept).await?;
 
+    // Left alone, the tarball URLs still reach Granary: npm maps
+    // registry.npmjs.org onto the configured registry.
+    if !st.cfg.npm_rewrite_tarballs {
+        return Ok(([(header::CONTENT_TYPE, meta.content_type)], meta.body).into_response());
+    }
     let body = rewrite_tarball_urls(
         &String::from_utf8_lossy(&meta.body),
         &st.cfg.npm_upstream,

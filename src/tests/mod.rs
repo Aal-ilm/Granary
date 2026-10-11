@@ -6,6 +6,7 @@ mod git;
 mod git_templates;
 mod jobs;
 mod maven;
+mod npm;
 mod offline;
 mod search;
 mod starter;
@@ -137,6 +138,7 @@ pub struct Opts {
     pub git_upstream: Option<String>,
     pub git_max_size: u64,
     pub git_timeout: Duration,
+    pub npm_rewrite_tarballs: bool,
 }
 
 /// The shared secret test warmers expect.
@@ -158,6 +160,7 @@ impl Default for Opts {
             git_upstream: None,
             git_max_size: 2 << 30,
             git_timeout: Duration::from_secs(600),
+            npm_rewrite_tarballs: true,
         }
     }
 }
@@ -191,6 +194,7 @@ impl Harness {
             git_upstream,
             git_max_size,
             git_timeout,
+            npm_rewrite_tarballs,
         } = opts;
         // Bind first so the config can name Granary's own address.
         let own = if serve {
@@ -250,6 +254,7 @@ impl Harness {
             trusted_proxies: Vec::new(),
             audit_days: 365,
             offline,
+            npm_rewrite_tarballs,
             cache_limit,
         };
         let store = Store::new(data.clone(), meta_ttl, offline).await.unwrap();

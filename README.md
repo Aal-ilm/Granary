@@ -575,6 +575,7 @@ All settings are environment variables.
 | `GRANARY_CARGO_INDEX` | `https://index.crates.io` | Upstream sparse index |
 | `GRANARY_CARGO_DL` | `https://static.crates.io/crates/{crate}/{version}/download` | Upstream crate download template |
 | `GRANARY_NPM_UPSTREAM` | `https://registry.npmjs.org` | Upstream npm registry |
+| `GRANARY_NPM_REWRITE_TARBALLS` | `on` | `off`: serve npm packuments with their original tarball URLs, so lockfiles stay portable (see [npm tarball URLs](#npm-tarball-urls)) |
 | `GRANARY_PYPI_INDEX` | `https://pypi.org/simple` | Upstream Simple API |
 | `GRANARY_PYPI_FILES` | `https://files.pythonhosted.org` | Host that PyPI file links point to |
 | `GRANARY_MAVEN_UPSTREAM` | `https://repo1.maven.org/maven2` | Upstream Maven repository (Maven 2 layout) |
@@ -611,6 +612,26 @@ PyPI and Maven alike:
 
 Fill the cache while online first, then switch offline mode on.
 
+### npm tarball URLs
+
+Each npm packument lists a tarball URL for every version, and npm, pnpm and
+Yarn copy those URLs into the lockfile as `resolved`. With
+`GRANARY_NPM_REWRITE_TARBALLS` on (the default), Granary rewrites them to
+point at itself, so every client downloads through Granary whatever its
+settings. The cost is that lockfiles then name Granary's address, and a
+machine without access to it can't install from them.
+
+With it off, packuments keep their `https://registry.npmjs.org/...` URLs and
+lockfiles stay portable. npm still downloads through Granary, because it maps
+registry.npmjs.org onto the configured registry (its `replace-registry-host`
+setting, `npmjs` by default). Clients that fetch the URL as written go
+straight to registry.npmjs.org instead, bypassing the cache, and fail in
+offline mode or without internet access. That includes Yarn 1, npm with
+`replace-registry-host=never`, some pnpm setups, and any client when
+`GRANARY_NPM_UPSTREAM` is not registry.npmjs.org (the URLs then name that
+registry, which npm doesn't map). Leave it on unless portable lockfiles
+matter more than that.
+
 ## How it works
 
 Every format comes down to two kinds of data:
@@ -624,7 +645,8 @@ Every format comes down to two kinds of data:
   the available versions and changes as new ones are published. It is cached
   for `GRANARY_META_TTL_SECS`, then revalidated with `If-None-Match` /
   `If-Modified-Since`. Download links inside it are rewritten to point back at
-  Granary.
+  Granary (for npm, unless [`GRANARY_NPM_REWRITE_TARBALLS`](#npm-tarball-urls)
+  is off).
 
 For Maven, Granary fetches the `.sha1` that Central publishes next to each
 `.jar` and `.pom` and checks the download against it before caching; a
