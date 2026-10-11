@@ -108,14 +108,14 @@ below a threshold.
 ## 6. Optional: warming templates
 
 Warming templates needs the `granary-warmer` container next to Granary (see
-the README's *Warming templates with the warmer*). Build it once:
+the README's *Warming templates with the warmer*). Its image is published
+with Granary's, as `ghcr.io/aal-ilm/granary-warmer`, with the same version
+tags and the same vulnerability scan, and rebuilt every week with security
+fixes. Use the version that matches your Granary. (To build it on the NAS
+instead: `sudo docker build -t granary-warmer:0.8 warmer` in the source
+folder, and add `pull_policy: never` below.)
 
-```sh
-cd /mnt/POOL/apps/granary/src
-sudo docker build -t granary-warmer:0.5.0 warmer
-```
-
-Then edit the app and add the warmer, an internal network and a shared
+Edit the app and add the warmer, an internal network and a shared
 secret (any 16+ random characters, the same in both places):
 
 ```yaml
@@ -129,8 +129,7 @@ services:
     networks: [default, warm]
 
   granary-warmer:
-    image: granary-warmer:0.5.0
-    pull_policy: never
+    image: ghcr.io/aal-ilm/granary-warmer:0.8
     restart: unless-stopped
     environment:
       WARMER_SECRET: "CHANGE-ME-TO-A-LONG-RANDOM-SECRET"

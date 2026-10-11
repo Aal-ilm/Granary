@@ -1,9 +1,11 @@
 name: Weekly image rebuild
 
-# The runtime base image is unpinned so it picks up security fixes. This
-# rebuilds the latest release every week, with a fresh base image and no
-# build cache, and republishes it under the same version tags, so the
-# published image gets those fixes even when Granary's code hasn't changed.
+# The images' base layers pick up security fixes from package upgrades at
+# build time. This rebuilds the latest release every week, with fresh base
+# images and no build cache, and republishes it under the same version tags,
+# so the published images get those fixes even when Granary's code hasn't
+# changed. The main image and the warmer are rebuilt separately, so a
+# problem with one never holds back the other.
 
 on:
   schedule:
@@ -24,19 +26,34 @@ jobs:
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: granary
+            context: .
+          - image: granary-warmer
+            context: warmer
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - id: release
         name: Find the latest release
+        env:
+          CONTEXT: ${{ matrix.context }}
         run: |
           tag="$(git tag --list 'v*' --sort=-v:refname | head -n 1)"
           if [ -z "$tag" ]; then
             echo "No release tags yet, so there is nothing to rebuild."
           else
-            echo "Rebuilding $tag"
             git checkout --quiet "$tag"
+            if [ ! -f "$CONTEXT/Dockerfile" ]; then
+              echo "$tag has no $CONTEXT/Dockerfile, so there is nothing to rebuild."
+              tag=""
+            else
+              echo "Rebuilding $tag from $CONTEXT"
+            fi
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - if: steps.release.outputs.tag != ''
@@ -51,7 +68,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/granary
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
             type=semver,pattern={{version}},value=${{ steps.release.outputs.tag }}
             type=semver,pattern={{major}}.{{minor}},value=${{ steps.release.outputs.tag }}
@@ -60,22 +77,22 @@ jobs:
       - if: steps.release.outputs.tag != ''
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ${{ matrix.context }}
           pull: true
           no-cache: true
           load: true
-          tags: granary:scan
+          tags: ${{ matrix.image }}:scan
       - if: steps.release.outputs.tag != ''
         uses: aquasecurity/trivy-action@0.33.1
         with:
-          image-ref: granary:scan
+          image-ref: ${{ matrix.image }}:scan
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: "1"
       - if: steps.release.outputs.tag != ''
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ${{ matrix.context }}
           pull: true
           push: true
           tags: ${{ steps.meta.outputs.tags }}

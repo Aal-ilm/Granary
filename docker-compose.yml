@@ -45,8 +45,10 @@ services:
 
   granary-warmer:
     profiles: [warmer]
-    build: ./warmer
-    image: granary-warmer:latest
+    # Published next to Granary's image with the same version tags. Keep the
+    # two on the same version. To build it yourself instead, replace this
+    # line with "build: ./warmer".
+    image: ghcr.io/aal-ilm/granary-warmer:0.8
     container_name: granary-warmer
     restart: unless-stopped
     environment:

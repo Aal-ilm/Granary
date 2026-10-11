@@ -434,10 +434,13 @@ next to `docker-compose.yml`, then start it with its profile:
 
 ```sh
 echo "GRANARY_WARMER_SECRET=$(openssl rand -hex 24)" >> .env
-docker compose --profile warmer up -d --build
+docker compose --profile warmer up -d
 ```
 
-`docker-compose.yml` already points Granary at it (`GRANARY_WARMER_URL`)
+The warmer image is published next to Granary's as
+`ghcr.io/aal-ilm/granary-warmer`, with the same version tags, the same
+vulnerability scan and the same weekly rebuild; keep the two on the same
+version. `docker-compose.yml` already points Granary at it (`GRANARY_WARMER_URL`)
 and puts both on an internal Docker network with no route to the internet,
 so the warmer can only download through Granary. When the warmer isn't
 running, the web UI hides **Warm** and **With dependencies**, and

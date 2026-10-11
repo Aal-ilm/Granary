@@ -33,17 +33,48 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  # The optional warmer image: built, scanned with the same gate as the main
+  # image, and published next to it on version tags with the same tags.
   warmer-image:
-    needs: [test]
+    needs: [test, audit]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      # The warmer is optional and never published; check that it builds.
+      - uses: docker/login-action@v3
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/granary-warmer
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
       - uses: docker/build-push-action@v6
         with:
           context: warmer
-          push: false
+          load: true
+          tags: granary-warmer:scan
+          cache-from: type=gha,scope=warmer
+      - uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: granary-warmer:scan
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+      - uses: docker/build-push-action@v6
+        with:
+          context: warmer
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=warmer
           cache-to: type=gha,scope=warmer,mode=max
 
