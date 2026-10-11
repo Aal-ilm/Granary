@@ -139,10 +139,8 @@ or org):
 - Offline mode serves cached private packages.
 
 ## Commits and docs
-- Conventional Commits with a scope (`feat(gitea): ...`,
-  `feat(auth): ...`), each ending with
-  `Signed-off-by: Dev <dev@dynatheia.com>`. No mention of Claude or AI in
-  commits, code, comments, or docs.
+- Commit messages contain only a description of the change and the
+  `Signed-off-by: Dev <dev@dynatheia.com>` line.
 - README sections: Gitea setup, the extra CA, private access modes and how
   to change them, private namespaces, and the dependency confusion rule.
   No em dashes.

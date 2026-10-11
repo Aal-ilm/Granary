@@ -162,9 +162,8 @@ and Podman (`registries.conf`).
 - Docker Hub search.
 
 ## Commits and docs
-- Conventional Commits with the scope `oci`, each ending with
-  `Signed-off-by: Dev <dev@dynatheia.com>`. No mention of Claude or AI in
-  commits, code, comments, or docs.
+- Commit messages contain only a description of the change and the
+  `Signed-off-by: Dev <dev@dynatheia.com>` line.
 - README sections:
   - setup for Docker, Docker Desktop, containerd, Kubernetes, and Podman
   - TLS

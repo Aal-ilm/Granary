@@ -167,9 +167,7 @@ Add "C++ CMake essentials", with both Conan and vcpkg sections:
   (skipped without it).
 
 ## Commits and docs
-- Conventional Commits with a scope (`feat(raw)`, `feat(vcpkg)`,
-  `feat(conan)`), each ending with
-  `Signed-off-by: Dev <dev@dynatheia.com>`. No mention of Claude or AI in
-  commits, code, comments, or docs.
+- Commit messages contain only a description of the change and the
+  `Signed-off-by: Dev <dev@dynatheia.com>` line.
 - README sections for each phase, with client setup and limits. No em
   dashes.

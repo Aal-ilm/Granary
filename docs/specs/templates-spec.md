@@ -182,3 +182,5 @@ versions unpinned, at latest compatible:
 - README sections for search, templates, the warmer service, and the
   privacy note on search hosts.
 - No em dashes in copy, comments, or commit messages.
+- Commit messages contain only a description of the change and the
+  `Signed-off-by: Dev <dev@dynatheia.com>` line.
