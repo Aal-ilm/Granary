@@ -23,6 +23,7 @@ use crate::{
     net::ClientIp,
     policy::{Mode, Principal},
     store::{dir_size, now_secs},
+    templates::lines::Eco,
     util::base_url,
 };
 
@@ -43,6 +44,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/system/check", post(system_check))
         .route("/api/system/gitea/check", post(gitea_check))
         .route("/api/system/private-access", put(set_private_access))
+        .route("/api/system/gitea/namespaces", put(set_namespaces))
         .route("/api/logs", get(logs))
 }
 
@@ -97,8 +99,29 @@ pub(crate) async fn usage(st: &AppState, inv: &[Asset]) -> Vec<RepoUsage> {
         .collect()
 }
 
-async fn overview(State(st): State<AppState>, who: Principal) -> Json<Value> {
+/// The cached files `who` may see, and the bytes of those they may not
+/// (with the private packages' metadata), which still count toward the
+/// cache budget.
+async fn visible(st: &AppState, who: &Principal) -> (Vec<Asset>, u64) {
     let inv = st.admin.inventory(&st.store).await;
+    let (shown, hidden): (Vec<Asset>, Vec<Asset>) = inv
+        .iter()
+        .cloned()
+        .partition(|a| st.policy.can_read(who, a.resource().as_ref()));
+    let meta_dirs: Vec<_> = inventory::PRIVATE
+        .iter()
+        .map(|(_, ns)| st.store.meta_dir(ns))
+        .collect();
+    let private_meta =
+        tokio::task::spawn_blocking(move || meta_dirs.iter().map(|d| dir_size(d)).sum::<u64>())
+            .await
+            .unwrap_or(0);
+    let hidden_size = hidden.iter().map(|a| a.size).sum::<u64>() + private_meta;
+    (shown, hidden_size)
+}
+
+async fn overview(State(st): State<AppState>, who: Principal) -> Json<Value> {
+    let (inv, hidden_assets) = visible(&st, &who).await;
     let mut repos = usage(&st, &inv).await;
     // Cached git repos get their own gauge and count toward the budget.
     // Private repos someone can't read are left out of their counts; their
@@ -113,7 +136,7 @@ async fn overview(State(st): State<AppState>, who: Principal) -> Json<Value> {
             crate::formats::git::cached_resource(&st.cfg, r).as_ref(),
         )
     });
-    let hidden_size: u64 = hidden.iter().map(|r| r.size).sum();
+    let hidden_size: u64 = hidden.iter().map(|r| r.size).sum::<u64>() + hidden_assets;
     repos.push(RepoUsage {
         repo: "git",
         packages: git.len(),
@@ -158,13 +181,20 @@ async fn overview(State(st): State<AppState>, who: Principal) -> Json<Value> {
 
 // ------------------------------------------------------------ repositories
 
-async fn repos(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
+async fn repos(State(st): State<AppState>, who: Principal, headers: HeaderMap) -> Json<Value> {
     let base = base_url(&st.cfg, &headers);
     let (scheme, host) = base.split_once("://").unwrap_or(("http", &base));
     let (scheme, host) = (scheme.to_string(), host.to_string());
     let auth = st.cfg.client_auth;
-    let inv = st.admin.inventory(&st.store).await;
+    let (inv, _) = visible(&st, &who).await;
     let usage = usage(&st, &inv).await;
+    // The private Cargo registry, for those who may use it.
+    let private_cargo = st.namespaces.cargo_owner().is_some_and(|owner| {
+        st.policy.can_read_private(
+            &who,
+            &crate::policy::Resource::gitea_package("cargo", &owner, ""),
+        )
+    });
     let health = st.admin.health.lock().unwrap().clone();
     let cfg = &st.cfg;
 
@@ -182,11 +212,20 @@ async fn repos(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
                         json!({"label": "Downloads", "url": cfg.cargo_dl}),
                     ],
                     if auth {
-                        json!({
+                        let mut setup = json!({
                             "file": "~/.cargo/config.toml",
                             "snippet": format!("[registries.granary]\nindex = \"sparse+{base}/cargo/\"\ncredential-provider = \"cargo:token\"\n\n[source.crates-io]\nreplace-with = \"granary\""),
                             "after": "Then run cargo login --registry granary and paste your token.",
-                        })
+                        });
+                        if private_cargo {
+                            setup["more"] = json!([{
+                                "label": "private registry (Gitea)",
+                                "file": "~/.cargo/config.toml",
+                                "snippet": format!("[registries.granary-private]\nindex = \"sparse+{base}/cargo-private/\"\ncredential-provider = \"cargo:token\""),
+                                "after": "Then run cargo login --registry granary-private with a token that has private access, and depend on its crates with registry = \"granary-private\".",
+                            }]);
+                        }
+                        setup
                     } else {
                         json!({
                             "file": "~/.cargo/config.toml",
@@ -320,6 +359,7 @@ struct ListQuery {
 
 async fn components(
     State(st): State<AppState>,
+    who: Principal,
     Query(q): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
     let repo = match q.repo.as_deref().filter(|r| !r.is_empty()) {
@@ -327,7 +367,7 @@ async fn components(
         None => None,
     };
     let needle = q.q.unwrap_or_default().trim().to_lowercase();
-    let inv = st.admin.inventory(&st.store).await;
+    let (inv, _) = visible(&st, &who).await;
     let filtered: Vec<Asset> = inv
         .iter()
         .filter(|a| repo.is_none_or(|r| a.repo == r))
@@ -370,6 +410,30 @@ async fn components(
 struct ComponentQuery {
     repo: String,
     name: String,
+    /// The private package from Gitea, rather than a public one.
+    #[serde(default)]
+    private: bool,
+}
+
+/// A package's cached files that `who` may see.
+async fn component_assets(
+    st: &AppState,
+    who: &Principal,
+    q: &ComponentQuery,
+) -> AppResult<Vec<Asset>> {
+    let repo = repo_id(&q.repo)?;
+    let (inv, _) = visible(st, who).await;
+    let assets: Vec<Asset> = inv
+        .into_iter()
+        .filter(|a| a.repo == repo && a.package == q.name && a.private == q.private)
+        .collect();
+    if assets.is_empty() {
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            format!("{} is not cached in {repo}", q.name),
+        ));
+    }
+    Ok(assets)
 }
 
 /// Order versions naturally: numeric runs compare as numbers.
@@ -438,21 +502,13 @@ fn upstream_page(st: &AppState, repo: &str, name: &str) -> Option<(String, Strin
 
 async fn component(
     State(st): State<AppState>,
+    who: Principal,
     headers: HeaderMap,
     Query(q): Query<ComponentQuery>,
 ) -> AppResult<Json<Value>> {
     let repo = repo_id(&q.repo)?;
-    let inv = st.admin.inventory(&st.store).await;
-    let assets: Vec<&Asset> = inv
-        .iter()
-        .filter(|a| a.repo == repo && a.package == q.name)
-        .collect();
-    if assets.is_empty() {
-        return Err(AppError::new(
-            StatusCode::NOT_FOUND,
-            format!("{} is not cached in {repo}", q.name),
-        ));
-    }
+    let owned = component_assets(&st, &who, &q).await?;
+    let assets: Vec<&Asset> = owned.iter().collect();
 
     let mut by_version: BTreeMap<&str, Vec<&Asset>> = BTreeMap::new();
     for a in &assets {
@@ -465,11 +521,14 @@ async fn component(
             let files_json: Vec<Value> = files
                 .iter()
                 .map(|a| {
-                    let download = match repo {
-                        "cargo" => format!("{base}/cargo/dl/{}/{v}", a.package),
-                        "npm" => format!("{base}/npm/{}", a.path),
-                        "maven" => format!("{base}/maven/{}", a.path),
-                        _ => format!("{base}/pypi/files/{}", a.path),
+                    let p = a.inner_path();
+                    let download = match (repo, a.private) {
+                        ("cargo", false) => format!("{base}/cargo/dl/{}/{v}", a.package),
+                        ("cargo", true) => format!("{base}/cargo-private/dl/{}/{v}", a.package),
+                        ("npm", _) => format!("{base}/npm/{p}"),
+                        ("maven", _) => format!("{base}/maven/{p}"),
+                        (_, false) => format!("{base}/pypi/files/{p}"),
+                        (_, true) => format!("{base}/pypi/gitea-files/{p}"),
                     };
                     json!({
                         "file_name": a.file_name,
@@ -497,10 +556,11 @@ async fn component(
         )
     });
 
-    let upstream = upstream_page(&st, repo, &q.name);
+    let upstream = upstream_page(&st, repo, &q.name).filter(|_| !q.private);
     Ok(Json(json!({
         "repo": repo,
         "name": q.name,
+        "private": q.private,
         "size": assets.iter().map(|a| a.size).sum::<u64>(),
         "files": assets.len(),
         "versions": versions,
@@ -511,29 +571,25 @@ async fn component(
 async fn delete_component(
     State(st): State<AppState>,
     auth: AuthSession,
+    who: Principal,
     Extension(ip): Extension<ClientIp>,
     Query(q): Query<ComponentQuery>,
 ) -> AppResult<Json<Value>> {
     let admin = require_admin(&auth)?;
     let repo = repo_id(&q.repo)?;
-    let inv = st.admin.inventory(&st.store).await;
-    let paths: Vec<String> = inv
-        .iter()
-        .filter(|a| a.repo == repo && a.package == q.name)
-        .map(|a| a.path.clone())
-        .collect();
-    if paths.is_empty() {
-        return Err(AppError::not_found());
-    }
+    let assets = component_assets(&st, &who, &q)
+        .await
+        .map_err(|_| AppError::not_found())?;
     let (mut files, mut bytes) = (0, 0);
-    for p in &paths {
-        if let Ok(freed) = st.store.delete_file(repo, p).await {
+    for a in &assets {
+        if let Ok(freed) = st.store.delete_file(a.ns, &a.path).await {
             files += 1;
             bytes += freed;
         }
     }
-    for key in inventory::meta_keys(repo, &q.name) {
-        bytes += st.store.delete_meta(repo, &key).await.unwrap_or(0);
+    let owner = assets.first().and_then(|a| a.owner.clone());
+    for (ns, key) in inventory::meta_docs(repo, owner.as_deref(), &q.name) {
+        bytes += st.store.delete_meta(ns, &key).await.unwrap_or(0);
     }
     st.admin.invalidate_inventory();
     let _ = st.store.flush_access().await;
@@ -553,17 +609,33 @@ async fn delete_component(
 struct AssetQuery {
     repo: String,
     path: String,
+    /// A private package's file, in its `gitea-` namespace.
+    #[serde(default)]
+    private: bool,
 }
 
 async fn delete_asset(
     State(st): State<AppState>,
     auth: AuthSession,
+    who: Principal,
     Extension(ip): Extension<ClientIp>,
     Query(q): Query<AssetQuery>,
 ) -> AppResult<Json<Value>> {
     let admin = require_admin(&auth)?;
     let repo = repo_id(&q.repo)?;
-    let freed = st.store.delete_file(repo, &q.path).await?;
+    let ns = if q.private {
+        inventory::private_ns(repo).ok_or_else(AppError::not_found)?
+    } else {
+        repo
+    };
+    // Only a file the caller may see; a private one must be readable.
+    if q.private {
+        let (inv, _) = visible(&st, &who).await;
+        if !inv.iter().any(|a| a.ns == ns && a.path == q.path) {
+            return Err(AppError::not_found());
+        }
+    }
+    let freed = st.store.delete_file(ns, &q.path).await?;
     st.admin.invalidate_inventory();
     let _ = st.store.flush_access().await;
     tracing::info!("{repo}: deleted {}", q.path);
@@ -752,6 +824,7 @@ async fn system(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
             "url": g.url,
             "host": g.host,
             "status": st.gitea.status(),
+            "namespaces": namespaces_json(&st),
         })),
         "private_access": private_access_json(&st),
     }))
@@ -763,6 +836,88 @@ fn private_access_json(st: &AppState) -> Value {
         "locked": st.policy.locked(),
         "modes": Mode::ALL.iter().map(|m| json!({"id": m.as_str(), "label": m.describe()})).collect::<Vec<_>>(),
     })
+}
+
+fn namespaces_json(st: &AppState) -> Value {
+    let lists = st.namespaces.lists();
+    let formats: Vec<Value> = [Eco::Npm, Eco::Pypi, Eco::Maven, Eco::Cargo]
+        .iter()
+        .map(|eco| {
+            json!({
+                "format": eco.as_str(),
+                "label": eco.label(),
+                "env": crate::namespaces::env_var(*eco),
+                "locked": st.namespaces.locked(*eco),
+                "rules": lists.get(eco.as_str()).cloned().unwrap_or_default(),
+            })
+        })
+        .collect();
+    json!(formats)
+}
+
+#[derive(Deserialize)]
+struct NamespacesBody {
+    format: String,
+    rules: Vec<crate::namespaces::Rule>,
+}
+
+/// Replace one format's private namespaces, unless the environment sets them.
+async fn set_namespaces(
+    State(st): State<AppState>,
+    auth: AuthSession,
+    Extension(ip): Extension<ClientIp>,
+    Json(body): Json<NamespacesBody>,
+) -> AppResult<Json<Value>> {
+    let admin = require_admin(&auth)?.username.clone();
+    if st.cfg.gitea.is_none() {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "Gitea is not set up (GRANARY_GITEA_URL)",
+        ));
+    }
+    let eco = Eco::parse(&body.format)
+        .ok_or_else(|| AppError::bad_request(format!("unknown format {:?}", body.format)))?;
+    let locked = st.namespaces.locked(eco);
+    st.namespaces
+        .set(&st.auth.db, eco, body.rules)
+        .await
+        .map_err(|e| {
+            AppError::new(
+                if locked {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                e,
+            )
+        })?;
+    let summary: Vec<String> = st
+        .namespaces
+        .lists()
+        .get(eco.as_str())
+        .into_iter()
+        .flatten()
+        .map(|r| format!("{}={}", r.pattern, r.owner))
+        .collect();
+    tracing::info!(
+        "{admin} set the private {} namespaces: {}",
+        eco.label(),
+        if summary.is_empty() {
+            "none".to_string()
+        } else {
+            summary.join(", ")
+        }
+    );
+    audit(
+        &st,
+        &admin,
+        "system.namespaces",
+        &format!("{}: {}", eco.as_str(), summary.join(", ")),
+        ip,
+    )
+    .await;
+    st.admin.invalidate_inventory();
+    Ok(Json(json!({ "namespaces": namespaces_json(&st) })))
 }
 
 /// "Test connection" for Gitea.

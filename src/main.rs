@@ -12,6 +12,7 @@ mod inventory;
 mod jobs;
 mod logbuf;
 mod metrics;
+mod namespaces;
 mod net;
 mod policy;
 mod search;
@@ -48,12 +49,14 @@ pub struct AppState {
     pub auth: Backend,
     pub policy: Arc<policy::Policy>,
     pub gitea: Arc<gitea::Gitea>,
+    pub namespaces: Arc<namespaces::Namespaces>,
 }
 
 pub fn app(state: AppState, sessions: SqliteSessionStore) -> Router {
     // Package downloads: access token or signed-in session (if required).
     let packages = Router::new()
         .merge(formats::cargo::router())
+        .merge(formats::cargo_private::router())
         .merge(formats::npm::router())
         .merge(formats::pypi::router())
         .merge(formats::maven::router())
@@ -165,6 +168,7 @@ async fn run() -> anyhow::Result<()> {
         cfg.meta_ttl,
         cfg.offline,
         egress.clone(),
+        store::UpstreamAuth::gitea(&cfg),
     )
     .await?;
     let admin = Admin::new(&cfg.data_dir, logs).await?;
@@ -191,6 +195,8 @@ async fn run() -> anyhow::Result<()> {
         tracing::info!("removed {n} sessions saved in the old format");
     }
     let policy = policy::Policy::load(&db, cfg.private_access).await?;
+    let namespaces =
+        namespaces::Namespaces::load(&db, cfg.gitea.is_some(), &cfg.namespace_env).await?;
     let backend = Backend::new(db).await?;
     tracing::info!(
         data_dir = %store.root().display(),
@@ -241,6 +247,7 @@ async fn run() -> anyhow::Result<()> {
         admin: Arc::new(admin),
         auth: backend,
         policy: Arc::new(policy),
+        namespaces: Arc::new(namespaces),
     };
     {
         let st = state.clone();

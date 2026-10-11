@@ -128,6 +128,7 @@ pub mod tests {
             extra_ca: None,
             private_hosts: Vec::new(),
             private_access: None,
+            namespace_env: Default::default(),
         }
     }
 }

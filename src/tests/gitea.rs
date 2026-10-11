@@ -32,17 +32,17 @@ use crate::{
     policy::Mode,
 };
 
-const TOKEN: &str = "0123456789abcdef0123456789abcdef01234567";
+pub(super) const TOKEN: &str = "0123456789abcdef0123456789abcdef01234567";
 
 /// A stand-in for Gitea at `https://localhost:{port}`: its version and user
 /// API, and `git http-backend` for repos under `root/{owner}/{repo}.git`.
 /// Everything needs the token.
 #[derive(Clone)]
-struct MockGitea {
-    url: String,
-    host: String,
+pub(super) struct MockGitea {
+    pub(super) url: String,
+    pub(super) host: String,
     /// The test CA's certificate (PEM).
-    ca: PathBuf,
+    pub(super) ca: PathBuf,
     root: Arc<TempDir>,
     /// Every Authorization header received, in order ("" when none).
     auth_seen: Arc<Mutex<Vec<String>>>,
@@ -50,6 +50,14 @@ struct MockGitea {
     redirect: Arc<Mutex<Option<String>>>,
     /// Act like a token without the read:user scope.
     no_user_scope: Arc<std::sync::atomic::AtomicBool>,
+    /// Package registry files by path (`/api/packages/...`).
+    pub(super) packages: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+    /// Package paths answered with a redirect to another URL.
+    pub(super) package_redirects: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// Every package registry path requested.
+    pub(super) package_hits: Arc<Mutex<Vec<String>>>,
+    /// What the package search API returns.
+    pub(super) search: Arc<Mutex<Value>>,
 }
 
 async fn serve_gitea(
@@ -66,6 +74,25 @@ async fn serve_gitea(
         .to_string();
     g.auth_seen.lock().unwrap().push(auth.clone());
     let path = uri.path();
+    if path.starts_with("/api/packages/") {
+        g.package_hits.lock().unwrap().push(path.to_string());
+        if auth != format!("token {TOKEN}") {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        if let Some(to) = g.package_redirects.lock().unwrap().get(path).cloned() {
+            return (StatusCode::FOUND, [(header::LOCATION, to)]).into_response();
+        }
+        return match g.packages.lock().unwrap().get(path).cloned() {
+            Some(body) => body.into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
+    if path.starts_with("/api/v1/packages/") {
+        if auth != format!("token {TOKEN}") {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        return Json(g.search.lock().unwrap().clone()).into_response();
+    }
     if path.starts_with("/api/") {
         if let Some(to) = g.redirect.lock().unwrap().clone() {
             return (StatusCode::FOUND, [(header::LOCATION, to)]).into_response();
@@ -108,7 +135,7 @@ async fn serve_gitea(
 }
 
 impl MockGitea {
-    async fn start() -> Self {
+    pub(super) async fn start() -> Self {
         let root = Arc::new(TempDir::new("gitea"));
         let (ca_pem, tls) = test_tls();
         let ca = root.0.join("test-ca.pem");
@@ -123,6 +150,10 @@ impl MockGitea {
             auth_seen: Arc::default(),
             redirect: Arc::default(),
             no_user_scope: Arc::default(),
+            packages: Arc::default(),
+            package_redirects: Arc::default(),
+            package_hits: Arc::default(),
+            search: Arc::new(Mutex::new(json!([]))),
         };
         let app = Router::new()
             .fallback(any(serve_gitea))
@@ -150,7 +181,7 @@ impl MockGitea {
         g
     }
 
-    fn gitea(&self) -> Gitea {
+    pub(super) fn gitea(&self) -> Gitea {
         Gitea {
             url: self.url.clone(),
             host: self.host.clone(),
@@ -159,7 +190,7 @@ impl MockGitea {
     }
 
     /// Create `{owner}/{name}.git` with one commit holding `files`.
-    fn create(&self, owner: &str, name: &str, files: &[(&str, &[u8])]) {
+    pub(super) fn create(&self, owner: &str, name: &str, files: &[(&str, &[u8])]) {
         let bare = self.root.0.join(owner).join(format!("{name}.git"));
         std::fs::create_dir_all(&bare).unwrap();
         ok(client_git(
@@ -170,7 +201,9 @@ impl MockGitea {
         std::fs::create_dir_all(&work).unwrap();
         ok(client_git(&["init", "-q", "-b", "main", "."], &work));
         for (path, data) in files {
-            std::fs::write(work.join(path), data).unwrap();
+            let file = work.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, data).unwrap();
         }
         ok(client_git(&["add", "."], &work));
         ok(client_git(&["commit", "-q", "-m", "first"], &work));
@@ -180,7 +213,7 @@ impl MockGitea {
         ));
     }
 
-    fn seen(&self) -> Vec<String> {
+    pub(super) fn seen(&self) -> Vec<String> {
         self.auth_seen.lock().unwrap().clone()
     }
 }

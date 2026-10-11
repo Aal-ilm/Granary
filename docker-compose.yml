@@ -40,6 +40,12 @@ services:
       # GRANARY_GITEA_URL: "https://gitea.example.lan"
       # GRANARY_GITEA_TOKEN_FILE: "/run/secrets/gitea-token"
       # GRANARY_EXTRA_CA: "/etc/granary/internal-ca.pem"
+      # Which package names belong to Gitea, per format (or set them on the
+      # System page). Matching names are only ever fetched from Gitea.
+      # GRANARY_GITEA_NPM: "@example=example-org"
+      # GRANARY_GITEA_PYPI: "example-*=example-org"
+      # GRANARY_GITEA_MAVEN: "com.example=example-org"
+      # GRANARY_GITEA_CARGO: "example-org"
       # Granary refuses upstreams at private addresses. List internal
       # mirrors you set as upstreams here (the Gitea host is always allowed).
       # GRANARY_PRIVATE_HOSTS: "nexus.example.lan"

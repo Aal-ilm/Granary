@@ -1107,7 +1107,7 @@ pub async fn client_guard(
 /// understands.
 pub fn challenge(st: &AppState, headers: &HeaderMap, path: &str) -> Response {
     let base = base_url(&st.cfg, headers);
-    let challenge = if path.starts_with("/cargo/") {
+    let challenge = if path.starts_with("/cargo/") || path.starts_with("/cargo-private/") {
         format!("Cargo login_url=\"{base}/#/tokens\"")
     } else if path.starts_with("/maven/") || path.starts_with("/git/") {
         // Maven and git only send credentials after this challenge.

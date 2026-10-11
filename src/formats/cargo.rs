@@ -45,14 +45,14 @@ async fn config_json(State(st): State<AppState>, headers: HeaderMap) -> impl Int
     }))
 }
 
-fn valid_crate_name(s: &str) -> bool {
+pub fn valid_crate_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-fn valid_version(s: &str) -> bool {
+pub fn valid_version(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
         && s.bytes()
@@ -101,7 +101,7 @@ async fn expected_cksum(st: &AppState, name: &str, version: &str) -> Option<Chec
     cksum_from_index(&meta.body, version)
 }
 
-fn cksum_from_index(index: &[u8], version: &str) -> Option<Checksum> {
+pub fn cksum_from_index(index: &[u8], version: &str) -> Option<Checksum> {
     #[derive(serde::Deserialize)]
     struct Line {
         vers: String,

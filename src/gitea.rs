@@ -44,7 +44,13 @@ impl ApiError {
 pub struct Gitea {
     client: reqwest::Client,
     status: Mutex<Option<Status>>,
+    /// Per owner: whether Gitea serves a sparse Cargo index, and when that
+    /// was checked.
+    cargo_sparse: Mutex<std::collections::HashMap<String, (bool, std::time::Instant)>>,
 }
+
+/// How long the answer to "does Gitea serve a sparse Cargo index" is kept.
+const CARGO_PROBE_TTL: Duration = Duration::from_secs(10 * 60);
 
 impl Gitea {
     pub fn new(egress: &std::sync::Arc<Egress>) -> anyhow::Result<Self> {
@@ -58,6 +64,7 @@ impl Gitea {
         Ok(Self {
             client,
             status: Mutex::default(),
+            cargo_sparse: Mutex::default(),
         })
     }
 
@@ -117,6 +124,30 @@ impl Gitea {
             .map_err(|e| ApiError::new(code, crate::error::error_chain(&e)))?;
         serde_json::from_slice(&body)
             .map_err(|e| ApiError::new(code, format!("{url} did not return JSON: {e}")))
+    }
+
+    /// Whether the connected Gitea serves `owner`'s Cargo registry as a
+    /// sparse index (its `config.json` answers); if not, Granary reads the
+    /// git index instead. The answer is kept for a few minutes.
+    pub async fn cargo_sparse(&self, cfg: &Config, owner: &str) -> Result<bool, String> {
+        if let Some((sparse, at)) = self.cargo_sparse.lock().unwrap().get(owner)
+            && at.elapsed() < CARGO_PROBE_TTL
+        {
+            return Ok(*sparse);
+        }
+        let sparse = match self
+            .api_get(cfg, &format!("/api/packages/{owner}/cargo/config.json"))
+            .await
+        {
+            Ok(_) => true,
+            Err(e) if e.status == Some(404) => false,
+            Err(e) => return Err(format!("Gitea's Cargo registry: {}", e.message)),
+        };
+        self.cargo_sparse
+            .lock()
+            .unwrap()
+            .insert(owner.to_string(), (sparse, std::time::Instant::now()));
+        Ok(sparse)
     }
 
     /// Check the connection: Gitea's version and the token's owner.

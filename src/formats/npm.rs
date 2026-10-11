@@ -13,6 +13,11 @@
 //! through uncached. Everything else there (login, tokens, publishing,
 //! ownership…) is refused, so Granary can't be used to relay credentials or
 //! account changes to the public registry.
+//!
+//! Scopes listed as private namespaces (see `namespaces`) come from Gitea's
+//! npm registry instead, and only from there: a private name Gitea doesn't
+//! have is a 404, never a lookup on the public registry. They are cached
+//! apart from public packages, under `gitea-npm/{owner}/`.
 
 use axum::{
     Router,
@@ -26,9 +31,89 @@ use axum::{
 use crate::{
     AppState,
     error::{AppError, AppResult},
-    store::Checksum,
+    policy::{Principal, Resource, refuse},
+    store::{Checksum, Meta},
+    templates::lines::Eco,
     util::base_url,
 };
+
+/// Where a package comes from: the public registry, or Gitea.
+pub struct Origin {
+    /// The cache namespace.
+    pub ns: &'static str,
+    /// The Gitea owner, for a private package.
+    pub owner: Option<String>,
+    /// The registry's base URL, without a trailing slash.
+    base: String,
+}
+
+/// Route a package name: private scopes to Gitea, everything else to the
+/// public registry.
+pub fn origin(st: &AppState, name: &str) -> Origin {
+    match (st.namespaces.owner(Eco::Npm, name), &st.cfg.gitea) {
+        (Some(owner), Some(g)) => Origin {
+            ns: "gitea-npm",
+            base: format!("{}/api/packages/{owner}/npm", g.url),
+            owner: Some(owner),
+        },
+        _ => Origin {
+            ns: "npm",
+            owner: None,
+            base: st.cfg.npm_upstream.clone(),
+        },
+    }
+}
+
+impl Origin {
+    /// The access policy's description of a private package.
+    pub fn resource(&self, name: &str) -> Option<Resource> {
+        self.owner
+            .as_deref()
+            .map(|o| Resource::gitea_package("npm", o, name))
+    }
+
+    /// A path in this origin's cache namespace.
+    fn rel(&self, rel: &str) -> String {
+        match &self.owner {
+            Some(o) => format!("{o}/{rel}"),
+            None => rel.to_string(),
+        }
+    }
+
+    fn packument_url(&self, name: &str) -> String {
+        match self.owner {
+            // Gitea routes scoped names as two path segments.
+            Some(_) => format!("{}/{name}", self.base),
+            // Scoped names are requested upstream as `@scope%2fname`.
+            None => format!("{}/{}", self.base, name.replace('/', "%2f")),
+        }
+    }
+
+    /// The tarball file name in a tarball URL from this origin's packument.
+    pub fn tarball_file(&self, url: &str) -> Option<String> {
+        let ours = match &self.owner {
+            Some(o) => url.contains(&format!("/api/packages/{o}/npm/")),
+            None => url.starts_with(&format!("{}/", self.base)),
+        };
+        let (_, file) = url.rsplit_once("/-/")?;
+        (ours && !file.contains('/')).then(|| file.to_string())
+    }
+}
+
+/// A package's packument from wherever it comes from, cached.
+pub async fn packument_meta(
+    st: &AppState,
+    name: &str,
+    variant: &str,
+    accept: &str,
+) -> AppResult<(Origin, Meta)> {
+    let o = origin(st, name);
+    let meta = st
+        .store
+        .meta(o.ns, &o.rel(name), variant, &o.packument_url(name), accept)
+        .await?;
+    Ok((o, meta))
+}
 
 pub const ABBREVIATED: &str = "application/vnd.npm.install-v1+json";
 
@@ -38,6 +123,7 @@ pub fn router() -> Router<AppState> {
 
 async fn handle(
     State(st): State<AppState>,
+    who: Principal,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -64,6 +150,13 @@ async fn handle(
             StatusCode::METHOD_NOT_ALLOWED,
             "this is a read-only proxy; publishing is not supported yet",
         ));
+    }
+    // Private packages: ask who's there before anything else, cached or not.
+    let name = rest.split_once("/-/").map_or(rest.as_str(), |(pkg, _)| pkg);
+    if let Some(r) = origin(&st, name).resource(name)
+        && let Some(answer) = refuse(&st, &who, &r, &headers, uri.path())
+    {
+        return Ok(answer);
     }
     if let Some((pkg, file)) = rest.split_once("/-/") {
         tarball(&st, pkg, file).await
@@ -103,21 +196,43 @@ async fn packument(st: &AppState, headers: &HeaderMap, name: &str) -> AppResult<
         ("full", "application/json")
     };
 
-    // Scoped names are requested upstream as `@scope%2fname`.
-    let url = format!("{}/{}", st.cfg.npm_upstream, name.replace('/', "%2f"));
-    let meta = st.store.meta("npm", name, variant, &url, accept).await?;
+    let (o, meta) = packument_meta(st, name, variant, accept).await?;
 
     // Left alone, the tarball URLs still reach Granary: npm maps
     // registry.npmjs.org onto the configured registry.
     if !st.cfg.npm_rewrite_tarballs {
         return Ok(([(header::CONTENT_TYPE, meta.content_type)], meta.body).into_response());
     }
-    let body = rewrite_tarball_urls(
-        &String::from_utf8_lossy(&meta.body),
-        &st.cfg.npm_upstream,
-        &format!("{}/npm", base_url(&st.cfg, headers)),
-    );
+    let ours = format!("{}/npm", base_url(&st.cfg, headers));
+    let body = match &o.owner {
+        Some(owner) => rewrite_gitea_tarballs(&meta.body, owner, &ours)
+            .ok_or_else(|| AppError::bad_gateway("Gitea sent a packument that isn't JSON"))?,
+        None => rewrite_tarball_urls(&String::from_utf8_lossy(&meta.body), &o.base, &ours),
+    };
     Ok(([(header::CONTENT_TYPE, meta.content_type)], body).into_response())
+}
+
+/// Point a Gitea packument's tarball URLs at Granary. Gitea builds them from
+/// its own idea of its address (`ROOT_URL`), which may not be the URL
+/// Granary uses, so everything up to the registry path is replaced.
+fn rewrite_gitea_tarballs(doc: &[u8], owner: &str, ours: &str) -> Option<String> {
+    let mut v: serde_json::Value = serde_json::from_slice(doc).ok()?;
+    let marker = format!("/api/packages/{owner}/npm/");
+    if let Some(versions) = v.get_mut("versions").and_then(|x| x.as_object_mut()) {
+        for ver in versions.values_mut() {
+            let Some(t) = ver.pointer_mut("/dist/tarball") else {
+                continue;
+            };
+            if let Some(rest) = t
+                .as_str()
+                .and_then(|u| u.split_once(&marker))
+                .map(|(_, r)| r)
+            {
+                *t = serde_json::Value::String(format!("{ours}/{rest}"));
+            }
+        }
+    }
+    Some(v.to_string())
 }
 
 /// Point every `"tarball"` URL that references the upstream registry at us.
@@ -138,26 +253,22 @@ pub async fn tarball(st: &AppState, pkg: &str, file: &str) -> AppResult<Response
     if !valid_package_name(pkg) || !valid_file {
         return Err(AppError::not_found());
     }
-    let url = format!("{}/{pkg}/-/{file}", st.cfg.npm_upstream);
-    let rel = format!("{pkg}/-/{file}");
-    let expected = if st.store.has_file("npm", &rel).await {
+    let o = origin(st, pkg);
+    let url = format!("{}/{pkg}/-/{file}", o.base);
+    let rel = o.rel(&format!("{pkg}/-/{file}"));
+    let expected = if st.store.has_file(o.ns, &rel).await {
         None
     } else {
         expected_integrity(st, pkg, file).await
     };
     st.store
-        .file("npm", &rel, &url, "application/octet-stream", expected)
+        .file(o.ns, &rel, &url, "application/octet-stream", expected)
         .await
 }
 
 /// The `dist.integrity` the packument lists for this tarball.
 async fn expected_integrity(st: &AppState, pkg: &str, file: &str) -> Option<Checksum> {
-    let url = format!("{}/{}", st.cfg.npm_upstream, pkg.replace('/', "%2f"));
-    let meta = st
-        .store
-        .meta("npm", pkg, "abbr", &url, ABBREVIATED)
-        .await
-        .ok()?;
+    let (_, meta) = packument_meta(st, pkg, "abbr", ABBREVIATED).await.ok()?;
     let suffix = format!("/{pkg}/-/{file}");
     tokio::task::spawn_blocking(move || integrity_from_packument(&meta.body, &suffix))
         .await

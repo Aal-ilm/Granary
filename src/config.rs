@@ -87,6 +87,8 @@ pub struct Config {
     /// Who may read private content, when the environment decides it. When
     /// `None`, admins choose on the System page.
     pub private_access: Option<crate::policy::Mode>,
+    /// Private namespaces set by the environment, per format.
+    pub namespace_env: crate::namespaces::Preset,
 }
 
 /// The Gitea connection.
@@ -451,6 +453,19 @@ impl Config {
                 s => Some(crate::policy::Mode::parse(s).with_context(|| {
                     format!("GRANARY_PRIVATE_ACCESS must be \"signed-in\" or \"scoped\", not {s:?}")
                 })?),
+            },
+            namespace_env: {
+                use crate::{namespaces, templates::lines::Eco};
+                let mut preset = namespaces::Preset::new();
+                for eco in Eco::ALL {
+                    let key = namespaces::env_var(eco);
+                    if let Ok(raw) = std::env::var(key) {
+                        let rules = namespaces::parse_rules(eco, &raw)
+                            .map_err(|e| anyhow::anyhow!("{key}: {e}"))?;
+                        preset.insert(eco.as_str().to_string(), rules);
+                    }
+                }
+                preset
             },
         }
         .with_gitea_from_env()

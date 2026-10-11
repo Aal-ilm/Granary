@@ -12,7 +12,11 @@
 
 use std::sync::RwLock;
 
-use axum::{extract::FromRequestParts, http::request::Parts};
+use axum::{
+    extract::FromRequestParts,
+    http::{HeaderMap, request::Parts},
+    response::{IntoResponse, Response},
+};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
@@ -83,6 +87,17 @@ pub struct Resource {
 }
 
 impl Resource {
+    pub fn gitea_package(format: &str, owner: &str, name: &str) -> Self {
+        Self {
+            source: Source::Gitea,
+            kind: Kind::Package {
+                format: format.to_string(),
+            },
+            owner: owner.to_string(),
+            name: name.to_string(),
+        }
+    }
+
     pub fn gitea_repo(owner: &str, name: &str) -> Self {
         Self {
             source: Source::Gitea,
@@ -143,6 +158,26 @@ impl FromRequestParts<AppState> for Principal {
             .ok();
         Ok(auth.map_or(Principal::Anonymous, |a| Principal::from_session(&a)))
     }
+}
+
+/// The answer for a request `who` may not make for `what`: an anonymous
+/// client is asked for a token (a 401, whether or not anything exists, so
+/// no name leaks), anyone else gets a 404. `None` when they may.
+pub fn refuse(
+    st: &AppState,
+    who: &Principal,
+    what: &Resource,
+    headers: &HeaderMap,
+    path: &str,
+) -> Option<Response> {
+    if st.policy.can_read_private(who, what) {
+        return None;
+    }
+    Some(if who.is_anonymous() {
+        crate::auth::challenge(st, headers, path)
+    } else {
+        crate::error::AppError::not_found().into_response()
+    })
 }
 
 const SETTING: &str = "private_access";

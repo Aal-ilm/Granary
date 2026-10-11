@@ -141,12 +141,34 @@ pub struct Stats {
     pub bytes_cached: AtomicU64,
 }
 
+/// Credentials sent with requests to one upstream's URLs.
+pub struct UpstreamAuth {
+    /// URLs starting with this get the header.
+    prefix: String,
+    value: HeaderValue,
+}
+
+impl UpstreamAuth {
+    /// Gitea's token, for URLs under `GRANARY_GITEA_URL`.
+    pub fn gitea(cfg: &crate::config::Config) -> Option<Self> {
+        let g = cfg.gitea.as_ref()?;
+        let mut value = HeaderValue::from_str(&format!("token {}", g.token.expose())).ok()?;
+        value.set_sensitive(true);
+        Some(Self {
+            prefix: format!("{}/", g.url),
+            value,
+        })
+    }
+}
+
 pub struct Store {
     root: PathBuf,
     meta_client: reqwest::Client,
     file_client: reqwest::Client,
     /// The private-address rule, checked before each request.
     egress: Arc<Egress>,
+    /// Credentials for one upstream (Gitea), sent only to its URLs.
+    auth: Option<UpstreamAuth>,
     meta_ttl: Duration,
     offline: bool,
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -189,6 +211,7 @@ impl Store {
         meta_ttl: Duration,
         offline: bool,
         egress: Arc<Egress>,
+        auth: Option<UpstreamAuth>,
     ) -> anyhow::Result<Self> {
         tokio::fs::create_dir_all(root.join("tmp")).await?;
         // Leftover partial downloads from a crash are useless; clear them.
@@ -224,6 +247,7 @@ impl Store {
             meta_client,
             file_client,
             egress,
+            auth,
             meta_ttl,
             offline,
             locks: Mutex::new(HashMap::new()),
@@ -253,6 +277,18 @@ impl Store {
     /// Outbound connection rules, for other clients (git) to follow too.
     pub fn egress(&self) -> &Arc<Egress> {
         &self.egress
+    }
+
+    /// Add the upstream's credentials to a request for one of its URLs. They
+    /// are never added for any other URL, and reqwest drops them if a
+    /// redirect leads to another host.
+    fn authorize(&self, req: reqwest::RequestBuilder, url: &str) -> reqwest::RequestBuilder {
+        match &self.auth {
+            Some(a) if url.starts_with(&a.prefix) => {
+                req.header(reqwest::header::AUTHORIZATION, a.value.clone())
+            }
+            _ => req,
+        }
     }
 
     /// Refuse a URL whose IP address breaks the private-address rule (names
@@ -419,7 +455,10 @@ impl Store {
             return Err(AppError::offline(url));
         }
         self.check_url(url)?;
-        let resp = self.file_client.get(url).send().await?;
+        let resp = self
+            .authorize(self.file_client.get(url), url)
+            .send()
+            .await?;
         match resp.status() {
             s if s.is_success() => {}
             StatusCode::NOT_FOUND | StatusCode::GONE => return Ok(None),
@@ -465,7 +504,10 @@ impl Store {
 
     async fn download(&self, url: &str, dest: &Path, expected: Option<&Checksum>) -> AppResult<()> {
         self.check_url(url)?;
-        let resp = self.file_client.get(url).send().await?;
+        let resp = self
+            .authorize(self.file_client.get(url), url)
+            .send()
+            .await?;
         match resp.status() {
             s if s.is_success() => {}
             StatusCode::NOT_FOUND | StatusCode::GONE => return Err(AppError::not_found()),
@@ -578,6 +620,20 @@ impl Store {
         .await
     }
 
+    /// Whether a metadata document is cached (fresh or not).
+    pub async fn has_meta(&self, ns: &str, rel: &str, variant: &str) -> bool {
+        let Ok(rel) = safe_rel_path(rel) else {
+            return false;
+        };
+        let base = self.root.join("meta").join(ns).join(rel);
+        let Some(name) = base.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            return false;
+        };
+        tokio::fs::try_exists(base.with_file_name(format!("{name}.{variant}.body")))
+            .await
+            .unwrap_or(false)
+    }
+
     async fn read_info(&self, info_path: &Path) -> Option<MetaInfo> {
         let raw = tokio::fs::read(info_path).await.ok()?;
         serde_json::from_slice(&raw).ok()
@@ -604,7 +660,7 @@ impl Store {
     ) -> AppResult<Meta> {
         let cached = self.read_info(info_path).await;
         self.check_url(url)?;
-        let mut req = self.meta_client.get(url).header(ACCEPT, accept);
+        let mut req = self.authorize(self.meta_client.get(url).header(ACCEPT, accept), url);
         if let Some(info) = &cached {
             if let Some(etag) = &info.etag {
                 req = req.header(IF_NONE_MATCH, etag);
@@ -842,7 +898,7 @@ impl Store {
 /// Suffixes of small files that belong to a cached file in `ns` and are
 /// listed, sized and deleted together with it.
 pub fn companions(ns: &str) -> &'static [&'static str] {
-    match ns {
+    match ns.strip_prefix("gitea-").unwrap_or(ns) {
         "pypi" => &[".metadata"],
         "maven" => &[".sha1", ".md5", ".sha256", ".sha512"],
         _ => &[],

@@ -53,6 +53,10 @@ impl Default for CleanupPolicy {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CleanupItem {
     pub repo: String,
+    /// The cache namespace, when it isn't the repository's own (a private
+    /// package's `gitea-` namespace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ns: Option<String>,
     pub package: String,
     pub version: String,
     pub path: String,
@@ -281,11 +285,20 @@ impl Admin {
             return inv.clone();
         }
         let access = store.access_snapshot();
-        let dirs: Vec<(&'static str, PathBuf)> =
-            REPOS.iter().map(|r| (*r, store.files_dir(r))).collect();
+        let mut dirs: Vec<(&'static str, &'static str, PathBuf, bool)> = REPOS
+            .iter()
+            .map(|r| (*r, *r, store.files_dir(r), false))
+            .collect();
+        dirs.extend(
+            inventory::PRIVATE
+                .iter()
+                .map(|(r, ns)| (*r, *ns, store.files_dir(ns), true)),
+        );
         let assets = tokio::task::spawn_blocking(move || {
             dirs.iter()
-                .flat_map(|(repo, dir)| inventory::scan_repo(repo, dir, &access))
+                .flat_map(|(repo, ns, dir, private)| {
+                    inventory::scan_repo(repo, ns, dir, &access, *private)
+                })
                 .collect::<Vec<_>>()
         })
         .await
@@ -332,6 +345,7 @@ pub async fn cleanup(st: &AppState, policy: &CleanupPolicy, dry_run: bool) -> Cl
             let last_used = a.last_access.unwrap_or(a.cached_at).max(a.cached_at);
             (last_used < cutoff).then(|| CleanupItem {
                 repo: a.repo.to_string(),
+                ns: a.private.then(|| a.ns.to_string()),
                 package: a.package.clone(),
                 version: a.version.clone(),
                 path: a.path.clone(),
@@ -353,18 +367,26 @@ pub async fn cleanup(st: &AppState, policy: &CleanupPolicy, dry_run: bool) -> Cl
         if dry_run {
             report.files += 1;
             report.bytes += item.size;
-        } else if let Ok(freed) = st.store.delete_file(&item.repo, &item.path).await {
+        } else if let Ok(freed) = st
+            .store
+            .delete_file(item.ns.as_deref().unwrap_or(&item.repo), &item.path)
+            .await
+        {
             report.files += 1;
             report.bytes += freed;
         }
     }
 
     if policy.include_metadata {
-        for repo in REPOS
+        // Each repository's own metadata, and its private packages' too.
+        let namespaces = REPOS
             .iter()
             .filter(|r| policy.repos.iter().any(|p| p == *r))
-        {
-            let dir = st.store.meta_dir(repo);
+            .flat_map(|r| [Some(*r), inventory::private_ns(r)])
+            .flatten()
+            .collect::<Vec<&'static str>>();
+        for ns in namespaces {
+            let dir = st.store.meta_dir(ns);
             let expired = tokio::task::spawn_blocking(move || expired_meta(&dir, cutoff))
                 .await
                 .unwrap_or_default();

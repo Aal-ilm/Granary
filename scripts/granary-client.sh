@@ -246,15 +246,16 @@ cargo_credentials() {
   fi
 }
 
-# Remove any [registries.granary] table from Cargo's credentials file. That
-# file only holds tokens, so replacing Granary's entry is always safe.
+# Remove any [registries.granary] and [registries.granary-private] tables
+# from Cargo's credentials file. That file only holds tokens, so replacing
+# Granary's entries is always safe.
 cargo_forget_token() {
   local file
   file="$(cargo_credentials)"
   [ -f "$file" ] || return 0
   local tmp="$file.granary-tmp"
   awk '
-    /^[[:space:]]*\[/ { skip = ($0 ~ /^[[:space:]]*\[registries\.granary\][[:space:]]*$/) }
+    /^[[:space:]]*\[/ { skip = ($0 ~ /^[[:space:]]*\[registries\.granary(-private)?\][[:space:]]*$/) }
     !skip
   ' "$file" >"$tmp"
   cat "$tmp" >"$file"
@@ -265,15 +266,23 @@ cargo_forget_token() {
 # Store the token where Cargo's built-in "cargo:token" provider reads it.
 # (This is what "cargo login" writes, without needing a network round trip.)
 cargo_save_token() {
-  local file
+  local file private="$1"
   file="$(cargo_credentials)"
   cargo_forget_token
   (umask 077 && touch "$file")
   {
     [ -s "$file" ] && printf '\n'
     printf '[registries.granary]\ntoken = "%s"\n' "$TOKEN"
+    if [ -n "$private" ]; then printf '\n[registries.granary-private]\ntoken = "%s"\n' "$TOKEN"; fi
   } >>"$file"
   chmod 600 "$file"
+}
+
+# Whether Granary has a private Cargo registry (from Gitea) this token can use.
+cargo_private_available() {
+  local code
+  code="$(curl -s -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$URL/cargo-private/config.json" || true)"
+  [ "$code" = "200" ]
 }
 
 # Fail if the user's own config already defines what we need to add.
@@ -286,8 +295,8 @@ cargo_check_conflicts() {
     $0 == e1 || $0 == e2 { skip = 0; next }
     !skip
   ' "$file")"
-  if printf '%s\n' "$outside" | grep -Eq '^[[:space:]]*\[(source\.crates-io|registries\.granary)\]'; then
-    die "$file already has its own [source.crates-io] or [registries.granary] section. Remove it first, then run this again"
+  if printf '%s\n' "$outside" | grep -Eq '^[[:space:]]*\[(source\.crates-io|registries\.granary(-private)?)\]'; then
+    die "$file already has its own [source.crates-io], [registries.granary] or [registries.granary-private] section. Remove it first, then run this again"
   fi
 }
 
@@ -297,6 +306,8 @@ cargo_use_granary() {
   file="$(cargo_file)"
   mkdir -p "$CARGO_DIR"
   cargo_check_conflicts "$file"
+  local private=""
+  if cargo_private_available; then private=1; fi
   backup "$file"
   strip_block "$file" "$REG_BEGIN" "$REG_END"
   strip_block "$file" "$USE_BEGIN" "$USE_END"
@@ -304,13 +315,18 @@ cargo_use_granary() {
     [ -s "$file" ] && printf '\n'
     printf '%s\n' "$REG_BEGIN"
     printf '[registries.granary]\nindex = "sparse+%s/cargo/"\ncredential-provider = "cargo:token"\n' "$URL"
+    # Private crates from Gitea: depend on them with registry = "granary-private".
+    if [ -n "$private" ]; then
+      printf '\n[registries.granary-private]\nindex = "sparse+%s/cargo-private/"\ncredential-provider = "cargo:token"\n' "$URL"
+    fi
     printf '%s\n\n' "$REG_END"
     printf '%s\n' "$USE_BEGIN"
     printf '[source.crates-io]\nreplace-with = "granary"\n'
     printf '%s\n' "$USE_END"
   } >>"$file"
-  cargo_save_token
+  cargo_save_token "$private"
   ok "cargo -> $URL/cargo/"
+  if [ -n "$private" ]; then ok "cargo -> $URL/cargo-private/ as registry granary-private"; fi
 }
 
 cargo_use_public() {

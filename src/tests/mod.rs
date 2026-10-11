@@ -5,6 +5,7 @@ mod cache_limit;
 mod git;
 mod git_templates;
 mod gitea;
+mod gitea_packages;
 mod jobs;
 mod maven;
 mod npm;
@@ -62,6 +63,8 @@ type Seen = (String, Option<String>);
 pub struct Mock {
     pub files: Arc<Mutex<HashMap<String, Upstream>>>,
     pub requests: Arc<Mutex<Vec<Seen>>>,
+    /// Set when any request carried an Authorization header.
+    pub saw_auth: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Mock {
@@ -92,6 +95,10 @@ impl Mock {
             .lock()
             .unwrap()
             .push((path.clone(), inm.clone()));
+        if headers.contains_key(header::AUTHORIZATION) {
+            mock.saw_auth
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         let Some(f) = mock.files.lock().unwrap().get(&path).cloned() else {
             return StatusCode::NOT_FOUND.into_response();
         };
@@ -146,6 +153,10 @@ pub struct Opts {
     /// Hosts allowed past the private-address rule. The default allows the
     /// local mock upstreams.
     pub private_hosts: Vec<String>,
+    /// Private namespaces, as the environment would set them.
+    pub namespaces: crate::namespaces::Preset,
+    /// Use this data directory (another harness's) instead of a new one.
+    pub data: Option<PathBuf>,
 }
 
 /// The shared secret test warmers expect.
@@ -172,6 +183,8 @@ impl Default for Opts {
             extra_ca: None,
             private_access: None,
             private_hosts: vec!["127.0.0.1".into(), "localhost".into()],
+            namespaces: Default::default(),
+            data: None,
         }
     }
 }
@@ -210,6 +223,8 @@ impl Harness {
             extra_ca,
             private_access,
             private_hosts,
+            namespaces,
+            data: reuse,
         } = opts;
         // Bind first so the config can name Granary's own address.
         let own = if serve {
@@ -227,13 +242,19 @@ impl Harness {
         tokio::spawn(async move { axum::serve(listener, upstream).await });
         let base = format!("http://{addr}");
 
-        let data = std::env::temp_dir().join(format!(
-            "granary-test-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&data);
-        std::fs::create_dir_all(&data).unwrap();
+        let data = match reuse {
+            Some(d) => d,
+            None => {
+                let data = std::env::temp_dir().join(format!(
+                    "granary-test-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                let _ = std::fs::remove_dir_all(&data);
+                std::fs::create_dir_all(&data).unwrap();
+                data
+            }
+        };
 
         let cfg = Config {
             listen: String::new(),
@@ -275,15 +296,22 @@ impl Harness {
             extra_ca,
             private_hosts,
             private_access,
+            namespace_env: namespaces,
         };
         let mut cfg = cfg;
         if let Some(g) = gitea {
             cfg.set_gitea(g);
         }
         let egress = Arc::new(crate::egress::Egress::new(&cfg).unwrap());
-        let store = Store::new(data.clone(), meta_ttl, offline, egress.clone())
-            .await
-            .unwrap();
+        let store = Store::new(
+            data.clone(),
+            meta_ttl,
+            offline,
+            egress.clone(),
+            crate::store::UpstreamAuth::gitea(&cfg),
+        )
+        .await
+        .unwrap();
         let admin = Admin::new(&data, LogBuffer::default()).await.unwrap();
         let db = auth::open_db(&data).await.unwrap();
         auth::ensure_admin(&db, "admin", Some("a long test password"))
@@ -294,6 +322,10 @@ impl Harness {
         let policy = crate::policy::Policy::load(&db, cfg.private_access)
             .await
             .unwrap();
+        let namespaces =
+            crate::namespaces::Namespaces::load(&db, cfg.gitea.is_some(), &cfg.namespace_env)
+                .await
+                .unwrap();
         let backend = auth::Backend::new(db).await.unwrap();
         let user = backend.list_users().await.unwrap().remove(0);
         let (_, token) = backend.create_token(user.id, "test", None).await.unwrap();
@@ -305,6 +337,7 @@ impl Harness {
             admin: Arc::new(admin),
             auth: backend,
             policy: Arc::new(policy),
+            namespaces: Arc::new(namespaces),
         };
         crate::jobs::spawn_runner(state.clone());
         let app = crate::app(state.clone(), sessions);

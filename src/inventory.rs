@@ -7,16 +7,40 @@ use serde::Serialize;
 
 use crate::{
     formats::{maven, pypi::normalize},
+    policy::Resource,
     store::companions,
 };
 
 /// The repositories Granary serves, in display order.
 pub const REPOS: [&str; 4] = ["cargo", "npm", "pypi", "maven"];
 
+/// Each repository's cache namespace for private packages from Gitea. Paths
+/// there start with the Gitea owner.
+pub const PRIVATE: [(&str, &str); 4] = [
+    ("cargo", "gitea-cargo"),
+    ("npm", "gitea-npm"),
+    ("pypi", "gitea-pypi"),
+    ("maven", "gitea-maven"),
+];
+
+/// The private cache namespace of a repository.
+pub fn private_ns(repo: &str) -> Option<&'static str> {
+    PRIVATE.iter().find(|(r, _)| *r == repo).map(|(_, ns)| *ns)
+}
+
 /// One cached file.
 #[derive(Clone, Debug, Serialize)]
 pub struct Asset {
     pub repo: &'static str,
+    /// The cache namespace the file is in: the repository, or for a private
+    /// package, its `gitea-` namespace.
+    #[serde(skip)]
+    pub ns: &'static str,
+    /// The Gitea owner of a private package.
+    #[serde(skip)]
+    pub owner: Option<String>,
+    /// From Gitea, so the access policy decides who sees it.
+    pub private: bool,
     pub package: String,
     pub version: String,
     /// Path under `files/<repo>/`, as used in delete requests.
@@ -77,8 +101,33 @@ pub fn classify(repo: &str, rel: &str) -> Option<(String, String)> {
     }
 }
 
-/// Scan one repository's files (blocking; run on a blocking thread).
-pub fn scan_repo(repo: &'static str, root: &Path, access: &HashMap<String, u64>) -> Vec<Asset> {
+impl Asset {
+    /// The access policy's description of a private package.
+    pub fn resource(&self) -> Option<Resource> {
+        self.owner
+            .as_deref()
+            .map(|o| Resource::gitea_package(self.repo, o, &self.package))
+    }
+
+    /// The path under the repository's own URL space: for a private file,
+    /// without the owner.
+    pub fn inner_path(&self) -> &str {
+        match &self.owner {
+            Some(_) => self.path.split_once('/').map_or("", |(_, p)| p),
+            None => &self.path,
+        }
+    }
+}
+
+/// Scan one repository's files (blocking; run on a blocking thread). With
+/// `private`, `ns` is a `gitea-` namespace whose paths start with an owner.
+pub fn scan_repo(
+    repo: &'static str,
+    ns: &'static str,
+    root: &Path,
+    access: &HashMap<String, u64>,
+    private: bool,
+) -> Vec<Asset> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -99,6 +148,13 @@ pub fn scan_repo(repo: &'static str, root: &Path, access: &HashMap<String, u64>)
                 continue;
             };
             let rel = rel.to_string_lossy().replace('\\', "/");
+            let (owner, inner) = match private {
+                true => match rel.split_once('/') {
+                    Some((o, inner)) => (Some(o.to_string()), inner.to_string()),
+                    None => continue,
+                },
+                false => (None, rel.clone()),
+            };
             // Companions (PyPI `.metadata`, Maven checksums) normally count
             // toward their main file. Ones whose main file was never
             // downloaded (pip and uv often resolve from metadata alone) are
@@ -106,15 +162,19 @@ pub fn scan_repo(repo: &'static str, root: &Path, access: &HashMap<String, u64>)
             // cleaned up.
             let main = companions(repo)
                 .iter()
-                .find_map(|ext| rel.strip_suffix(ext));
+                .find_map(|ext| inner.strip_suffix(ext));
             let classified = match main {
                 Some(main) => {
-                    if root.join(main).exists() {
+                    let main_rel = match &owner {
+                        Some(o) => format!("{o}/{main}"),
+                        None => main.to_string(),
+                    };
+                    if root.join(main_rel).exists() {
                         continue;
                     }
                     classify(repo, main)
                 }
-                None => classify(repo, &rel),
+                None => classify(repo, &inner),
             };
             let Some((package, version)) = classified else {
                 continue;
@@ -134,10 +194,13 @@ pub fn scan_repo(repo: &'static str, root: &Path, access: &HashMap<String, u64>)
                 .sum();
             out.push(Asset {
                 repo,
+                ns,
+                private: owner.is_some(),
+                owner,
                 package,
                 version,
                 file_name: entry.file_name().to_string_lossy().to_string(),
-                last_access: access.get(&format!("{repo}/{rel}")).copied(),
+                last_access: access.get(&format!("{ns}/{rel}")).copied(),
                 path: rel,
                 size: meta.len() + companion,
                 cached_at,
@@ -152,6 +215,8 @@ pub fn scan_repo(repo: &'static str, root: &Path, access: &HashMap<String, u64>)
 pub struct Component {
     pub repo: &'static str,
     pub name: String,
+    /// From Gitea.
+    pub private: bool,
     pub versions: usize,
     pub files: usize,
     pub size: u64,
@@ -160,13 +225,15 @@ pub struct Component {
 }
 
 pub fn group(assets: &[Asset]) -> Vec<Component> {
-    let mut map: HashMap<(&str, &str), Component> = HashMap::new();
-    let mut versions: HashMap<(&str, &str), std::collections::HashSet<&str>> = HashMap::new();
+    type Key<'a> = (&'a str, &'a str, bool);
+    let mut map: HashMap<Key, Component> = HashMap::new();
+    let mut versions: HashMap<Key, std::collections::HashSet<&str>> = HashMap::new();
     for a in assets {
-        let key = (a.repo, a.package.as_str());
+        let key = (a.repo, a.package.as_str(), a.private);
         let c = map.entry(key).or_insert_with(|| Component {
             repo: a.repo,
             name: a.package.clone(),
+            private: a.private,
             versions: 0,
             files: 0,
             size: 0,
@@ -213,6 +280,28 @@ pub fn meta_key(repo: &str, name: &str) -> Option<String> {
             ))
         }
         _ => None,
+    }
+}
+
+/// Every metadata document of a package, as (namespace, key): for a
+/// private one, in its `gitea-` namespace under the owner.
+pub fn meta_docs(
+    repo: &'static str,
+    owner: Option<&str>,
+    name: &str,
+) -> Vec<(&'static str, String)> {
+    match owner.zip(private_ns(repo)) {
+        None => meta_keys(repo, name)
+            .into_iter()
+            .map(|k| (repo, k))
+            .collect(),
+        Some((owner, ns)) => meta_keys(repo, name)
+            .into_iter()
+            .map(|k| match repo {
+                "cargo" => (ns, format!("{owner}/index/{k}")),
+                _ => (ns, format!("{owner}/{k}")),
+            })
+            .collect(),
     }
 }
 

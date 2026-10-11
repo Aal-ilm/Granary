@@ -649,7 +649,7 @@ async function renderBrowse({ params, query, isCurrent }) {
         }
       }
       return `${head}<tr${byGroup ? ' class="in-group"' : ''}>
-        <td><a class="pkg mono" href="#/c/${esc(c.repo)}/${esc(encodeURIComponent(c.name))}">${esc(label)}</a></td>
+        <td><a class="pkg mono" href="#/c/${esc(c.repo)}/${esc(encodeURIComponent(c.name))}${c.private ? '?private=1' : ''}">${esc(label)}</a>${privateBadge(c.private)}</td>
         ${repo ? '' : `<td>${chip(c.repo)}</td>`}
         <td class="r num">${esc(count(c.versions))}</td>
         <td class="r num">${esc(bytes(c.size))}</td>
@@ -731,8 +731,10 @@ async function renderBrowse({ params, query, isCurrent }) {
 
 // --------------------------------------------------------------- component
 
-async function renderComponent({ params, isCurrent }) {
+async function renderComponent({ params, query, isCurrent }) {
   const [repo, name] = params;
+  // A private package from Gitea, rather than a public one of that name.
+  const priv = query?.get('private') === '1' ? '&private=true' : '';
   // Maven: Browse > group > artifact, then its versions.
   const maven = repo === 'maven' ? mavenName(name) : null;
   const crumbs = `<div class="crumbs"><a href="#/browse/${repo}">Browse ${esc(REPOS[repo].label)}</a>${
@@ -741,7 +743,7 @@ async function renderComponent({ params, isCurrent }) {
   const title = maven ? maven.artifact : name;
   let d;
   try {
-    d = await api(`/api/component?repo=${repo}&name=${encodeURIComponent(name)}`);
+    d = await api(`/api/component?repo=${repo}&name=${encodeURIComponent(name)}${priv}`);
   } catch (e) {
     if (e.status !== 404) throw e;
     if (!isCurrent()) return;
@@ -790,7 +792,7 @@ async function renderComponent({ params, isCurrent }) {
     ${crumbs}
     <div class="page-head">
       <div>
-        <h1 class="title-mono">${esc(title)}</h1>
+        <h1 class="title-mono">${esc(title)}${privateBadge(d.private)}</h1>
         <div class="summary-line">
           ${chip(repo)}
           ${maven && maven.group ? `<span>Group <b class="mono">${esc(maven.group)}</b></span>` : ''}
@@ -823,7 +825,7 @@ async function renderComponent({ params, isCurrent }) {
       });
       if (!ok) return;
       try {
-        const r = await act(() => api(`/api/asset?repo=${repo}&path=${encodeURIComponent(delFile.dataset.deleteFile)}`, { method: 'DELETE' }));
+        const r = await act(() => api(`/api/asset?repo=${repo}&path=${encodeURIComponent(delFile.dataset.deleteFile)}${priv}`, { method: 'DELETE' }));
         toast(`Deleted ${delFile.dataset.label}, freed ${bytes(r.bytes)}`);
         route();
       } catch (err) {
@@ -839,7 +841,7 @@ async function renderComponent({ params, isCurrent }) {
       });
       if (!ok) return;
       try {
-        const r = await act(() => api(`/api/component?repo=${repo}&name=${encodeURIComponent(d.name)}`, { method: 'DELETE' }));
+        const r = await act(() => api(`/api/component?repo=${repo}&name=${encodeURIComponent(d.name)}${priv}`, { method: 'DELETE' }));
         toast(`Deleted ${d.name}, freed ${bytes(r.bytes)}`);
         location.hash = '#/browse/' + repo;
       } catch (err) {
@@ -898,7 +900,7 @@ async function renderGet({ params, query, isCurrent }) {
     const rows = d.results
       .map(
         (r) => `<tr>
-          <td>${r.cached_versions ? `<a class="pkg mono" href="#/c/${eco}/${esc(encodeURIComponent(r.name))}">${esc(r.name)}</a>` : `<span class="pkg mono">${esc(r.name)}</span>`}</td>
+          <td>${r.cached_versions ? `<a class="pkg mono" href="#/c/${eco}/${esc(encodeURIComponent(r.name))}${r.private ? '?private=1' : ''}">${esc(r.name)}</a>` : `<span class="pkg mono">${esc(r.name)}</span>`}${privateBadge(r.private)}</td>
           <td class="mono">${esc(r.latest || '')}</td>
           ${described ? `<td class="desc">${esc(r.description || '')}</td>` : ''}
           <td>${r.cached_versions ? `<span class="status"><span class="dot ok"></span>${esc(plural(r.cached_versions, 'version'))}</span>` : '<span class="muted">Not cached</span>'}</td>
@@ -2096,6 +2098,33 @@ async function renderTasks({ isCurrent }) {
 
 // ------------------------------------------------------------------ system
 
+const NS_HINTS = {
+  npm: ['Scope', '@dynatheia'],
+  pypi: ['Name or prefix*', 'dynatheia-*'],
+  maven: ['groupId prefix', 'com.dynatheia'],
+};
+
+/** One format's private namespaces: editable unless set by the environment. */
+function namespaceForm(n) {
+  const editable = isAdmin() && !n.locked;
+  const owner = (r, i) => `<input type="text" data-ns-owner="${i}" value="${esc(r.owner)}" aria-label="Gitea owner" placeholder="Gitea user or org" spellcheck="false" ${editable ? '' : 'disabled'}>`;
+  const rows = n.format === 'cargo'
+    ? `<div class="inline-form">
+        <div class="field grow"><label>Gitea owner of the private registry (<code>/cargo-private/</code>)</label>${owner(n.rules[0] || { owner: '' }, 0)}</div>
+      </div>`
+    : [...n.rules, { pattern: '', owner: '' }]
+        .map((r, i) => `<div class="inline-form" data-ns-row>
+          <div class="field grow"><label class="${i ? 'sr-only' : ''}">${esc(NS_HINTS[n.format][0])}</label><input type="text" data-ns-pattern="${i}" value="${esc(r.pattern)}" placeholder="${esc(NS_HINTS[n.format][1])}" spellcheck="false" ${editable ? '' : 'disabled'}></div>
+          <div class="field grow"><label class="${i ? 'sr-only' : ''}">Gitea owner</label>${owner(r, i)}</div>
+        </div>`)
+        .join('');
+  return `<form class="panel panel-pad ns-form" data-ns-format="${esc(n.format)}">
+    <h4>${esc(n.label)}</h4>
+    ${rows}
+    ${n.locked ? `<p class="muted">Locked: set by <code>${esc(n.env)}</code> in the environment.</p>` : editable ? '<p><button class="small" type="submit">Save</button> <span class="muted">Clear a row to remove it.</span></p>' : ''}
+  </form>`;
+}
+
 /** The Gitea connection's facts: address, status, version and token owner. */
 function giteaFacts(g) {
   const s = g.status;
@@ -2146,6 +2175,9 @@ async function renderSystem({ isCurrent }) {
       <h2>Gitea</h2>
       <dl class="panel facts" id="gitea-facts">${giteaFacts(d.gitea)}</dl>
       <p class="admin-only"><button data-gitea-check>Test connection</button></p>
+      <h3>Private namespaces</h3>
+      <p class="muted">Names that belong to Gitea. A name matching one is only ever fetched from Gitea, and is a 404 if Gitea doesn't have it; other names are never fetched from Gitea.</p>
+      <div id="ns-lists">${d.gitea.namespaces.map(namespaceForm).join('')}</div>
     </section>` : '';
   const accessSection = `
     <section>
@@ -2206,6 +2238,25 @@ async function renderSystem({ isCurrent }) {
     }
     b.disabled = false;
     b.textContent = 'Test connection';
+  });
+  view().addEventListener('submit', async (e) => {
+    const form = e.target.closest('[data-ns-format]');
+    if (!form) return;
+    e.preventDefault();
+    const format = form.dataset.nsFormat;
+    const owners = $$('[data-ns-owner]', form).map((i) => i.value.trim());
+    const rules = format === 'cargo'
+      ? (owners[0] ? [{ pattern: '*', owner: owners[0] }] : [])
+      : $$('[data-ns-pattern]', form)
+          .map((p, i) => ({ pattern: p.value.trim(), owner: owners[i] }))
+          .filter((r) => r.pattern || r.owner);
+    try {
+      await api('/api/system/gitea/namespaces', { method: 'PUT', body: { format, rules } });
+      toast('Private namespaces saved');
+      route();
+    } catch (err) {
+      toast(err.message, 'error');
+    }
   });
   $('#pa-mode', view()).addEventListener('change', async (e) => {
     const sel = e.currentTarget;

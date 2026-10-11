@@ -22,13 +22,18 @@
 //! Central has no snapshots, so `-SNAPSHOT` paths are refused without asking
 //! upstream. Maven and Gradle probe for many files that don't exist, so a 404
 //! from upstream is remembered for a few minutes.
+//!
+//! GroupIds listed as private namespaces (see `namespaces`) come from Gitea's
+//! Maven registry instead, and only from there, with the same `.sha1`
+//! checks. Their 404s are never remembered, so a package published to Gitea
+//! shows up at once. They are cached under `gitea-maven/{owner}/`.
 
 use std::time::Duration;
 
 use axum::{
     Router,
     extract::State,
-    http::{HeaderValue, Method, StatusCode, Uri, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::any,
 };
@@ -36,8 +41,63 @@ use axum::{
 use crate::{
     AppState,
     error::{AppError, AppResult},
+    policy::{Principal, Resource, refuse},
     store::Checksum,
+    templates::lines::Eco,
 };
+
+/// Where a repository path comes from: Maven Central, or Gitea.
+struct Origin {
+    ns: &'static str,
+    owner: Option<String>,
+    base: String,
+}
+
+impl Origin {
+    fn rel(&self, rel: &str) -> String {
+        match &self.owner {
+            Some(o) => format!("{o}/{rel}"),
+            None => rel.to_string(),
+        }
+    }
+}
+
+/// The groupId a repository path belongs to (release file or metadata).
+fn group_of(rel: &str) -> Option<String> {
+    if let Some((group, ..)) = coordinates(rel) {
+        return Some(group);
+    }
+    let segs: Vec<&str> = rel.split('/').collect();
+    (segs.len() >= 3).then(|| segs[..segs.len() - 2].join("."))
+}
+
+/// Route a path: private groupIds to Gitea, everything else to Central.
+fn origin(st: &AppState, rel: &str) -> Origin {
+    let owner = group_of(rel).and_then(|g| st.namespaces.owner(Eco::Maven, &g));
+    match (owner, &st.cfg.gitea) {
+        (Some(owner), Some(g)) => Origin {
+            ns: "gitea-maven",
+            base: format!("{}/api/packages/{owner}/maven", g.url),
+            owner: Some(owner),
+        },
+        _ => Origin {
+            ns: "maven",
+            owner: None,
+            base: st.cfg.maven_upstream.clone(),
+        },
+    }
+}
+
+/// The access policy's description of a private path, if it is one.
+fn resource(st: &AppState, rel: &str) -> Option<Resource> {
+    let o = origin(st, rel);
+    let owner = o.owner?;
+    let name = match coordinates(rel) {
+        Some((group, artifact, ..)) => format!("{group}:{artifact}"),
+        None => group_of(rel).unwrap_or_default(),
+    };
+    Some(Resource::gitea_package("maven", &owner, &name))
+}
 
 /// How long a 404 from upstream is remembered.
 const NEGATIVE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -155,7 +215,13 @@ fn content_type(file: &str) -> &'static str {
     }
 }
 
-async fn handle(State(st): State<AppState>, method: Method, uri: Uri) -> AppResult<Response> {
+async fn handle(
+    State(st): State<AppState>,
+    who: Principal,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> AppResult<Response> {
     if method != Method::GET && method != Method::HEAD {
         let mut resp = AppError::new(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -167,6 +233,12 @@ async fn handle(State(st): State<AppState>, method: Method, uri: Uri) -> AppResu
         return Ok(resp);
     }
     let rel = checked_path(&uri)?;
+    // Private groupIds: ask who's there before anything else.
+    if let Some(r) = resource(&st, &rel)
+        && let Some(answer) = refuse(&st, &who, &r, &headers, uri.path())
+    {
+        return Ok(answer);
+    }
     fetch(&st, &rel).await
 }
 
@@ -180,44 +252,64 @@ pub async fn fetch(st: &AppState, rel: &str) -> AppResult<Response> {
         ));
     }
     let kind = classify(rel).ok_or_else(AppError::not_found)?;
+    let o = origin(st, rel);
 
+    // Private paths never use the negative cache: a package just published
+    // to Gitea shows up at once.
     let missing_key = format!("maven:{rel}");
-    if st.store.known_missing(&missing_key) {
+    let public = o.owner.is_none();
+    if public && st.store.known_missing(&missing_key) {
         return Err(AppError::not_found());
     }
     let result = match kind {
-        Kind::Metadata => metadata(st, rel).await,
-        Kind::Release { verify } => release(st, rel, verify).await,
+        Kind::Metadata => metadata(st, &o, rel).await,
+        Kind::Release { verify } => release(st, &o, rel, verify).await,
     };
     // Only upstream's own 404s are remembered; an offline miss isn't one.
     if let Err(e) = &result
         && e.status == StatusCode::NOT_FOUND
         && !st.store.offline()
+        && public
     {
         st.store.remember_missing(&missing_key, NEGATIVE_TTL);
     }
     result
 }
 
-async fn metadata(st: &AppState, rel: &str) -> AppResult<Response> {
-    let url = format!("{}/{rel}", st.cfg.maven_upstream);
-    let meta = st.store.meta("maven", rel, "raw", &url, "*/*").await?;
+/// A `maven-metadata.xml` (or other metadata path), from wherever its
+/// groupId comes from.
+pub async fn metadata_doc(st: &AppState, rel: &str) -> AppResult<crate::store::Meta> {
+    let o = origin(st, rel);
+    let url = format!("{}/{rel}", o.base);
+    st.store.meta(o.ns, &o.rel(rel), "raw", &url, "*/*").await
+}
+
+/// Where a release file is cached: its namespace and path there.
+pub fn cached_at(st: &AppState, rel: &str) -> (&'static str, String) {
+    let o = origin(st, rel);
+    (o.ns, o.rel(rel))
+}
+
+async fn metadata(st: &AppState, o: &Origin, rel: &str) -> AppResult<Response> {
+    let url = format!("{}/{rel}", o.base);
+    let meta = st.store.meta(o.ns, &o.rel(rel), "raw", &url, "*/*").await?;
     Ok(([(header::CONTENT_TYPE, content_type(rel))], meta.body).into_response())
 }
 
-async fn release(st: &AppState, rel: &str, verify: bool) -> AppResult<Response> {
-    let url = format!("{}/{rel}", st.cfg.maven_upstream);
+async fn release(st: &AppState, o: &Origin, rel: &str, verify: bool) -> AppResult<Response> {
+    let url = format!("{}/{rel}", o.base);
     let ct = content_type(rel);
+    let (ns, cached) = (o.ns, o.rel(rel));
     // Offline, there's no checksum to fetch; the store serves the file if it
     // is cached and otherwise says it is offline.
-    if !verify || st.store.offline() || st.store.has_file("maven", rel).await {
-        return st.store.file("maven", rel, &url, ct, None).await;
+    if !verify || st.store.offline() || st.store.has_file(ns, &cached).await {
+        return st.store.file(ns, &cached, &url, ct, None).await;
     }
 
     // Verify against upstream's .sha1, and keep that file next to the
     // artifact once the artifact is cached.
-    let sha1_rel = format!("{rel}.sha1");
-    let sha1 = match st.store.read_file("maven", &sha1_rel).await {
+    let sha1_rel = format!("{cached}.sha1");
+    let sha1 = match st.store.read_file(ns, &sha1_rel).await {
         Some(b) => Some(b.into()),
         None => {
             st.store
@@ -235,9 +327,9 @@ async fn release(st: &AppState, rel: &str, verify: bool) -> AppResult<Response> 
             })
         })
         .transpose()?;
-    let resp = st.store.file("maven", rel, &url, ct, expected).await?;
+    let resp = st.store.file(ns, &cached, &url, ct, expected).await?;
     if let Some(b) = sha1
-        && let Err(e) = st.store.put_file("maven", &sha1_rel, &b).await
+        && let Err(e) = st.store.put_file(ns, &sha1_rel, &b).await
     {
         tracing::warn!("maven: could not cache {sha1_rel}: {}", e.message);
     }

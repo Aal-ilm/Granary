@@ -12,6 +12,12 @@
 //! (the same path clients use), so cached packages can be looked up offline.
 //! With `GRANARY_SEARCH=off` or in offline mode, nothing is sent to a search
 //! host: the search box does exact lookups instead.
+//!
+//! Names in private namespaces are looked up and cached from Gitea only,
+//! like everywhere else. For people with private access, a search also asks
+//! Gitea's package API, and results say where they come from; public results
+//! with a private namespace's name are dropped, since they could never be
+//! fetched from the public registry.
 
 use std::{
     collections::HashMap,
@@ -36,6 +42,7 @@ use crate::{
     formats::{cargo, maven, npm, pypi},
     inventory::{self, meta_key},
     net::ClientIp,
+    policy::{Principal, Resource},
     templates::lines::{self, Eco},
 };
 
@@ -61,6 +68,9 @@ pub struct Hit {
     pub name: String,
     pub latest: Option<String>,
     pub description: Option<String>,
+    /// From Gitea, rather than the public registry.
+    #[serde(default)]
+    pub private: bool,
 }
 
 pub fn router() -> Router<AppState> {
@@ -149,9 +159,12 @@ async fn search(
     )
     .await;
 
-    let hits = if lookup_only {
+    let who = Principal::from_session(&auth);
+    let private = |name: &str| private_name(&st, eco, name);
+    let mut hits = if lookup_only {
         match lookup(&st, eco, text).await? {
             Some(v) => vec![Hit {
+                private: private(&v.name),
                 name: v.name,
                 latest: v.latest,
                 description: None,
@@ -159,8 +172,24 @@ async fn search(
             None => Vec::new(),
         }
     } else {
-        search_upstream(&st, user.id, eco, text).await?
+        let mut hits = search_upstream(&st, user.id, eco, text).await?;
+        // A public package with a private name can never be fetched.
+        hits.retain(|h| !private(&h.name));
+        hits
     };
+    // Private packages, for those who may see them.
+    if search_on && st.policy.has_private_access(&who) {
+        hits.extend(search_gitea(&st, eco, text).await);
+    }
+    hits.retain(|h| {
+        !h.private || {
+            let owner = owner_of(&st, eco, &h.name).unwrap_or_default();
+            st.policy.can_read_private(
+                &who,
+                &Resource::gitea_package(eco.as_str(), &owner, &h.name),
+            )
+        }
+    });
 
     let inv = st.admin.inventory(&st.store).await;
     let results: Vec<Value> = hits
@@ -172,6 +201,8 @@ async fn search(
                 "latest": h.latest,
                 "description": h.description,
                 "cached_versions": cached,
+                "private": h.private,
+                "source": if h.private { "Gitea" } else { "public" },
             })
         })
         .collect();
@@ -185,6 +216,79 @@ async fn search(
         "note": note,
         "results": results,
     })))
+}
+
+/// The Gitea owner of a package name in `eco`, when it is private.
+fn owner_of(st: &AppState, eco: Eco, name: &str) -> Option<String> {
+    st.cfg.gitea.as_ref()?;
+    match eco {
+        // The private registry is separate; crates.io names are public.
+        Eco::Cargo => None,
+        Eco::Pypi => st.namespaces.owner(eco, &pypi::normalize(name)),
+        _ => st.namespaces.owner(eco, name),
+    }
+}
+
+fn private_name(st: &AppState, eco: Eco, name: &str) -> bool {
+    owner_of(st, eco, name).is_some()
+}
+
+/// Search Gitea's packages of every owner with private names in `eco`.
+/// Failures are logged and leave just the public results.
+async fn search_gitea(st: &AppState, eco: Eco, q: &str) -> Vec<Hit> {
+    let kind = eco.as_str();
+    let mut by_name: HashMap<String, Hit> = HashMap::new();
+    for owner in st.namespaces.owners(eco) {
+        let path = format!(
+            "/api/v1/packages/{owner}?type={kind}&q={}&limit=50",
+            url_encode(q)
+        );
+        let list = match st.gitea.api_get(&st.cfg, &path).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("searching Gitea's {kind} packages: {}", e.message);
+                continue;
+            }
+        };
+        for p in list.as_array().into_iter().flatten() {
+            let (Some(name), Some(version)) = (p["name"].as_str(), p["version"].as_str()) else {
+                continue;
+            };
+            // Only names that route to this owner: anything else would be
+            // fetched from somewhere else.
+            if owner_of(st, eco, name).as_deref() != Some(owner.as_str()) {
+                continue;
+            }
+            let hit = by_name.entry(name.to_string()).or_insert_with(|| Hit {
+                name: name.to_string(),
+                latest: None,
+                description: None,
+                private: true,
+            });
+            if hit
+                .latest
+                .as_deref()
+                .is_none_or(|l| version_cmp(version, l).is_gt())
+            {
+                hit.latest = Some(version.to_string());
+            }
+        }
+    }
+    let mut hits: Vec<Hit> = by_name.into_values().collect();
+    hits.sort_by(|a, b| a.name.cmp(&b.name));
+    hits.truncate(HITS);
+    hits
+}
+
+fn url_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 fn cached_versions(inv: &[inventory::Asset], eco: Eco, name: &str) -> usize {
@@ -264,6 +368,7 @@ async fn search_upstream(st: &AppState, user: i64, eco: Eco, q: &str) -> AppResu
                         name: s(&p["name"])?,
                         latest: s(&p["version"]),
                         description: s(&p["description"]),
+                        private: false,
                     })
                 })
                 .collect()
@@ -283,6 +388,7 @@ async fn search_upstream(st: &AppState, user: i64, eco: Eco, q: &str) -> AppResu
                         name: s(&c["name"])?,
                         latest: s(&c["max_stable_version"]).or_else(|| s(&c["max_version"])),
                         description: s(&c["description"]).map(|d| d.trim().to_string()),
+                        private: false,
                     })
                 })
                 .collect()
@@ -306,6 +412,7 @@ async fn search_upstream(st: &AppState, user: i64, eco: Eco, q: &str) -> AppResu
                         name: format!("{}:{}", s(&d["g"])?, s(&d["a"])?),
                         latest: s(&d["latestVersion"]).or_else(|| s(&d["v"])),
                         description: None,
+                        private: false,
                     })
                 })
                 .collect()
@@ -385,11 +492,9 @@ pub async fn lookup(st: &AppState, eco: Eco, name: &str) -> AppResult<Option<Ver
             if !npm::valid_package_name(name) {
                 return Ok(None);
             }
-            let url = format!("{}/{}", st.cfg.npm_upstream, name.replace('/', "%2f"));
-            st.store
-                .meta("npm", name, "abbr", &url, npm::ABBREVIATED)
+            npm::packument_meta(st, name, "abbr", npm::ABBREVIATED)
                 .await
-                .map(|m| {
+                .map(|(_, m)| {
                     let v: Value = serde_json::from_slice(&m.body).unwrap_or_default();
                     let versions = v["versions"]
                         .as_object()
@@ -432,42 +537,33 @@ pub async fn lookup(st: &AppState, eco: Eco, name: &str) -> AppResult<Option<Ver
             if !pypi::valid_project(&name) {
                 return Ok(None);
             }
-            let url = format!("{}/{name}/", st.cfg.pypi_index);
-            st.store
-                .meta("pypi", &name, "json", &url, pypi::SIMPLE_JSON)
-                .await
-                .map(|m| {
-                    let v: Value = serde_json::from_slice(&m.body).unwrap_or_default();
-                    // PEP 700 lists versions; older indexes only list files.
-                    let versions = match v["versions"].as_array() {
-                        Some(list) => list
-                            .iter()
-                            .filter_map(|x| x.as_str().map(String::from))
-                            .collect(),
-                        None => pypi_files(&v)
-                            .into_iter()
-                            .filter_map(|(_, f)| {
-                                inventory::classify("pypi", &f).map(|(_, ver)| ver)
-                            })
-                            .collect(),
-                    };
-                    finish(name.clone(), versions, None)
-                })
+            pypi::project_meta(st, &name, true).await.map(|m| {
+                let v: Value = serde_json::from_slice(&m.body).unwrap_or_default();
+                // PEP 700 lists versions; older indexes (and Gitea's HTML
+                // pages) only list files.
+                let versions = match v["versions"].as_array() {
+                    Some(list) => list
+                        .iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect(),
+                    None => pypi::page_files(&m.body)
+                        .into_iter()
+                        .filter_map(|(_, f, _)| inventory::classify("pypi", &f).map(|(_, ver)| ver))
+                        .collect(),
+                };
+                finish(name.clone(), versions, None)
+            })
         }
         Eco::Maven => {
             let Ok((group, artifact, _)) = lines::maven(name) else {
                 return Ok(None);
             };
             let rel = format!("{}/{artifact}/maven-metadata.xml", group.replace('.', "/"));
-            let url = format!("{}/{rel}", st.cfg.maven_upstream);
-            st.store
-                .meta("maven", &rel, "raw", &url, "*/*")
-                .await
-                .map(|m| {
-                    let text = String::from_utf8_lossy(&m.body);
-                    let (versions, release) = maven_versions(&text);
-                    finish(format!("{group}:{artifact}"), versions, release)
-                })
+            maven::metadata_doc(st, &rel).await.map(|m| {
+                let text = String::from_utf8_lossy(&m.body);
+                let (versions, release) = maven_versions(&text);
+                finish(format!("{group}:{artifact}"), versions, release)
+            })
         }
     };
     match found {
@@ -497,21 +593,6 @@ pub fn maven_versions(xml: &str) -> (Vec<String>, Option<String>) {
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
     (versions, release)
-}
-
-/// (url, filename) of every file in a Simple API JSON page.
-fn pypi_files(v: &Value) -> Vec<(String, String)> {
-    v["files"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|f| {
-            Some((
-                f["url"].as_str()?.split('#').next()?.to_string(),
-                f["filename"].as_str()?.to_string(),
-            ))
-        })
-        .collect()
 }
 
 #[derive(Deserialize)]
@@ -553,23 +634,25 @@ struct DistFile {
     kind: &'static str,
 }
 
+/// The files of one version. Paths are under `/pypi/files/`, or for a
+/// private project under `/pypi/gitea-files/`.
 async fn pypi_version_files(st: &AppState, name: &str, version: &str) -> AppResult<Vec<DistFile>> {
     let name = pypi::normalize(name);
     if !pypi::valid_project(&name) {
         return Err(AppError::not_found());
     }
-    let url = format!("{}/{name}/", st.cfg.pypi_index);
-    let m = st
-        .store
-        .meta("pypi", &name, "json", &url, pypi::SIMPLE_JSON)
-        .await?;
-    let v: Value = serde_json::from_slice(&m.body).unwrap_or_default();
+    let m = pypi::project_meta(st, &name, true).await?;
+    let private = pypi::private_owner(st, &name).is_some();
     let prefix = format!("{}/", st.cfg.pypi_files);
-    Ok(pypi_files(&v)
+    Ok(pypi::page_files(&m.body)
         .into_iter()
-        .filter(|(_, f)| inventory::classify("pypi", f).is_some_and(|(_, ver)| ver == version))
-        .filter_map(|(url, filename)| {
-            let path = url.strip_prefix(&prefix)?.to_string();
+        .filter(|(_, f, _)| inventory::classify("pypi", f).is_some_and(|(_, ver)| ver == version))
+        .filter_map(|(url, filename, _)| {
+            let path = if private {
+                format!("{name}/{version}/{filename}")
+            } else {
+                url.strip_prefix(&prefix)?.to_string()
+            };
             let kind = if filename.ends_with(".whl") {
                 "wheel"
             } else {
@@ -662,12 +745,13 @@ pub async fn cache_one(
     version: &str,
     file: Option<&str>,
 ) -> AppResult<Vec<(String, u64)>> {
-    let mut rels: Vec<String> = Vec::new();
+    // (namespace, path) of every file cached.
+    let mut rels: Vec<(&'static str, String)> = Vec::new();
     match eco {
         Eco::Cargo => {
             cargo::fetch_crate(st, name, version).await?;
             let lower = name.to_ascii_lowercase();
-            rels.push(format!("{lower}/{lower}-{version}.crate"));
+            rels.push(("cargo", format!("{lower}/{lower}-{version}.crate")));
         }
         Eco::Npm => {
             let v = lookup(st, eco, name)
@@ -679,27 +763,22 @@ pub async fn cache_one(
                     format!("{name} has no version {version}"),
                 ));
             }
-            let url = format!("{}/{}", st.cfg.npm_upstream, name.replace('/', "%2f"));
-            let meta = st
-                .store
-                .meta("npm", name, "abbr", &url, npm::ABBREVIATED)
-                .await?;
+            let (o, meta) = npm::packument_meta(st, name, "abbr", npm::ABBREVIATED).await?;
             let doc: Value = serde_json::from_slice(&meta.body).unwrap_or_default();
             let tarball = doc["versions"][version]["dist"]["tarball"]
                 .as_str()
                 .ok_or_else(|| {
                     AppError::bad_gateway("the registry lists no tarball for that version")
                 })?;
-            let rel = tarball
-                .strip_prefix(&format!("{}/", st.cfg.npm_upstream))
-                .ok_or_else(|| {
-                    AppError::bad_gateway("the tarball is not on the configured registry")
-                })?;
-            let (pkg, file) = rel
-                .split_once("/-/")
-                .ok_or_else(|| AppError::bad_gateway("unexpected tarball URL"))?;
-            npm::tarball(st, pkg, file).await?;
-            rels.push(format!("{pkg}/-/{file}"));
+            let file = o.tarball_file(tarball).ok_or_else(|| {
+                AppError::bad_gateway("the tarball is not on the registry the package comes from")
+            })?;
+            npm::tarball(st, name, &file).await?;
+            let rel = format!("{name}/-/{file}");
+            rels.push(match &o.owner {
+                Some(owner) => (o.ns, format!("{owner}/{rel}")),
+                None => (o.ns, rel),
+            });
         }
         Eco::Pypi => {
             let files = pypi_version_files(st, name, version).await?;
@@ -715,8 +794,16 @@ pub async fn cache_one(
                     "that file is not part of this version",
                 ));
             }
-            pypi::fetch_file(st, &path).await?;
-            rels.push(path);
+            match pypi::private_owner(st, &pypi::normalize(name)) {
+                Some(owner) => {
+                    pypi::fetch_gitea_file(st, &owner, &path).await?;
+                    rels.push(("gitea-pypi", format!("{owner}/{path}")));
+                }
+                None => {
+                    pypi::fetch_file(st, &path).await?;
+                    rels.push(("pypi", path));
+                }
+            }
         }
         Eco::Maven => {
             let (group, artifact, version) =
@@ -728,10 +815,11 @@ pub async fn cache_one(
             );
             let pom = format!("{base}.pom");
             maven::fetch(st, &pom).await?;
-            rels.push(pom.clone());
+            let (ns, pom_rel) = maven::cached_at(st, &pom);
+            rels.push((ns, pom_rel.clone()));
             let packaging = st
                 .store
-                .read_file("maven", &pom)
+                .read_file(ns, &pom_rel)
                 .await
                 .and_then(|b| pom_packaging(&String::from_utf8_lossy(&b)))
                 .unwrap_or_else(|| "jar".into());
@@ -745,14 +833,13 @@ pub async fn cache_one(
             if let Some(ext) = ext {
                 let main = format!("{base}.{ext}");
                 maven::fetch(st, &main).await?;
-                rels.push(main);
+                rels.push(maven::cached_at(st, &main));
             }
         }
     }
-    let dir = st.store.files_dir(eco.as_str());
     let mut out = Vec::new();
-    for rel in rels {
-        let size = tokio::fs::metadata(dir.join(&rel))
+    for (ns, rel) in rels {
+        let size = tokio::fs::metadata(st.store.files_dir(ns).join(&rel))
             .await
             .map(|m| m.len())
             .unwrap_or(0);

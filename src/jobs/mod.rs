@@ -422,11 +422,15 @@ async fn snapshot(st: &AppState) -> HashMap<String, (String, u64)> {
     tokio::task::spawn_blocking(move || {
         let access = HashMap::new();
         let mut out = HashMap::new();
-        for repo in REPOS {
-            for a in inventory::scan_repo(repo, &store.files_dir(repo), &access) {
+        let namespaces = REPOS
+            .iter()
+            .map(|r| (*r, *r, false))
+            .chain(inventory::PRIVATE.iter().map(|(r, ns)| (*r, *ns, true)));
+        for (repo, ns, private) in namespaces {
+            for a in inventory::scan_repo(repo, ns, &store.files_dir(ns), &access, private) {
                 out.insert(
-                    format!("{repo}/{}", a.path),
-                    (format!("{repo}/{}", a.package), a.size),
+                    format!("{ns}/{}", a.path),
+                    (format!("{ns}/{}", a.package), a.size),
                 );
             }
         }

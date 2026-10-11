@@ -10,11 +10,17 @@
 //! Project pages are cached with a TTL and their file links are rewritten to
 //! point back at this server. Distribution files (and their `.metadata`
 //! companions) are cached forever; pip verifies the `sha256` in each link.
+//!
+//! Names listed as private namespaces (compared after PEP 503 normalization,
+//! see `namespaces`) come from Gitea's PyPI registry instead, and only from
+//! there: their pages and files are never fetched from PyPI. Their files are
+//! served at `/pypi/gitea-files/{project}/{version}/{file}` and cached under
+//! `gitea-pypi/{owner}/`.
 
 use axum::{
     Router,
     extract::{Path, State},
-    http::{HeaderMap, header},
+    http::{HeaderMap, Uri, header},
     response::{IntoResponse, Redirect, Response},
     routing::get,
 };
@@ -23,7 +29,9 @@ use crate::{
     AppState,
     error::{AppError, AppResult},
     inventory::classify,
-    store::Checksum,
+    policy::{Principal, Resource, refuse},
+    store::{Checksum, Meta},
+    templates::lines::Eco,
     util::base_url,
 };
 
@@ -40,6 +48,101 @@ pub fn router() -> Router<AppState> {
         .route("/pypi/simple/{project}", get(redirect_slash))
         .route("/pypi/simple/{project}/", get(project_page))
         .route("/pypi/files/{*path}", get(file))
+        .route("/pypi/gitea-files/{*path}", get(gitea_file))
+}
+
+/// The Gitea owner of a (normalized) project name, when it is private.
+pub fn private_owner(st: &AppState, project: &str) -> Option<String> {
+    st.cfg.gitea.as_ref()?;
+    st.namespaces.owner(Eco::Pypi, project)
+}
+
+/// Gitea's PyPI registry for `owner`, without a trailing slash.
+fn gitea_base(st: &AppState, owner: &str) -> String {
+    let url = st.cfg.gitea.as_ref().map_or("", |g| g.url.as_str());
+    format!("{url}/api/packages/{owner}/pypi")
+}
+
+/// A project's page, from Gitea for a private name, else from the index.
+/// Gitea serves HTML only, so private pages are always HTML.
+pub async fn project_meta(st: &AppState, name: &str, json: bool) -> AppResult<Meta> {
+    match private_owner(st, name) {
+        Some(owner) => {
+            let url = format!("{}/simple/{name}", gitea_base(st, &owner));
+            st.store
+                .meta(
+                    "gitea-pypi",
+                    &format!("{owner}/{name}"),
+                    "html",
+                    &url,
+                    SIMPLE_HTML,
+                )
+                .await
+        }
+        None => {
+            let url = format!("{}/{name}/", st.cfg.pypi_index);
+            let (variant, accept) = if json {
+                ("json", SIMPLE_JSON)
+            } else {
+                ("html", SIMPLE_HTML)
+            };
+            st.store.meta("pypi", name, variant, &url, accept).await
+        }
+    }
+}
+
+/// Every file a project page links to: (URL without its fragment, file
+/// name, sha256 when given). Reads the JSON and the HTML forms.
+pub fn page_files(body: &[u8]) -> Vec<(String, String, Option<String>)> {
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        return v["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|f| {
+                Some((
+                    f["url"].as_str()?.split('#').next()?.to_string(),
+                    f["filename"].as_str()?.to_string(),
+                    f["hashes"]["sha256"].as_str().map(String::from),
+                ))
+            })
+            .collect();
+    }
+    let text = String::from_utf8_lossy(body);
+    text.split("href=\"")
+        .skip(1)
+        .filter_map(|rest| {
+            let href = rest.split('"').next()?.replace("&amp;", "&");
+            let (url, fragment) = href.split_once('#').unwrap_or((&href, ""));
+            let file = url.rsplit('/').next()?.to_string();
+            let sha = fragment
+                .strip_prefix("sha256=")
+                .map(|h| h.split('&').next().unwrap_or(h).to_string());
+            (!file.is_empty()).then(|| (url.to_string(), file, sha))
+        })
+        .collect()
+}
+
+/// Point a Gitea project page's file links at Granary's `/pypi/gitea-files/`.
+/// Gitea builds them from its own idea of its address (`ROOT_URL`), so
+/// everything up to the registry path is replaced.
+fn rewrite_gitea_links(page: &str, owner: &str, ours: &str) -> String {
+    let marker = format!("/api/packages/{owner}/pypi/files/");
+    let mut out = String::with_capacity(page.len());
+    let mut rest = page;
+    while let Some(i) = rest.find("href=\"") {
+        let (head, tail) = rest.split_at(i + 6);
+        out.push_str(head);
+        let end = tail.find('"').unwrap_or(tail.len());
+        let href = &tail[..end];
+        match href.split_once(&marker) {
+            Some((_, path)) => out.push_str(&format!("{ours}{path}")),
+            None => out.push_str(href),
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// PEP 503 name normalization.
@@ -92,6 +195,8 @@ async fn root_index(State(st): State<AppState>, headers: HeaderMap) -> AppResult
 
 async fn project_page(
     State(st): State<AppState>,
+    who: Principal,
+    uri: Uri,
     headers: HeaderMap,
     Path(project): Path<String>,
 ) -> AppResult<Response> {
@@ -99,8 +204,18 @@ async fn project_page(
     if !valid_project(&name) {
         return Err(AppError::not_found());
     }
-    let url = format!("{}/{name}/", st.cfg.pypi_index);
-    serve_page(&st, &headers, &name, url).await
+    let Some(owner) = private_owner(&st, &name) else {
+        let url = format!("{}/{name}/", st.cfg.pypi_index);
+        return serve_page(&st, &headers, &name, url).await;
+    };
+    let r = Resource::gitea_package("pypi", &owner, &name);
+    if let Some(answer) = refuse(&st, &who, &r, &headers, uri.path()) {
+        return Ok(answer);
+    }
+    let meta = project_meta(&st, &name, false).await?;
+    let ours = format!("{}/pypi/gitea-files/", base_url(&st.cfg, &headers));
+    let body = rewrite_gitea_links(&String::from_utf8_lossy(&meta.body), &owner, &ours);
+    Ok(([(header::CONTENT_TYPE, meta.content_type)], body).into_response())
 }
 
 async fn serve_page(
@@ -118,7 +233,70 @@ async fn serve_page(
 }
 
 async fn file(State(st): State<AppState>, Path(path): Path<String>) -> AppResult<Response> {
+    // A file of a private project never comes from PyPI.
+    let dist = path.strip_suffix(".metadata").unwrap_or(&path);
+    if let Some((project, _)) = classify("pypi", dist)
+        && private_owner(&st, &project).is_some()
+    {
+        return Err(AppError::not_found());
+    }
     fetch_file(&st, &path).await
+}
+
+async fn gitea_file(
+    State(st): State<AppState>,
+    who: Principal,
+    uri: Uri,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+) -> AppResult<Response> {
+    let mut parts = path.split('/');
+    let (Some(project), Some(_version), Some(_file), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(AppError::not_found());
+    };
+    let name = normalize(project);
+    let Some(owner) = private_owner(&st, &name) else {
+        return Err(AppError::not_found());
+    };
+    let r = Resource::gitea_package("pypi", &owner, &name);
+    if let Some(answer) = refuse(&st, &who, &r, &headers, uri.path()) {
+        return Ok(answer);
+    }
+    fetch_gitea_file(&st, &owner, &path).await
+}
+
+/// Serve one file of a private project (`{project}/{version}/{file}`),
+/// downloading it from Gitea and checking its sha256 on first use.
+pub async fn fetch_gitea_file(st: &AppState, owner: &str, path: &str) -> AppResult<Response> {
+    let rel = format!("{owner}/{path}");
+    let url = format!("{}/files/{path}", gitea_base(st, owner));
+    let expected = if st.store.has_file("gitea-pypi", &rel).await {
+        None
+    } else {
+        let project = normalize(path.split('/').next().unwrap_or(""));
+        let file = path.rsplit('/').next().unwrap_or("");
+        project_meta(st, &project, false)
+            .await
+            .ok()
+            .and_then(|m| {
+                page_files(&m.body)
+                    .into_iter()
+                    .find(|(_, f, _)| f == file)
+                    .and_then(|(_, _, sha)| sha)
+            })
+            .and_then(|h| Checksum::sha256_hex(&h))
+    };
+    st.store
+        .file(
+            "gitea-pypi",
+            &rel,
+            &url,
+            "application/octet-stream",
+            expected,
+        )
+        .await
 }
 
 /// Serve one distribution file (path under the files host), downloading and

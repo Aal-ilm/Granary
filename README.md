@@ -256,9 +256,9 @@ subgroups aren't supported yet).
 ## Gitea
 
 Granary can use a self-hosted [Gitea](https://about.gitea.com) as a private
-upstream. Your private Gitea repos then come through Granary next to the
-public ones, under the same `/git/` URLs. Gitea does the hosting; Granary
-does the caching. Everything that comes from Gitea is **private**: who may
+upstream. Your private Gitea repos and the packages you publish to Gitea
+then come through Granary next to the public ones, under the same URLs.
+Gitea does the hosting and publishing; Granary does the caching. Everything that comes from Gitea is **private**: who may
 read it is decided by [private access](#private-access).
 
 **Setup.** Create an access token in Gitea (**Settings → Applications**)
@@ -300,6 +300,79 @@ through its environment rather than its command line, so it never reaches
 another host or another process's view. Private repos work everywhere
 public ones do: cloning, **Browse → Git**, and [templates from
 repos](#templates-from-repos). They carry a **Private** badge.
+
+### Private packages
+
+Packages you publish to Gitea's package registries come through Granary
+too, under the same URLs as the public ones: npm, pip and Maven need no
+change at all, since Granary decides where each name comes from. Tell it
+which names belong to Gitea under **System → Gitea → Private namespaces**,
+one list per format, each pattern mapped to the Gitea user or org that owns
+the packages:
+
+| Format | Pattern | Fetched from |
+|---|---|---|
+| npm | a scope: `@dynatheia` | `{gitea}/api/packages/{owner}/npm/` |
+| PyPI | an exact name, or a prefix ending in `*`: `dynatheia-*` | `{gitea}/api/packages/{owner}/pypi/simple/` |
+| Maven | a groupId prefix: `com.dynatheia` | `{gitea}/api/packages/{owner}/maven/` |
+| Cargo | the whole private registry (see below) | `{gitea}/api/packages/{owner}/cargo/` |
+
+PyPI names are compared after [PEP 503](https://peps.python.org/pep-0503/)
+normalization, so `Dynatheia_Foo`, `dynatheia.foo` and `dynatheia-foo` are
+the same project. A Maven prefix matches whole segments: `com.dynatheia`
+covers `com.dynatheia.core` but not `com.dynatheiax`.
+
+The lists can also be set with `GRANARY_GITEA_NPM`, `GRANARY_GITEA_PYPI`,
+`GRANARY_GITEA_MAVEN` and `GRANARY_GITEA_CARGO`, written
+`pattern=owner,pattern=owner` (for Cargo, just the owner):
+
+```yaml
+      GRANARY_GITEA_NPM: "@dynatheia=dynatheia"
+      GRANARY_GITEA_PYPI: "dynatheia-*=dynatheia"
+      GRANARY_GITEA_MAVEN: "com.dynatheia=dynatheia"
+      GRANARY_GITEA_CARGO: "dynatheia"
+```
+
+A format whose variable is set is locked on the System page, as with
+`GRANARY_PRIVATE_ACCESS`; the others are edited there.
+
+**The dependency confusion rule.** A name matching a private namespace is
+only ever fetched from Gitea. If Gitea doesn't have it, the answer is a
+404: Granary never falls back to the public registry, so a package someone
+publishes there under your name can't be installed in its place. In the
+other direction, a name matching no namespace is never fetched from Gitea.
+Private packages are cached apart from public ones (under `gitea-npm/`,
+`gitea-pypi/` and so on in the data directory), and a 404 for a private
+name is never remembered, so a package just published to Gitea shows up
+at once.
+
+Private packages follow [private access](#private-access) on every request,
+cached or not and in offline mode too, and carry a **Private** badge in
+Browse and in **Get packages**. There, people with private access also see
+search results from Gitea's package API, labelled as such; public results
+with a private namespace's name are left out, since they could never be
+installed. npm tarball URLs follow `GRANARY_NPM_REWRITE_TARBALLS`: with it
+off, private packuments keep Gitea's own URLs, so clients fetch those
+tarballs from Gitea directly. Checksums are checked as for the public
+registries (npm `integrity`, PyPI `sha256`, Maven `.sha1`, Cargo `cksum`).
+
+**The private Cargo registry.** Cargo can't route single crate names to
+another registry, so Gitea's Cargo registry for the configured owner is a
+separate registry at `/cargo-private/`. Granary uses Gitea's sparse index
+when the connected Gitea serves one, and otherwise reads its git index
+(`{owner}/_cargo-index`) through the git cache. Cargo always sends its
+token there. `make use-granary` adds it when your token has private access;
+by hand:
+
+```toml
+# ~/.cargo/config.toml
+[registries.granary-private]
+index = "sparse+http://HOST/cargo-private/"
+credential-provider = "cargo:token"
+```
+
+Then `cargo login --registry granary-private`, and depend on its crates
+with `my-crate = { version = "1", registry = "granary-private" }`.
 
 ### Private access
 
@@ -344,6 +417,45 @@ trusts them for everything it fetches over HTTPS, Gitea and the public
 upstreams alike, next to the system's own roots. git gets a bundle of both
 (written to `state/ca-bundle.pem` in the data directory), so public hosts
 keep working. Mount the file read-only, as in the example above.
+
+### Gitea Actions runners
+
+CI jobs can install everything through Granary too, so builds don't reach
+the internet. Give the runner's job containers a network that reaches
+Granary and nothing else (in act_runner's `config.yaml`, `container:
+network:` naming an internal Docker network Granary is on), make an access
+token with private access for CI, store it as a Gitea Actions secret, and
+point each tool at Granary in a first step:
+
+```yaml
+      - name: Use Granary
+        env:
+          GRANARY: http://granary:8080
+          TOKEN: ${{ secrets.GRANARY_TOKEN }}
+        run: |
+          host="${GRANARY#*://}"
+          # npm
+          printf 'registry=%s/npm/\n//%s/npm/:_authToken=%s\n' "$GRANARY" "$host" "$TOKEN" >> ~/.npmrc
+          # pip and uv
+          echo "PIP_INDEX_URL=${GRANARY%%://*}://__token__:$TOKEN@$host/pypi/simple/" >> "$GITHUB_ENV"
+          echo "UV_INDEX_URL=${GRANARY%%://*}://__token__:$TOKEN@$host/pypi/simple/" >> "$GITHUB_ENV"
+          # Cargo (source replacement can't be set from the environment)
+          mkdir -p ~/.cargo
+          printf '[registries.granary]\nindex = "sparse+%s/cargo/"\ncredential-provider = "cargo:token"\n\n[registries.granary-private]\nindex = "sparse+%s/cargo-private/"\ncredential-provider = "cargo:token"\n\n[source.crates-io]\nreplace-with = "granary"\n\n[net]\ngit-fetch-with-cli = true\n' "$GRANARY" "$GRANARY" >> ~/.cargo/config.toml
+          echo "CARGO_REGISTRIES_GRANARY_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          echo "CARGO_REGISTRIES_GRANARY_PRIVATE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          # Maven and Gradle: the starter's .mvn/settings.xml, or ~/.m2/settings.xml
+          mkdir -p ~/.m2
+          printf '<settings><servers><server><id>granary</id><username>token</username><password>%s</password></server></servers><mirrors><mirror><id>granary</id><mirrorOf>central</mirrorOf><url>%s/maven</url></mirror></mirrors></settings>\n' "$TOKEN" "$GRANARY" > ~/.m2/settings.xml
+          # git: GitHub and Gitea repos through the git cache
+          for h in github.com gitea.skynet.core; do
+            git config --global url."$GRANARY/git/$h/".insteadOf "https://$h/"
+          done
+          git config --global http."$GRANARY/".extraHeader "Authorization: Basic $(printf 'token:%s' "$TOKEN" | base64 | tr -d '\n')"
+```
+
+Keep only the tools a workflow uses. On a machine with this repository,
+`make use-granary` does the same for a person's own setup.
 
 ## Getting packages ahead of time
 
@@ -686,6 +798,8 @@ All settings are environment variables.
 | `GRANARY_GIT_TIMEOUT_MINS` | `10` | Longest a git clone or refresh may run |
 | `GRANARY_GITEA_URL` | *(none)* | A self-hosted Gitea used as a private upstream, e.g. `https://gitea.skynet.core` (see [Gitea](#gitea)) |
 | `GRANARY_GITEA_TOKEN_FILE` | *(none)* | File holding a Gitea access token with read-only repository and package scopes. Needed with `GRANARY_GITEA_URL` |
+| `GRANARY_GITEA_NPM`, `GRANARY_GITEA_PYPI`, `GRANARY_GITEA_MAVEN` | *(set on the System page)* | Private namespaces per format, `pattern=owner,...`, e.g. `@dynatheia=dynatheia`. When set, the System page can't change that format's list (see [Private packages](#private-packages)) |
+| `GRANARY_GITEA_CARGO` | *(set on the System page)* | The Gitea owner whose Cargo registry is served at `/cargo-private/` |
 | `GRANARY_PRIVATE_ACCESS` | *(set on the System page)* | `scoped` or `signed-in`: who may read private content (see [Private access](#private-access)). When set, the System page can't change it |
 | `GRANARY_EXTRA_CA` | *(none)* | PEM file of extra root certificates trusted for every HTTPS upstream, e.g. an internal CA (see [Extra CA](#extra-ca)) |
 | `GRANARY_PRIVATE_HOSTS` | *(none)* | Comma-separated host names or IP addresses Granary may connect to although they're private addresses, besides the Gitea host (see [Private addresses](#private-addresses)) |
@@ -805,6 +919,9 @@ cached.
   git pushes.
 - **Git: public repos only (and private ones from Gitea), no submodules or
   LFS.** See [Git repos](#git-repos) and [Gitea](#gitea).
+- **Private packages:** Maven snapshots from Gitea aren't served, and
+  **Get packages** doesn't search or cache crates from the private Cargo
+  registry; Cargo itself uses it as usual.
 - **No single sign-on yet.** Accounts live in Granary itself; LDAP and OpenID
   Connect aren't supported. Granary serves plain HTTP, so put it behind a
   reverse proxy with TLS if it's reachable from untrusted networks.
@@ -822,8 +939,9 @@ cached.
   internal mirror, add its host to `GRANARY_PRIVATE_HOSTS`; the System
   page's upstream check shows any host that is refused.
 - **Gitea and private access are new.** Nothing changes until
-  `GRANARY_GITEA_URL` is set. The database gains a few columns on the
-  first start; no data is changed.
+  `GRANARY_GITEA_URL` is set, and no package name is private until a
+  private namespace lists it. The database gains a few columns on the first
+  start; no data is changed.
 
 ## Roadmap
 
