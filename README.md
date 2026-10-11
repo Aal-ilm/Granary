@@ -574,8 +574,10 @@ recorded in the audit log; viewers can see the job history.
   invalidate caches and manage users. Viewers can browse and create their own
   access tokens. The server enforces this; hidden buttons are a convenience.
 - **First admin.** On first start Granary creates `admin` with a random
-  password, printed once to the container log (never to the in-app log view).
-  Set `GRANARY_ADMIN_PASSWORD` to choose it instead. New users and resets get a
+  password and writes it to `initial-admin-password` in the data directory
+  (mode 600), never to a log; the log only says where the file is. The file
+  is deleted after the first admin sign-in or password change. Set
+  `GRANARY_ADMIN_PASSWORD` to choose the password instead. New users and resets get a
   temporary password that must be changed at first sign-in.
 - **Passwords** are hashed with Argon2id and must be at least 12 characters.
   Changing a password signs out the account's other sessions.

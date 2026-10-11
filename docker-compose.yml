@@ -24,8 +24,10 @@ services:
       # Granary sees real client addresses for sign-in limits and the
       # audit log. Docker's bridge networks are inside 172.16.0.0/12.
       # GRANARY_TRUSTED_PROXIES: "172.16.0.0/12"
-      # The first admin's password is generated and printed to this
-      # container's log on first start. To choose it instead, put
+      # The first admin's password is generated on first start and written
+      # to /data/initial-admin-password (read it with
+      #   docker compose exec granary cat /data/initial-admin-password
+      # ); it is never logged. To choose it instead, put
       # GRANARY_ADMIN_PASSWORD=... in a .env file next to this one.
       GRANARY_ADMIN_PASSWORD: "${GRANARY_ADMIN_PASSWORD:-}"
       # "required": package downloads need an access token. "off": open.
