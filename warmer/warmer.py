@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""Granary warmer: runs the real package tools against Granary so that
+everything they download lands in Granary's cache.
+
+Granary sends one job per ecosystem to POST /run with the manifests to use
+(Cargo.toml, package.json, requirements.txt or pom.xml), the platforms to
+cover and an access token. The warmer writes them to a fresh temporary
+directory, points the tools at Granary only, runs them, streams their output
+back line by line and deletes the directory. Install scripts and build steps
+never run: npm uses --ignore-scripts and pip downloads wheels only, unless
+the template allows source distributions.
+
+Settings (environment variables):
+  WARMER_SECRET      shared secret Granary sends as a bearer token (required)
+  WARMER_ALLOW_FROM  comma-separated host names or IPs allowed to connect,
+                     e.g. "granary"; empty allows any address
+  WARMER_LISTEN      address to listen on, default 0.0.0.0:9090
+  WARMER_PIP         pip command, default "python3 -m pip"
+  WARMER_WORKDIR     where job directories are made, default the system temp
+
+Only the Python standard library is used.
+"""
+
+import hmac
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+SECRET = os.environ.get("WARMER_SECRET", "")
+ALLOW_FROM = [h.strip() for h in os.environ.get("WARMER_ALLOW_FROM", "").split(",") if h.strip()]
+LISTEN = os.environ.get("WARMER_LISTEN", "0.0.0.0:9090")
+PIP = shlex.split(os.environ.get("WARMER_PIP", f"{sys.executable} -m pip"))
+WORKDIR = os.environ.get("WARMER_WORKDIR") or None
+MAX_BODY = 2 * 1024 * 1024
+RESULT = "##granary "
+MAVEN_DEPENDENCY_PLUGIN = "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:go-offline"
+
+# Wheel platform tags and npm os/cpu for each Granary platform id.
+PLATFORMS = {
+    "linux-x86_64": {
+        "pip": ["manylinux_2_28_x86_64", "manylinux_2_17_x86_64", "manylinux2014_x86_64", "linux_x86_64"],
+        "npm": ("linux", "x64"),
+    },
+    "linux-aarch64": {
+        "pip": ["manylinux_2_28_aarch64", "manylinux_2_17_aarch64", "manylinux2014_aarch64", "linux_aarch64"],
+        "npm": ("linux", "arm64"),
+    },
+    "macos-arm64": {
+        "pip": ["macosx_14_0_arm64", "macosx_13_0_arm64", "macosx_12_0_arm64", "macosx_11_0_arm64"],
+        "npm": ("darwin", "arm64"),
+    },
+    "macos-x86_64": {
+        "pip": ["macosx_14_0_x86_64", "macosx_12_0_x86_64", "macosx_10_15_x86_64", "macosx_10_9_x86_64"],
+        "npm": ("darwin", "x64"),
+    },
+    "windows-x86_64": {"pip": ["win_amd64"], "npm": ("win32", "x64")},
+}
+
+# Files Granary may send for each ecosystem.
+FILES = {
+    "cargo": {"Cargo.toml", "src/main.rs"},
+    "npm": {"package.json"},
+    "pypi": {"requirements.txt"},
+    "maven": {"pom.xml"},
+}
+
+# Terminal colour and cursor codes some tools print even without a terminal.
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+# Running jobs: job id -> Job.
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+
+
+class Cancelled(Exception):
+    pass
+
+
+class ClientGone(Exception):
+    pass
+
+
+class Job:
+    def __init__(self, job_id, emit, secrets):
+        self.id = job_id
+        self.emit_raw = emit
+        self.secrets = [s for s in secrets if s]
+        self.proc = None
+        self.cancelled = False
+
+    def mask(self, text):
+        for s in self.secrets:
+            text = text.replace(s, "***")
+        return text
+
+    def emit(self, line):
+        self.emit_raw(self.mask(ANSI.sub("", line.rstrip("\r\n"))))
+
+    def cancel(self):
+        self.cancelled = True
+        p = self.proc
+        if p and p.poll() is None:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    def run(self, args, cwd, env, show=None):
+        """Run a command, streaming its output. Returns True on success."""
+        if self.cancelled:
+            raise Cancelled()
+        self.emit("$ " + (show or " ".join(shlex.quote(a) for a in args)))
+        try:
+            self.proc = subprocess.Popen(
+                args,
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                text=True,
+                errors="replace",
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            self.emit(f"{args[0]} is not installed in the warmer")
+            return False
+        try:
+            for line in self.proc.stdout:
+                self.emit(line)
+        except ClientGone:
+            self.cancel()
+            raise
+        code = self.proc.wait()
+        if self.cancelled:
+            raise Cancelled()
+        if code != 0:
+            self.emit(f"(exited with code {code})")
+        return code == 0
+
+
+def base_env(home):
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": home,
+        "LANG": "C.UTF-8",
+        "NO_COLOR": "1",
+        "CARGO_TERM_COLOR": "never",
+        "npm_config_color": "false",
+        "npm_config_update_notifier": "false",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    }
+    for key in ("JAVA_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "SSL_CERT_FILE"):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    # rustup finds its toolchains through RUSTUP_HOME, which defaults to
+    # ~/.rustup; jobs get their own HOME, so point it at the real one.
+    if "RUSTUP_HOME" not in env:
+        for candidate in (os.path.expanduser("~/.rustup"), "/usr/local/rustup"):
+            if os.path.isdir(candidate):
+                env["RUSTUP_HOME"] = candidate
+                break
+    return env
+
+
+def write(path, text):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def warm_cargo(job, req, d, env):
+    url = req["granary_url"]
+    cargo_home = os.path.join(d, "cargo-home")
+    write(
+        os.path.join(cargo_home, "config.toml"),
+        f'[registries.granary]\nindex = "sparse+{url}/cargo/"\ncredential-provider = "cargo:token"\n\n'
+        '[source.crates-io]\nreplace-with = "granary"\n\n[net]\nretry = 3\n',
+    )
+    env = dict(env, CARGO_HOME=cargo_home, CARGO_REGISTRIES_GRANARY_TOKEN=req["token"])
+    # cargo fetch downloads every target's dependencies, so one run covers
+    # all platforms.
+    ok = job.run(["cargo", "generate-lockfile"], d, env) and job.run(["cargo", "fetch"], d, env)
+    return ok, lockfiles(d, ["Cargo.lock"])
+
+
+def warm_npm(job, req, d, env):
+    url = req["granary_url"]
+    hostport = urllib.parse.urlsplit(url).netloc
+    write(
+        os.path.join(d, ".npmrc"),
+        f"registry={url}/npm/\n//{hostport}/npm/:_authToken={req['token']}\nfund=false\naudit=false\n",
+    )
+    env = dict(env, npm_config_cache=os.path.join(d, "npm-cache"))
+    ok = True
+    for plat in req["platforms"]:
+        os_, cpu = PLATFORMS[plat]["npm"]
+        # The lockfile from the first run keeps versions the same for every
+        # platform; only node_modules is cleared between runs.
+        shutil.rmtree(os.path.join(d, "node_modules"), ignore_errors=True)
+        ok = job.run(
+            ["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund", f"--os={os_}", f"--cpu={cpu}"],
+            d,
+            env,
+        ) and ok
+    return ok, lockfiles(d, ["package-lock.json"])
+
+
+def warm_pypi(job, req, d, env):
+    url = urllib.parse.urlsplit(req["granary_url"])
+    index = f"{url.scheme}://__token__:{urllib.parse.quote(req['token'], safe='')}@{url.netloc}/pypi/simple/"
+    shown_index = f"{url.scheme}://__token__:***@{url.netloc}/pypi/simple/"
+    common = ["download", "--no-cache-dir", "--dest", "out", "--index-url", index]
+    shown_common = ["download", "--no-cache-dir", "--dest", "out", "--index-url", shown_index]
+    if url.scheme == "http":
+        host = url.hostname or ""
+        common += ["--trusted-host", host]
+        shown_common += ["--trusted-host", host]
+    ver = req["python_version"]
+    abi = "cp" + ver.replace(".", "")
+    ok = True
+    for plat in req["platforms"]:
+        target = ["--only-binary=:all:", "--python-version", ver, "--implementation", "cp",
+                  "--abi", abi, "--abi", "abi3", "--abi", "none"]
+        for tag in PLATFORMS[plat]["pip"]:
+            target += ["--platform", tag]
+        args = common + target + ["-r", "requirements.txt"]
+        show = " ".join(PIP + shown_common + target + ["-r", "requirements.txt"])
+        ok = job.run(PIP + args, d, env, show=show) and ok
+    if req.get("allow_sdist"):
+        job.emit("Source distributions are allowed for this template; building one can run its code.")
+        ok = job.run(PIP + common + ["-r", "requirements.txt"], d, env,
+                     show=" ".join(PIP + shown_common + ["-r", "requirements.txt"])) and ok
+    # pip has no lockfile; list what was downloaded instead.
+    pins = set()
+    for name in os.listdir(os.path.join(d, "out")) if os.path.isdir(os.path.join(d, "out")) else []:
+        parts = name.split("-")
+        if name.endswith(".whl") and len(parts) >= 2:
+            pins.add(f"{parts[0].replace('_', '-').lower()}=={parts[1]}")
+        elif name.endswith((".tar.gz", ".zip")) and "-" in name:
+            stem = name[: -len(".tar.gz")] if name.endswith(".tar.gz") else name[: -len(".zip")]
+            n, v = stem.rsplit("-", 1)
+            pins.add(f"{n.replace('_', '-').lower()}=={v}")
+    locks = {}
+    if pins:
+        locks["requirements.lock.txt"] = "".join(f"{p}\n" for p in sorted(pins))
+    return ok, locks
+
+
+def warm_maven(job, req, d, env):
+    url = req["granary_url"]
+    write(
+        os.path.join(d, "settings.xml"),
+        f"""<settings>
+  <mirrors>
+    <mirror><id>granary</id><mirrorOf>*</mirrorOf><url>{url}/maven</url></mirror>
+    <!-- Granary is plain HTTP on an internal network; don't block it. -->
+    <mirror><id>maven-default-http-blocker</id><mirrorOf>external:dummy:*</mirrorOf><url>http://0.0.0.0/</url><blocked>false</blocked></mirror>
+  </mirrors>
+  <servers>
+    <server><id>granary</id><username>token</username><password>{req['token']}</password></server>
+  </servers>
+</settings>
+""",
+    )
+    ok = job.run(
+        ["mvn", "-B", "-ntp", "-s", "settings.xml", "-Dmaven.repo.local=" + os.path.join(d, "m2"),
+         MAVEN_DEPENDENCY_PLUGIN],
+        d,
+        env,
+    )
+    return ok, {}
+
+
+WARMERS = {"cargo": warm_cargo, "npm": warm_npm, "pypi": warm_pypi, "maven": warm_maven}
+
+
+def lockfiles(d, names):
+    out = {}
+    for n in names:
+        p = os.path.join(d, n)
+        if os.path.isfile(p) and os.path.getsize(p) < 8 * 1024 * 1024:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                out[n] = f.read()
+    return out
+
+
+def check_request(req):
+    eco = req.get("ecosystem")
+    if eco not in WARMERS:
+        return f"unknown ecosystem {eco!r}"
+    files = req.get("files")
+    if not isinstance(files, dict) or not files:
+        return "no files"
+    for path in files:
+        if path not in FILES[eco]:
+            return f"unexpected file {path!r}"
+    plats = req.get("platforms") or []
+    if not plats or any(p not in PLATFORMS for p in plats):
+        return "unknown platform"
+    url = urllib.parse.urlsplit(str(req.get("granary_url", "")))
+    if url.scheme not in ("http", "https") or not url.netloc:
+        return "granary_url must be an http(s) URL"
+    if not str(req.get("token", "")):
+        return "no token"
+    ver = str(req.get("python_version", ""))
+    if not (len(ver.split(".")) == 2 and all(p.isdigit() for p in ver.split("."))):
+        return "python_version must look like 3.12"
+    if not isinstance(req.get("job"), int):
+        return "job must be a number"
+    return None
+
+
+def run_job(req, emit):
+    """Run one ecosystem's tools. Returns the result dict."""
+    job = Job(req["job"], emit, [req["token"], urllib.parse.quote(req["token"], safe="")])
+    with JOBS_LOCK:
+        JOBS[job.id] = job
+    d = tempfile.mkdtemp(prefix=f"granary-job-{job.id}-", dir=WORKDIR)
+    try:
+        for path, text in req["files"].items():
+            write(os.path.join(d, path), text)
+        env = base_env(os.path.join(d, "home"))
+        os.makedirs(env["HOME"], exist_ok=True)
+        ok, locks = WARMERS[req["ecosystem"]](job, req, d, env)
+        if ok:
+            return {"ok": True, "lockfiles": locks}
+        return {"ok": False, "error": "a tool exited with an error; see the log above", "lockfiles": locks}
+    except Cancelled:
+        return {"ok": False, "error": "cancelled"}
+    finally:
+        with JOBS_LOCK:
+            if JOBS.get(job.id) is job:
+                del JOBS[job.id]
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def tool_versions():
+    tools = {}
+    checks = {
+        "cargo": ["cargo", "--version"],
+        "node": ["node", "--version"],
+        "npm": ["npm", "--version"],
+        "pip": PIP + ["--version"],
+        "maven": ["mvn", "-B", "-v"],
+        "java": ["java", "-version"],
+    }
+    env = base_env(tempfile.gettempdir())
+    for name, args in checks.items():
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=60, env=env)
+            first = (r.stdout or r.stderr).strip().splitlines()
+            tools[name] = ANSI.sub("", first[0]) if first else "?"
+        except (OSError, subprocess.TimeoutExpired):
+            tools[name] = "missing"
+    return tools
+
+
+TOOLS = {}
+
+
+def allowed_addresses():
+    addrs = set()
+    for host in ALLOW_FROM:
+        try:
+            for info in socket.getaddrinfo(host, None):
+                addrs.add(info[4][0])
+        except socket.gaierror:
+            pass
+    return addrs
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "granary-warmer"
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+
+    def reply(self, code, body, ctype="application/json"):
+        data = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def authorized(self):
+        if ALLOW_FROM:
+            peer = self.client_address[0]
+            if peer.startswith("::ffff:"):
+                peer = peer[7:]
+            # Loopback is only reachable from inside this container (its own
+            # health check); everything else must come from an allowed host.
+            if peer not in ("127.0.0.1", "::1") and peer not in allowed_addresses():
+                self.reply(403, json.dumps({"error": "this address may not use the warmer"}))
+                return False
+        auth = self.headers.get("Authorization", "")
+        given = auth[7:] if auth.startswith("Bearer ") else ""
+        if not hmac.compare_digest(given.encode(), SECRET.encode()):
+            self.reply(401, json.dumps({"error": "wrong or missing secret"}))
+            return False
+        return True
+
+    def do_GET(self):
+        if not self.authorized():
+            return
+        if self.path == "/health":
+            with JOBS_LOCK:
+                running = sorted(JOBS)
+            self.reply(200, json.dumps({"ok": True, "tools": TOOLS, "running": running}))
+        else:
+            self.reply(404, json.dumps({"error": "not found"}))
+
+    def do_DELETE(self):
+        if not self.authorized():
+            return
+        parts = self.path.strip("/").split("/")
+        if len(parts) == 2 and parts[0] == "run" and parts[1].isdigit():
+            with JOBS_LOCK:
+                job = JOBS.get(int(parts[1]))
+            if job:
+                job.cancel()
+            self.reply(200, json.dumps({"stopped": bool(job)}))
+        else:
+            self.reply(404, json.dumps({"error": "not found"}))
+
+    def do_POST(self):
+        if not self.authorized():
+            return
+        if self.path != "/run":
+            self.reply(404, json.dumps({"error": "not found"}))
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0 or length > MAX_BODY:
+            self.reply(400, json.dumps({"error": "missing or oversized body"}))
+            return
+        try:
+            req = json.loads(self.rfile.read(length))
+        except ValueError:
+            self.reply(400, json.dumps({"error": "body is not JSON"}))
+            return
+        problem = check_request(req)
+        if problem:
+            self.reply(400, json.dumps({"error": problem}))
+            return
+        with JOBS_LOCK:
+            busy = req["job"] in JOBS
+        if busy:
+            self.reply(409, json.dumps({"error": "that job is already running"}))
+            return
+
+        # Stream plain text lines; the connection closing ends the body.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.close_connection = True
+
+        def emit(line):
+            try:
+                self.wfile.write((line + "\n").encode("utf-8", "replace"))
+                self.wfile.flush()
+            except OSError as e:
+                raise ClientGone() from e
+
+        try:
+            result = run_job(req, emit)
+            emit(RESULT + json.dumps(result))
+        except ClientGone:
+            sys.stderr.write(f"job {req['job']}: Granary went away; stopped\n")
+
+
+def healthcheck():
+    """`granary-warmer healthcheck` for the container's HEALTHCHECK."""
+    import urllib.request
+
+    port = LISTEN.rsplit(":", 1)[-1]
+    r = urllib.request.Request(f"http://127.0.0.1:{port}/health", headers={"Authorization": f"Bearer {SECRET}"})
+    try:
+        with urllib.request.urlopen(r, timeout=5) as resp:
+            sys.exit(0 if resp.status == 200 else 1)
+    except Exception:
+        sys.exit(1)
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "healthcheck":
+        healthcheck()
+    if len(SECRET) < 16:
+        sys.exit("granary-warmer: set WARMER_SECRET to the same value as GRANARY_WARMER_SECRET (16+ characters)")
+    TOOLS.update(tool_versions())
+    host, port = LISTEN.rsplit(":", 1)
+    server = ThreadingHTTPServer((host, int(port)), Handler)
+    server.daemon_threads = True
+    print(f"granary-warmer listening on {LISTEN}", flush=True)
+    for name, version in TOOLS.items():
+        print(f"  {name}: {version}", flush=True)
+    if ALLOW_FROM:
+        print(f"  accepting connections from: {', '.join(ALLOW_FROM)}", flush=True)
+    else:
+        print("  WARMER_ALLOW_FROM is empty: any address with the secret may connect", flush=True)
+    # Exit straight away on SIGTERM; job directories are temporary anyway.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

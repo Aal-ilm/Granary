@@ -105,6 +105,54 @@ Useful alerts: `granary_upstream_up == 0` (a registry is unreachable),
 file that didn't match its checksum), and `granary_disk_free_bytes` falling
 below a threshold.
 
+## 6. Optional: warming templates
+
+Warming templates needs the `granary-warmer` container next to Granary (see
+the README's *Warming templates with the warmer*). Build it once:
+
+```sh
+cd /mnt/POOL/apps/granary/src
+sudo docker build -t granary-warmer:0.5.0 warmer
+```
+
+Then edit the app and add the warmer, an internal network and a shared
+secret (any 16+ random characters, the same in both places):
+
+```yaml
+services:
+  granary:
+    # ... everything from before, plus:
+    environment:
+      GRANARY_WARMER_URL: "http://granary-warmer:9090"
+      GRANARY_WARMER_SECRET: "CHANGE-ME-TO-A-LONG-RANDOM-SECRET"
+      GRANARY_WARMER_GRANARY_URL: "http://granary:8080"
+    networks: [default, warm]
+
+  granary-warmer:
+    image: granary-warmer:0.5.0
+    pull_policy: never
+    restart: unless-stopped
+    environment:
+      WARMER_SECRET: "CHANGE-ME-TO-A-LONG-RANDOM-SECRET"
+      WARMER_ALLOW_FROM: "granary"
+    volumes:
+      - /mnt/POOL/apps/granary/warmer-work:/work
+    networks: [warm]
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  # No route to the internet: the warmer can only download through Granary.
+  warm:
+    internal: true
+```
+
+Create the `warmer-work` dataset first and give it to user 10002 (the
+warmer's user), e.g. `sudo chown 10002:10002 /mnt/POOL/apps/granary/warmer-work`.
+
 ## Upgrading
 
 1. Update the source in `POOL/apps/granary/src` and build with a new tag,

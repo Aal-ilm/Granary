@@ -2,6 +2,7 @@
 //! localhost and a throwaway data directory.
 
 mod cache_limit;
+mod jobs;
 mod maven;
 mod offline;
 mod search;
@@ -117,7 +118,18 @@ pub struct Opts {
     pub offline: bool,
     pub cache_limit: Option<u64>,
     pub search: bool,
+    /// The warmer's URL (a fake one, or a real warmer.py).
+    pub warmer_url: Option<String>,
+    /// How the warmer reaches this Granary; set by `Harness::serve` users.
+    pub warmer_granary_url: Option<String>,
+    pub warm_jobs: usize,
+    pub warm_timeout: Duration,
+    /// Also serve Granary on a real TCP port, so a warmer can reach it.
+    pub serve: bool,
 }
+
+/// The shared secret test warmers expect.
+pub const WARMER_SECRET: &str = "test-warmer-secret-0123456789";
 
 impl Default for Opts {
     fn default() -> Self {
@@ -127,6 +139,11 @@ impl Default for Opts {
             offline: false,
             cache_limit: None,
             search: true,
+            warmer_url: None,
+            warmer_granary_url: None,
+            warm_jobs: 2,
+            warm_timeout: Duration::from_secs(1800),
+            serve: false,
         }
     }
 }
@@ -152,7 +169,21 @@ impl Harness {
             offline,
             cache_limit,
             search,
+            warmer_url,
+            warmer_granary_url,
+            warm_jobs,
+            warm_timeout,
+            serve,
         } = opts;
+        // Bind first so the config can name Granary's own address.
+        let own = if serve {
+            Some(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
+        } else {
+            None
+        };
+        let own_url = own
+            .as_ref()
+            .map(|l| format!("http://{}", l.local_addr().unwrap()));
         let mock = Mock::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
@@ -182,6 +213,14 @@ impl Harness {
             search,
             cargo_api: format!("{base}/crates-api"),
             maven_search: format!("{base}/solr/select"),
+            warmer_url,
+            warmer_secret: Some(WARMER_SECRET.into()),
+            warmer_granary_url: warmer_granary_url
+                .or(own_url.clone())
+                .unwrap_or_else(|| "http://granary.invalid".into()),
+            warm_jobs,
+            warm_timeout,
+            warm_python: "3.12".into(),
             admin_user: "admin".into(),
             admin_password: None,
             client_auth,
@@ -210,10 +249,22 @@ impl Harness {
             admin: Arc::new(admin),
             auth: backend,
         };
+        crate::jobs::spawn_runner(state.clone());
+        let app = crate::app(state.clone(), sessions);
+        if let Some(listener) = own {
+            let app = app.clone();
+            tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await
+            });
+        }
         Self {
             base,
             db: state.auth.db.clone(),
-            app: crate::app(state, sessions),
+            app,
             mock,
             data,
             token,

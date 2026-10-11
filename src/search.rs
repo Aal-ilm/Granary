@@ -100,9 +100,11 @@ fn eco_param(s: &str) -> AppResult<Eco> {
 async fn status(State(st): State<AppState>, auth: AuthSession) -> AppResult<Json<Value>> {
     require_admin(&auth)?;
     let (search, note) = search_mode(&st);
+    let warmer = crate::jobs::warmer::health(&st).await;
     Ok(Json(json!({
         "search": search,
         "offline": st.cfg.offline,
+        "warmer": warmer.available && !st.cfg.offline,
         "note": note,
         "hosts": {
             "cargo": st.cfg.cargo_api,
@@ -361,8 +363,10 @@ fn is_prerelease(v: &str) -> bool {
 fn finish(name: String, mut versions: Vec<String>, latest: Option<String>) -> Versions {
     versions.sort_by(|a, b| version_cmp(b, a));
     versions.dedup();
+    // A registry's "latest" can be a pre-release (Maven's <release> often
+    // is a milestone); prefer the newest stable version then.
     let latest = latest
-        .filter(|l| versions.contains(l))
+        .filter(|l| versions.contains(l) && !is_prerelease(l))
         .or_else(|| versions.iter().find(|v| !is_prerelease(v)).cloned())
         .or_else(|| versions.first().cloned());
     Versions {
@@ -809,6 +813,12 @@ mod tests {
             Some("1.0".into()),
         );
         assert_eq!(v.latest.as_deref(), Some("1.0"));
+        let v = finish(
+            "x".into(),
+            vec!["4.1.0".into(), "4.2.0-M2".into()],
+            Some("4.2.0-M2".into()),
+        );
+        assert_eq!(v.latest.as_deref(), Some("4.1.0"));
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod config;
 mod error;
 mod formats;
 mod inventory;
+mod jobs;
 mod logbuf;
 mod metrics;
 mod net;
@@ -63,6 +64,7 @@ pub fn app(state: AppState, sessions: SqliteSessionStore) -> Router {
         .merge(audit::router())
         .merge(search::router())
         .merge(templates::api::router())
+        .merge(jobs::api::router())
         .route_layer(middleware::from_fn(auth::api_guard));
 
     let idle = state.cfg.session_idle.as_secs() as i64;
@@ -189,6 +191,11 @@ async fn run() -> anyhow::Result<()> {
             cfg.trusted_proxies.len()
         );
     }
+    if cfg.warmer_url.is_some() && cfg.warmer_secret.is_none() {
+        tracing::warn!(
+            "GRANARY_WARMER_URL is set but GRANARY_WARMER_SECRET is not; the warmer will refuse Granary's jobs"
+        );
+    }
     if cfg.offline {
         tracing::warn!(
             "GRANARY_OFFLINE is on: Granary serves only what is cached and never contacts an upstream"
@@ -206,6 +213,7 @@ async fn run() -> anyhow::Result<()> {
         auth: backend,
     };
     admin::spawn_scheduler(state.clone(), sessions.clone());
+    jobs::spawn_runner(state.clone());
     let service = app(state.clone(), sessions).into_make_service_with_connect_info::<SocketAddr>();
     axum::serve(listener, service)
         .with_graceful_shutdown(shutdown_signal())

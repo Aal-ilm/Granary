@@ -26,7 +26,11 @@ pub fn router() -> Router<AppState> {
 async fn metrics(State(st): State<AppState>, auth: AuthSession, headers: HeaderMap) -> Response {
     let allowed = auth.user.is_some()
         || match token_from_headers(&headers) {
-            Some(t) => matches!(st.auth.user_for_token(&t).await, Ok(Some(_))),
+            // System tokens (the warmer's) may only download packages.
+            Some(t) => {
+                matches!(st.auth.user_for_token(&t).await, Ok(Some(_)))
+                    && matches!(st.auth.is_system_token(&t).await, Ok(false))
+            }
             None => false,
         };
     if !allowed {

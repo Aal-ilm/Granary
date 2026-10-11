@@ -135,6 +135,9 @@ pub struct Stats {
     pub meta_refreshes: AtomicU64,
     pub meta_stale_served: AtomicU64,
     pub integrity_failures: AtomicU64,
+    /// Bytes added to the cache since start (files and metadata), so warm
+    /// jobs can stop at the cache budget without rescanning the disk.
+    pub bytes_cached: AtomicU64,
 }
 
 pub struct Store {
@@ -481,6 +484,11 @@ impl Store {
         match result {
             Ok(()) => {
                 tokio::fs::rename(&tmp, dest).await?;
+                if let Ok(m) = tokio::fs::metadata(dest).await {
+                    self.stats
+                        .bytes_cached
+                        .fetch_add(m.len(), Ordering::Relaxed);
+                }
                 if expected.is_some() {
                     tracing::info!("cached {url} (checksum verified)");
                 } else {
@@ -665,6 +673,9 @@ impl Store {
 
         // Body first, then info: a crash in between leaves stale-but-valid info.
         self.write_atomic(body_path, &body).await?;
+        self.stats
+            .bytes_cached
+            .fetch_add(body.len() as u64, Ordering::Relaxed);
         self.write_atomic(info_path, &serde_json::to_vec(&info).unwrap())
             .await?;
         self.stats.meta_refreshes.fetch_add(1, Ordering::Relaxed);

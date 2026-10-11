@@ -20,7 +20,8 @@ public registry once, then served from your own disk after that.
   cleanup rules, watch tasks, check upstream health and read logs. It's served
   by the same binary and never loads anything from the internet.
 - **Fill the cache ahead of time.** Search a registry and cache a version,
-  or keep templates of the packages each kind of project needs.
+  or keep templates of the packages each kind of project needs and warm
+  them, transitive dependencies and all, before the network goes away.
 - **Accounts built in.** Sign-in with admin and viewer roles, two-factor
   codes, and per-machine access tokens for Cargo, npm, pip, Maven and Gradle. Built on the
   open-source axum-login, tower-sessions, password-auth (Argon2id) and
@@ -182,7 +183,8 @@ For Gradle it writes `~/.gradle/init.d/granary.gradle`; `use-public` and
 | Browse | Every cached package, filterable and sortable by size, versions, cache date and last download; the sidebar search covers all repositories |
 | Package detail | Each cached version and file, with download and delete |
 | Get packages | Search a registry and cache a version before anyone needs it (admins only; see [Getting packages ahead of time](#getting-packages-ahead-of-time)) |
-| Templates | Named sets of packages for a kind of project: browse, create, edit, clone, delete and export (see [Templates](#templates)) |
+| Templates | Named sets of packages for a kind of project: browse, create, edit, clone, delete, export and warm (see [Templates](#templates)) |
+| Jobs | Warm jobs with their status, live log, what they cached, and cancel (see [Warming](#warming-templates-with-the-warmer)) |
 | Cleanup | Delete packages nobody has downloaded in *N* days, per repository, with a dry-run preview and an optional daily schedule |
 | Tasks | Scheduled jobs (cleanup, upstream checks, saving download history) with last run, result and **Run now** |
 | System | Upstream reachability and latency, disk space, and the active configuration |
@@ -210,7 +212,9 @@ version (latest by default) and fetches that one version straight away: the
 `.crate`, the npm tarball, the PyPI file you pick (a pure-Python wheel is
 suggested) or a Maven POM with its jar, aar or war. Every file is checked
 against the registry's checksum, exactly as for client downloads. Its
-dependencies are fetched when a client first asks for them.
+dependencies are fetched when a client first asks for them, unless you tick
+**With dependencies** (shown when the [warmer](#warming-templates-with-the-warmer)
+is running), which starts a warm job for that one version.
 
 **Privacy note.** Search sends the text you type to crates.io and
 search.maven.org, which are not otherwise contacted, and to the npm
@@ -267,8 +271,59 @@ the problem. **Import from manifest** fills a section from a `Cargo.toml`,
 lists anything it had to leave out, such as path dependencies. **Export**
 downloads a template as a TOML file in the same format as the built-ins.
 
-Viewers can see templates and export them; creating, editing, cloning and
-deleting them needs an admin. Every change is recorded in the audit log.
+Viewers can see templates and export them; creating, editing, cloning,
+deleting and warming them needs an admin. Every change is recorded in the
+audit log.
+
+## Warming templates with the warmer
+
+**Warm** fills the cache with everything a template needs, including every
+transitive dependency, for each of its platforms. Granary doesn't resolve
+dependencies itself; it runs the real tools in a separate container,
+`granary-warmer`, which can reach nothing but Granary. Everything the tools
+download goes through Granary's normal proxy paths, so it is checked and
+cached on the way.
+
+| Ecosystem | What the warmer runs |
+|---|---|
+| Cargo | `cargo generate-lockfile` and `cargo fetch` on a generated Cargo.toml (this covers every target) |
+| npm | `npm install --ignore-scripts --no-audit --no-fund` on a generated package.json, once per platform with `--os` and `--cpu`, so platform packages (esbuild, swc, sharp...) are cached too |
+| PyPI | `pip download --only-binary=:all:` once per platform, with that platform's wheel tags, `--python-version` (`GRANARY_WARM_PYTHON`) and `--implementation cp` |
+| Maven | `mvn dependency:go-offline` on a generated pom.xml; Maven lines without a version use the latest stable release |
+
+Install scripts and build steps never run: npm gets `--ignore-scripts` and
+pip downloads wheels only, unless the template allows source distributions.
+Each job runs in a fresh directory with empty tool caches, deleted
+afterwards.
+
+**Turning it on.** The warmer is optional. Put a shared secret in `.env`
+next to `docker-compose.yml`, then start it with its profile:
+
+```sh
+echo "GRANARY_WARMER_SECRET=$(openssl rand -hex 24)" >> .env
+docker compose --profile warmer up -d --build
+```
+
+`docker-compose.yml` already points Granary at it (`GRANARY_WARMER_URL`)
+and puts both on an internal Docker network with no route to the internet,
+so the warmer can only download through Granary. When the warmer isn't
+running, the web UI hides **Warm** and **With dependencies**, and
+single-file caching still works.
+
+**Security.** The warmer accepts jobs only with the shared secret and only
+from the Granary container (`WARMER_ALLOW_FROM`). It downloads with an access
+token Granary creates for it, listed under **Access tokens** as `warmer` with
+a System badge. That token can only download packages (it is refused for
+`/metrics`), is never stored in plain text, and is made again automatically
+if you revoke it. Tokens are masked in job logs.
+
+**Jobs.** Warm jobs wait in a queue and at most `GRANARY_WARM_JOBS` (2) run
+at once. A job's page streams the tools' output and, when it ends, shows how
+many packages, files and bytes were newly cached. A job can be cancelled; it
+stops after `GRANARY_WARM_TIMEOUT_MINS` (30); and when `GRANARY_CACHE_LIMIT`
+is set it stops as soon as the cache reaches the budget, saying so. The last
+200 jobs are kept. Starting and cancelling jobs needs an admin and is
+recorded in the audit log; viewers can see the job history.
 
 ## Sign-in and security
 
@@ -355,7 +410,7 @@ All settings are environment variables.
 | `GRANARY_DATA_DIR` | `/data` in Docker, `./data` otherwise | Where the cache lives |
 | `GRANARY_PUBLIC_URL` | *(from request headers)* | Fixed external URL, e.g. `https://granary.lan`. Set it when clients reach Granary through a reverse proxy that doesn't send `X-Forwarded-Host` / `X-Forwarded-Proto` |
 | `GRANARY_META_TTL_SECS` | `300` | How long index/metadata responses are fresh before revalidation |
-| `GRANARY_CACHE_LIMIT` | *(none)* | Cache budget such as `500MB`, `20GB` or `1.5TB` (KB, MB, GB and TB are powers of 1024). The Overview gauges fill against it, or against the disk size when unset. It is a budget, not a hard cap: client downloads are never refused because of it |
+| `GRANARY_CACHE_LIMIT` | *(none)* | Cache budget such as `500MB`, `20GB` or `1.5TB` (KB, MB, GB and TB are powers of 1024). The Overview gauges fill against it, or against the disk size when unset. It is a budget, not a hard cap: client downloads are never refused because of it, but warm jobs stop when the cache reaches it |
 | `GRANARY_OFFLINE` | `off` | `on`: never contact an upstream registry; serve only what is cached (see [Offline mode](#offline-mode)) |
 | `GRANARY_CLIENT_AUTH` | `required` | `required`: package downloads need an access token or a signed-in session. `off`: anyone who can reach Granary can download |
 | `GRANARY_ADMIN_USER` | `admin` | Username of the first admin, created when there are no users |
@@ -370,6 +425,12 @@ All settings are environment variables.
 | `GRANARY_PYPI_INDEX` | `https://pypi.org/simple` | Upstream Simple API |
 | `GRANARY_PYPI_FILES` | `https://files.pythonhosted.org` | Host that PyPI file links point to |
 | `GRANARY_MAVEN_UPSTREAM` | `https://repo1.maven.org/maven2` | Upstream Maven repository (Maven 2 layout) |
+| `GRANARY_WARMER_URL` | *(none)* | The warmer service, e.g. `http://granary-warmer:9090`. Warming is off when unset |
+| `GRANARY_WARMER_SECRET` | *(none)* | Shared secret for the warmer (16+ characters); give the warmer the same value as `WARMER_SECRET` |
+| `GRANARY_WARMER_GRANARY_URL` | `http://granary:8080` | How the warmer reaches Granary |
+| `GRANARY_WARM_JOBS` | `2` | Warm jobs that may run at once (1 to 8) |
+| `GRANARY_WARM_TIMEOUT_MINS` | `30` | Longest a warm job may run |
+| `GRANARY_WARM_PYTHON` | `3.12` | Python version pip picks wheels for when warming |
 | `GRANARY_SEARCH` | `on` | `off`: **Get packages** never sends search text to a search host and looks packages up by exact name only |
 | `GRANARY_CARGO_API` | `https://crates.io/api/v1` | crates.io web API, used only for search |
 | `GRANARY_MAVEN_SEARCH` | `https://search.maven.org/solrsearch/select` | Maven Central search, used only for search |

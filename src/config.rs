@@ -31,6 +31,19 @@ pub struct Config {
     pub cargo_api: String,
     /// Maven Central's search API, used only for search.
     pub maven_search: String,
+    /// The warmer service, e.g. `http://granary-warmer:9090`. Warming is
+    /// off when unset.
+    pub warmer_url: Option<String>,
+    /// Shared secret Granary sends to the warmer.
+    pub warmer_secret: Option<String>,
+    /// How the warmer reaches Granary, e.g. `http://granary:8080`.
+    pub warmer_granary_url: String,
+    /// Warm jobs that may run at once.
+    pub warm_jobs: usize,
+    /// Longest a warm job may run.
+    pub warm_timeout: Duration,
+    /// Python version pip resolves wheels for.
+    pub warm_python: String,
     /// Username for the first admin account, created when no users exist.
     pub admin_user: String,
     /// Password for that account. When unset, one is generated and printed once.
@@ -180,6 +193,39 @@ impl Config {
                 "GRANARY_MAVEN_SEARCH",
                 "https://search.maven.org/solrsearch/select",
             ),
+            warmer_url: Some(url_var("GRANARY_WARMER_URL", "")).filter(|s| !s.is_empty()),
+            warmer_secret: {
+                let s = var("GRANARY_WARMER_SECRET", "");
+                if s.is_empty() {
+                    None
+                } else if s.len() < 16 {
+                    anyhow::bail!("GRANARY_WARMER_SECRET needs at least 16 characters");
+                } else {
+                    Some(s)
+                }
+            },
+            warmer_granary_url: url_var("GRANARY_WARMER_GRANARY_URL", "http://granary:8080"),
+            warm_jobs: var("GRANARY_WARM_JOBS", "2")
+                .parse::<usize>()
+                .context("GRANARY_WARM_JOBS must be a whole number")?
+                .clamp(1, 8),
+            warm_timeout: Duration::from_secs(
+                var("GRANARY_WARM_TIMEOUT_MINS", "30")
+                    .parse::<u64>()
+                    .context("GRANARY_WARM_TIMEOUT_MINS must be a whole number of minutes")?
+                    .clamp(1, 24 * 60)
+                    * 60,
+            ),
+            warm_python: {
+                let v = var("GRANARY_WARM_PYTHON", "3.12");
+                let ok = v.split('.').count() == 2
+                    && v.split('.')
+                        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+                if !ok {
+                    anyhow::bail!("GRANARY_WARM_PYTHON must look like 3.12, not {v:?}");
+                }
+                v
+            },
             admin_user: var("GRANARY_ADMIN_USER", "admin"),
             admin_password: std::env::var("GRANARY_ADMIN_PASSWORD")
                 .ok()

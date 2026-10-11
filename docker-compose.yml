@@ -27,12 +27,48 @@ services:
       GRANARY_CLIENT_AUTH: "required"
       GRANARY_META_TTL_SECS: "300"
       RUST_LOG: "granary=info"
+      # Warming templates (filling the cache with every dependency) uses the
+      # optional granary-warmer service below. Start it with
+      #   docker compose --profile warmer up -d
+      # after putting GRANARY_WARMER_SECRET=<16+ random characters> in .env.
+      # Without it, everything else works and the web UI hides warming.
+      GRANARY_WARMER_URL: "http://granary-warmer:9090"
+      GRANARY_WARMER_SECRET: "${GRANARY_WARMER_SECRET:-}"
+      GRANARY_WARMER_GRANARY_URL: "http://granary:8080"
     # Granary only writes to /data, so the rest of the container can be
     # read-only and it needs no Linux capabilities.
     read_only: true
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
+    networks: [default, warm]
+
+  granary-warmer:
+    profiles: [warmer]
+    build: ./warmer
+    image: granary-warmer:latest
+    container_name: granary-warmer
+    restart: unless-stopped
+    environment:
+      WARMER_SECRET: "${GRANARY_WARMER_SECRET:-}"
+      # Only Granary may send it jobs.
+      WARMER_ALLOW_FROM: "granary"
+    # Job directories are made here and deleted when each job ends.
+    volumes:
+      - granary-warmer-work:/work
+    networks: [warm]
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  # Only Granary and the warmer are on this network, and it has no route to
+  # the internet, so the warmer can download only through Granary.
+  warm:
+    internal: true
 
 volumes:
   granary-data:
+  granary-warmer-work:

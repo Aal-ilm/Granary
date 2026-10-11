@@ -6,6 +6,7 @@
 //! and never touches custom templates. Custom templates live in SQLite.
 
 pub mod api;
+pub mod build;
 pub mod lines;
 pub mod manifest;
 

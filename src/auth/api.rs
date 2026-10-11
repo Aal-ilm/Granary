@@ -403,6 +403,8 @@ struct TokenRow {
     created_at: i64,
     last_used: Option<i64>,
     expires_at: Option<i64>,
+    /// Created by Granary itself (the warmer's token).
+    system: bool,
 }
 
 #[derive(Deserialize)]
@@ -417,7 +419,7 @@ async fn list_tokens(
 ) -> AppResult<Json<Value>> {
     let user = current_user(&auth)?;
     let all = q.all.unwrap_or(false) && user.role == Role::Admin;
-    let sql = "SELECT t.id, t.user_id, u.username, t.name, t.hint, t.created_at, t.last_used, t.expires_at
+    let sql = "SELECT t.id, t.user_id, u.username, t.name, t.hint, t.created_at, t.last_used, t.expires_at, t.system
                FROM tokens t JOIN users u ON u.id = t.user_id";
     let rows: Vec<TokenRow> = if all {
         sqlx::query_as(AssertSqlSafe(format!(

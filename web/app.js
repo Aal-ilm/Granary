@@ -359,6 +359,8 @@ const routes = [
   [/^\/templates\/new$/, 'templates', renderTemplateEditor, { admin: true }],
   [/^\/templates\/(\d+)$/, 'templates', renderTemplate],
   [/^\/templates\/(\d+)\/edit$/, 'templates', renderTemplateEditor, { admin: true }],
+  [/^\/jobs$/, 'jobs', renderJobs],
+  [/^\/jobs\/(\d+)$/, 'jobs', renderJob],
   [/^\/cleanup$/, 'cleanup', renderCleanup],
   [/^\/tasks$/, 'tasks', renderTasks],
   [/^\/system$/, 'system', renderSystem],
@@ -930,21 +932,22 @@ async function renderGet({ params, query, isCurrent }) {
   if (!q) $('#get-q').focus();
   view().addEventListener('click', (e) => {
     const b = e.target.closest('[data-cache]');
-    if (b) openCacheDialog(eco, b.dataset.cache, b.dataset.latest);
+    if (b) openCacheDialog(eco, b.dataset.cache, b.dataset.latest, status.warmer);
   });
 }
 
 /** Pick a version (and, for PyPI, a file) and cache it. */
-async function openCacheDialog(eco, name, latest) {
+async function openCacheDialog(eco, name, latest, warmer) {
   const dlg = $('#cache-dialog');
   dlg.innerHTML = `
     <form method="dialog" id="cache-form">
       <h2 id="cache-title">Cache <span class="mono">${esc(name)}</span></h2>
-      <p>Caches this one version${eco === 'maven' ? ' (its POM and artifact)' : ''}. Its dependencies are fetched when a client first asks for them.</p>
+      <p id="cache-what"></p>
       <div class="stack">
         <div class="field"><label for="cache-version">Version</label>
           <select id="cache-version" disabled><option>Loading versions…</option></select></div>
-        ${eco === 'pypi' ? '<div class="field"><label for="cache-file">File</label><select id="cache-file" disabled><option>Choose a version first</option></select><p class="help">Wheels are built for one platform; a file ending in -none-any.whl works everywhere.</p></div>' : ''}
+        ${warmer ? '<label class="check"><input type="checkbox" id="cache-deps" checked> With dependencies</label>' : ''}
+        ${eco === 'pypi' ? '<div class="field" id="cache-file-row"><label for="cache-file">File</label><select id="cache-file" disabled><option>Choose a version first</option></select><p class="help">Wheels are built for one platform; a file ending in -none-any.whl works everywhere.</p></div>' : ''}
       </div>
       <p class="err hidden" id="cache-err"></p>
       <div class="row">
@@ -957,6 +960,15 @@ async function openCacheDialog(eco, name, latest) {
   const versionSel = $('#cache-version');
   const fileSel = $('#cache-file');
   const ok = $('#cache-ok');
+  const deps = $('#cache-deps');
+  const single = `Caches this one version${eco === 'maven' ? ' (its POM and artifact)' : ''}. Its dependencies are fetched when a client first asks for them.`;
+  const withDeps = 'Starts a warm job that installs this version with the real package tool, so every dependency is cached too, for each default platform.';
+  const describe = () => {
+    $('#cache-what').textContent = deps?.checked ? withDeps : single;
+    $('#cache-file-row')?.classList.toggle('hidden', !!deps?.checked);
+  };
+  describe();
+  deps?.addEventListener('change', describe);
 
   const loadFiles = async () => {
     if (!fileSel) return;
@@ -1000,6 +1012,10 @@ async function openCacheDialog(eco, name, latest) {
     ok.disabled = true;
     ok.textContent = 'Caching…';
     showError(err, '');
+    if (deps?.checked) {
+      dlg.close();
+      return startWarm('/api/packages/warm', { eco, name, version: versionSel.value });
+    }
     try {
       const body = { eco, name, version: versionSel.value };
       if (fileSel) body.file = fileSel.value;
@@ -1031,7 +1047,7 @@ const packageCounts = (counts) =>
     .join('');
 
 async function renderTemplates({ query, isCurrent }) {
-  const d = await api('/api/templates');
+  const [d, warmer] = await Promise.all([api('/api/templates'), api('/api/warmer')]);
   if (!isCurrent()) return;
   const tag = query.get('tag') || '';
   const q = query.get('q') || '';
@@ -1061,6 +1077,7 @@ async function renderTemplates({ query, isCurrent }) {
         <div class="tpl-foot">
           <span class="muted">Last warmed ${t.last_warmed_at ? timeTag(t.last_warmed_at) : '<span>never</span>'}</span>
           <span class="page-actions">
+            ${warmer.available ? `<button class="small primary admin-only" data-warm="${t.id}">Warm</button>` : ''}
             ${t.builtin ? '' : `<a class="btn small admin-only" href="#/templates/${t.id}/edit">Edit</a>`}
             <button class="small admin-only" data-clone="${t.id}">Clone</button>
             <a class="btn small" href="/api/templates/${t.id}/export" download>Export</a>
@@ -1076,6 +1093,7 @@ async function renderTemplates({ query, isCurrent }) {
       <div><h1>Templates</h1><p>Named sets of packages for a kind of project. Built-in templates are read-only; clone one to change it.</p></div>
       <div class="page-actions admin-only"><a class="btn primary" href="#/templates/new">New template</a></div>
     </div>
+    ${warmerNote(warmer)}
     <div class="toolbar">
       ${tags.length ? `<nav class="seg" aria-label="Tag">${tagNav}</nav>` : ''}
       <div class="grow"><label class="sr-only" for="tpl-filter">Filter templates</label>
@@ -1100,8 +1118,15 @@ async function renderTemplates({ query, isCurrent }) {
   view().addEventListener('click', (e) => templateAction(e));
 }
 
-/** Clone and delete buttons, on the list and on a template's page. */
+/** Warm, clone and delete buttons, on the list and on a template's page. */
 async function templateAction(e) {
+  const warm = e.target.closest('[data-warm]');
+  if (warm) {
+    warm.disabled = true;
+    await startWarm(`/api/templates/${warm.dataset.warm}/warm`);
+    warm.disabled = false;
+    return;
+  }
   const clone = e.target.closest('[data-clone]');
   if (clone) {
     try {
@@ -1133,10 +1158,14 @@ async function templateAction(e) {
 }
 
 async function renderTemplate({ params, isCurrent }) {
-  const t = await api(`/api/templates/${params[0]}`);
+  const [t, list, warmer, jobs] = await Promise.all([
+    api(`/api/templates/${params[0]}`),
+    api('/api/templates'),
+    api('/api/warmer'),
+    api(`/api/jobs?template=${params[0]}`),
+  ]);
   if (!isCurrent()) return;
-  const platforms = (await api('/api/templates')).platforms;
-  if (!isCurrent()) return;
+  const platforms = list.platforms;
   const label = (id) => platforms.find((p) => p.id === id)?.label || id;
   const sections = TEMPLATE_ECOS.filter((e) => t[e].trim())
     .map(
@@ -1159,6 +1188,7 @@ async function renderTemplate({ params, isCurrent }) {
         ${t.description ? `<p>${esc(t.description)}</p>` : ''}
       </div>
       <div class="page-actions">
+        ${warmer.available ? `<button class="primary admin-only" data-warm="${t.id}">Warm</button>` : ''}
         ${t.builtin ? '' : `<a class="btn admin-only" href="#/templates/${t.id}/edit">Edit</a>`}
         <button class="admin-only" data-clone="${t.id}">Clone</button>
         <a class="btn" href="/api/templates/${t.id}/export" download>Export</a>
@@ -1169,7 +1199,12 @@ async function renderTemplate({ params, isCurrent }) {
       <div><dt>Platforms</dt><dd>${t.platforms.map((p) => esc(label(p))).join(', ')}</dd></div>
       <div><dt>Source distributions</dt><dd>${t.allow_sdist ? 'Allowed (building one can run code)' : 'Wheels only'}</dd></div>
     </dl>
-    ${sections}`);
+    ${warmerNote(warmer)}
+    ${sections}
+    ${jobs.jobs.length ? `<section><h2>Recent warm jobs</h2><div class="panel table-wrap"><table>
+      <thead><tr><th>Job</th><th>Status</th><th>Queued</th><th>Newly cached</th></tr></thead>
+      <tbody>${jobs.jobs.slice(0, 5).map((j) => `<tr><td><a href="#/jobs/${j.id}">#${esc(j.id)}</a></td><td>${jobStatus(j.status)}</td><td>${timeTag(j.created_at)}</td><td class="num">${esc(jobAdded(j))}</td></tr>`).join('')}</tbody>
+    </table></div></section>` : ''}`);
   view().addEventListener('click', (e) => templateAction(e));
 }
 
@@ -1346,6 +1381,157 @@ function openImportDialog(eco, changed) {
       showError($('#import-err'), ex.message);
     }
   });
+}
+
+// -------------------------------------------------------------------- jobs
+
+const JOB_STATES = {
+  queued: ['', 'Queued'],
+  running: ['warn', 'Running'],
+  done: ['ok', 'Done'],
+  failed: ['bad', 'Failed'],
+  cancelled: ['', 'Cancelled'],
+};
+const jobStatus = (s) => {
+  const [dot, label] = JOB_STATES[s] || ['', s];
+  return `<span class="status"><span class="dot ${dot}"></span>${esc(label)}</span>`;
+};
+const jobActive = (j) => j.status === 'queued' || j.status === 'running';
+const jobDuration = (j) => (j.started_at ? duration((j.finished_at || Date.now() / 1000) - j.started_at) : '-');
+const jobAdded = (j) =>
+  j.new_files == null ? '-' : `${plural(j.new_packages, 'package')}, ${bytes(j.new_bytes)}`;
+
+/** Start a warm job and open its page. */
+async function startWarm(path, body) {
+  try {
+    const r = await act(() => api(path, { method: 'POST', body }));
+    toast('Warm job queued');
+    location.hash = `#/jobs/${r.id}`;
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+/** Says why warming isn't available, for admins. */
+const warmerNote = (w) => {
+  if (w.available) return '';
+  const why = w.offline
+    ? 'Offline mode is on, so templates can\'t be warmed.'
+    : !w.configured
+      ? 'Warming templates needs the optional granary-warmer service. See the README to turn it on.'
+      : `The warmer isn't answering${w.error ? `: ${w.error}` : ''}. Is the granary-warmer container running?`;
+  return `<div class="banner admin-only"><span class="dot"></span><span>${esc(why)}</span></div>`;
+};
+
+async function renderJobs({ isCurrent }) {
+  const d = await api('/api/jobs');
+  if (!isCurrent()) return;
+  const rows = d.jobs
+    .map(
+      (j) => `<tr>
+        <td class="num">#${esc(j.id)}</td>
+        <td><a href="#/jobs/${j.id}">${esc(j.title)}</a> <span class="muted">${j.kind === 'template' ? 'template' : 'package'}</span></td>
+        <td>${jobStatus(j.status)}</td>
+        <td>${timeTag(j.created_at)} <span class="muted">by ${esc(j.created_by)}</span></td>
+        <td class="num hide-sm">${esc(jobDuration(j))}</td>
+        <td class="num">${esc(jobAdded(j))}</td>
+        <td class="actions">${jobActive(j) ? `<button class="small admin-only" data-cancel-job="${j.id}">Cancel</button>` : ''}</td>
+      </tr>`
+    )
+    .join('');
+  setView(`
+    <div class="page-head">
+      <div><h1>Jobs</h1><p>Warm jobs fill the cache with every package a template needs. Up to ${esc(d.max_running)} run at once; the last 200 are kept.</p></div>
+    </div>
+    <div class="panel">${
+      d.jobs.length
+        ? `<div class="table-wrap"><table>
+            <thead><tr><th>Job</th><th>What</th><th>Status</th><th>Queued</th><th class="hide-sm">Took</th><th>Newly cached</th><th class="r"><span class="sr-only">Actions</span></th></tr></thead>
+            <tbody>${rows}</tbody></table></div>`
+        : '<div class="empty"><strong>No jobs yet</strong>Warm a template, or cache a package with its dependencies, and its job appears here.</div>'
+    }</div>`);
+  view().addEventListener('click', (e) => cancelJob(e));
+  // Refresh while anything is queued or running.
+  if (d.jobs.some(jobActive)) {
+    const t = setTimeout(() => isCurrent() && route(), 2000);
+    onLeave(() => clearTimeout(t));
+  }
+}
+
+async function cancelJob(e) {
+  const b = e.target.closest('[data-cancel-job]');
+  if (!b) return;
+  b.disabled = true;
+  try {
+    await act(() => api(`/api/jobs/${b.dataset.cancelJob}/cancel`, { method: 'POST' }));
+    toast('Cancelling job');
+  } catch (err) {
+    toast(err.message, 'error');
+    b.disabled = false;
+  }
+}
+
+async function renderJob({ params, isCurrent }) {
+  const id = params[0];
+  let d = await api(`/api/jobs/${id}`);
+  if (!isCurrent()) return;
+  let last = 0;
+
+  const head = (j) => `
+    <div class="crumbs"><a href="#/jobs">Jobs</a>${j.template_id ? ` <span aria-hidden="true">/</span> <a href="#/templates/${j.template_id}">Template</a>` : ''}</div>
+    <div class="page-head">
+      <div><h1>${esc(j.title)}</h1>
+        <div class="summary-line">${jobStatus(j.status)}<span>Job #${esc(j.id)}</span><span>Queued ${timeTag(j.created_at)} by ${esc(j.created_by)}</span></div></div>
+      <div class="page-actions">${jobActive(j) ? `<button class="admin-only" data-cancel-job="${j.id}">Cancel job</button>` : ''}</div>
+    </div>
+    ${j.message ? `<div class="banner"><span class="dot ${j.status === 'failed' ? 'bad' : ''}"></span><span>${esc(j.message[0].toUpperCase() + j.message.slice(1))}</span></div>` : ''}
+    <dl class="panel panel-pad tpl-facts">
+      <div><dt>Status</dt><dd>${esc(JOB_STATES[j.status]?.[1] || j.status)}</dd></div>
+      <div><dt>Running time</dt><dd>${esc(jobDuration(j))}</dd></div>
+      <div><dt>New packages</dt><dd class="num">${j.new_packages == null ? '-' : esc(count(j.new_packages))}</dd></div>
+      <div><dt>New files</dt><dd class="num">${j.new_files == null ? '-' : esc(count(j.new_files))}</dd></div>
+      <div><dt>Newly cached</dt><dd class="num">${j.new_bytes == null ? '-' : esc(bytes(j.new_bytes))}</dd></div>
+    </dl>`;
+
+  setView(`<div id="job-head">${head(d.job)}</div>
+    <h2>Log</h2>
+    <div class="panel log" id="job-log" role="log" aria-live="polite"></div>`);
+  view().addEventListener('click', (e) => cancelJob(e));
+
+  const box = $('#job-log');
+  const append = (lines) => {
+    if (!lines.length) return;
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+    box.insertAdjacentHTML(
+      'beforeend',
+      lines.map((l) => `<div class="job-line${l.line.startsWith('$ ') ? ' cmd' : l.line.startsWith('---') ? ' step' : ''}">${esc(l.line)}</div>`).join('')
+    );
+    last = lines[lines.length - 1].n;
+    if (atBottom) box.scrollTop = box.scrollHeight;
+  };
+  append(d.lines);
+  if (!d.lines.length) box.innerHTML = '<div class="empty"><strong>Waiting to start</strong>Lines appear here as the tools run.</div>';
+
+  // Poll every 2 seconds for new lines until the job ends.
+  const poll = async () => {
+    if (!isCurrent()) return;
+    try {
+      d = await api(`/api/jobs/${id}?after=${last}`);
+    } catch {
+      return schedule();
+    }
+    if (!isCurrent()) return;
+    if (d.lines.length && !last) box.innerHTML = '';
+    append(d.lines);
+    $('#job-head').innerHTML = head(d.job);
+    if (jobActive(d.job)) schedule();
+  };
+  let timer;
+  const schedule = () => {
+    timer = setTimeout(poll, 2000);
+  };
+  onLeave(() => clearTimeout(timer));
+  if (jobActive(d.job)) schedule();
 }
 
 // ----------------------------------------------------------------- cleanup
@@ -1908,8 +2094,8 @@ async function renderTokens({ query, isCurrent }) {
   const tokenRows = (tokens) => tokens
     .map(
       (t) => `<tr>
-        <td><strong>${esc(t.name)}</strong></td>
-        ${all ? `<td>${esc(t.username)}</td>` : ''}
+        <td><strong>${esc(t.name)}</strong>${t.system ? ' <span class="kind" title="Created by Granary for the warmer. It can only download packages, and is made again if revoked.">System</span>' : ''}</td>
+        ${all ? `<td>${esc(t.system ? 'Granary' : t.username)}</td>` : ''}
         <td class="mono">${esc(t.hint)}</td>
         <td>${timeTag(t.created_at)}</td>
         <td>${timeTag(t.last_used)}</td>

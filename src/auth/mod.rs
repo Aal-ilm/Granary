@@ -203,10 +203,36 @@ pub async fn open_db(data_dir: &Path) -> anyhow::Result<SqlitePool> {
         crate::audit::SCHEMA,
         crate::audit::INDEX,
         crate::templates::SCHEMA,
+        crate::jobs::SCHEMA,
+        crate::jobs::LOG_SCHEMA,
     ] {
         sqlx::query(stmt).execute(&pool).await?;
     }
+    // Columns added after the first release.
+    add_column(&pool, "tokens", "system", "INTEGER NOT NULL DEFAULT 0").await?;
     Ok(pool)
+}
+
+/// Add a column to an existing table unless it's already there.
+pub async fn add_column(
+    pool: &SqlitePool,
+    table: &str,
+    column: &str,
+    def: &str,
+) -> sqlx::Result<()> {
+    let cols: Vec<(String,)> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT name FROM pragma_table_info('{table}')"
+    )))
+    .fetch_all(pool)
+    .await?;
+    if !cols.iter().any(|(c,)| c == column) {
+        sqlx::query(AssertSqlSafe(format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {def}"
+        )))
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
 }
 
 pub async fn hash_password(password: String) -> anyhow::Result<String> {
@@ -461,6 +487,8 @@ pub struct Backend {
     /// as long as a wrong password and can't be told apart by timing.
     dummy_hash: Arc<String>,
     token_used: Arc<Mutex<HashMap<i64, u64>>>,
+    /// The warmer's system token, only ever held in memory.
+    warmer_token: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 pub struct Credentials {
@@ -475,7 +503,50 @@ impl Backend {
             limiter: Arc::default(),
             dummy_hash: Arc::new(hash_password(random_password()).await?),
             token_used: Arc::default(),
+            warmer_token: Arc::default(),
         })
+    }
+
+    /// Whether a token is a system token (such as the warmer's), which may
+    /// only download packages.
+    pub async fn is_system_token(&self, token: &str) -> sqlx::Result<bool> {
+        let row: Option<(bool,)> = sqlx::query_as("SELECT system FROM tokens WHERE hash = ?")
+            .bind(sha256_hex(token))
+            .fetch_optional(&self.db)
+            .await?;
+        Ok(row.is_some_and(|(s,)| s))
+    }
+
+    /// The warmer's access token: a system token named "warmer", owned by
+    /// the first active admin and only usable for downloads. It is created
+    /// when first needed and again if it was revoked or stopped working; its
+    /// plain text is never stored.
+    pub async fn warmer_token(&self) -> anyhow::Result<String> {
+        let mut held = self.warmer_token.lock().await;
+        if let Some(t) = held.as_ref()
+            && self.user_for_token(t).await?.is_some()
+        {
+            return Ok(t.clone());
+        }
+        sqlx::query("DELETE FROM tokens WHERE system = 1 AND name = 'warmer'")
+            .execute(&self.db)
+            .await?;
+        let owner: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM users WHERE role = 'admin' AND disabled = 0 ORDER BY id LIMIT 1",
+        )
+        .fetch_optional(&self.db)
+        .await?;
+        let Some((owner,)) = owner else {
+            anyhow::bail!("there is no active admin account to own the warmer's token");
+        };
+        let (id, token) = self.create_token(owner, "warmer", None).await?;
+        sqlx::query("UPDATE tokens SET system = 1 WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        tracing::info!("created the warmer's access token");
+        *held = Some(token.clone());
+        Ok(token)
     }
 
     pub async fn user_by_id(&self, id: i64) -> sqlx::Result<Option<User>> {

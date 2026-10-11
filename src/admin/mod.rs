@@ -184,6 +184,8 @@ pub struct Admin {
     pub logs: LogBuffer,
     /// Search results and per-user limits for "Get packages".
     pub search: crate::search::SearchState,
+    /// The warm job queue.
+    pub jobs: crate::jobs::Jobs,
     pub started_at: u64,
     inventory: Mutex<Option<(Instant, Arc<Vec<Asset>>)>>,
     settings_path: PathBuf,
@@ -255,6 +257,7 @@ impl Admin {
             started_at: now_secs(),
             inventory: Mutex::new(None),
             search: Default::default(),
+            jobs: Default::default(),
             settings_path,
         })
     }
