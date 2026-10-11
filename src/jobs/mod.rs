@@ -628,6 +628,7 @@ async fn run_inner(
         Ok(t) => t,
         Err(e) => return Outcome::failed(format!("could not get the warmer's access token: {e}")),
     };
+    let cargo_private = cargo_private_index(st, id).await;
 
     // Maven needs versions; use the latest release for lines without one.
     let mut maven_versions = HashMap::new();
@@ -709,6 +710,7 @@ async fn run_inner(
             token: token.clone(),
             repo: checkout,
             git_hosts: st.cfg.git_hosts.clone(),
+            cargo_private: (eco == Eco::Cargo).then(|| cargo_private.clone()).flatten(),
         };
         match warmer::run(st, &req, log, cancel, deadline, budget).await {
             Ok(r) if r.ok => {
@@ -787,6 +789,25 @@ async fn warmer_token(st: &AppState, id: i64) -> anyhow::Result<String> {
         }
         None => st.auth.warmer_token().await,
     }
+}
+
+/// The private Cargo registry's index for the warmer, when there is one and
+/// the job's starter may read it (the job's token acts for them, so the
+/// registry would refuse it otherwise).
+async fn cargo_private_index(st: &AppState, id: i64) -> Option<String> {
+    st.cfg.gitea.as_ref()?;
+    let owner = st.namespaces.cargo_owner()?;
+    let (acting_for,): (Option<i64>,) = sqlx::query_as("SELECT acting_for FROM jobs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&st.auth.db)
+        .await
+        .ok()??;
+    let starter = st.auth.user_by_id(acting_for?).await.ok()??;
+    let who = crate::policy::Principal::Job { starter };
+    let registry = Resource::gitea_package("cargo", &owner, "");
+    st.policy
+        .can_read_private(&who, &registry)
+        .then(|| format!("{}/cargo-private/", st.cfg.warmer_granary_url))
 }
 
 /// One run of the warmer within a job.

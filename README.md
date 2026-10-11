@@ -374,6 +374,13 @@ credential-provider = "cargo:token"
 Then `cargo login --registry granary-private`, and depend on its crates
 with `my-crate = { version = "1", registry = "granary-private" }`.
 
+Warm jobs started by someone with private access get the private registry
+too, so [repo templates](#templates-from-repos) whose crates come from it
+warm. The repo's `Cargo.lock` can name the registry by whatever URL its
+developer used: the warmer sends every registry other than crates.io that
+the repo names to Granary's private registry, and `cargo fetch --locked`
+still holds. For anyone else, the job log says why those crates fail.
+
 ### Private access
 
 Who may read private content is set in one place, and applies to every

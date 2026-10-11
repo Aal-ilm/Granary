@@ -38,6 +38,10 @@ pub struct RunRequest {
     pub repo: Option<RepoCheckout>,
     /// Git hosts whose clones go through Granary (git dependencies).
     pub git_hosts: Vec<String>,
+    /// The private Cargo registry's index (`.../cargo-private/`), when the
+    /// job's starter may read it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cargo_private: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

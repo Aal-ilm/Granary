@@ -38,6 +38,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -245,17 +246,100 @@ def checkout(job, req, d, env):
     return folder
 
 
-def cargo_env(req, d, env):
+# The private registry's name in the warmer's Cargo config. Unusual on
+# purpose, so it never clashes with a registry name a repo uses.
+PRIVATE_REGISTRY = "granary-warm-private"
+CRATES_IO = {"registry+https://github.com/rust-lang/crates.io-index", "sparse+https://index.crates.io/"}
+
+
+def cargo_config(req):
     url = req["granary_url"]
-    cargo_home = os.path.join(d, "cargo-home")
-    write(
-        os.path.join(cargo_home, "config.toml"),
+    config = (
         f'[registries.granary]\nindex = "sparse+{url}/cargo/"\ncredential-provider = "cargo:token"\n\n'
         '[source.crates-io]\nreplace-with = "granary"\n\n'
         # Cargo's built-in git client can't send the token header.
-        '[net]\nretry = 3\ngit-fetch-with-cli = true\n',
+        '[net]\nretry = 3\ngit-fetch-with-cli = true\n'
     )
-    return dict(env, CARGO_HOME=cargo_home, CARGO_REGISTRIES_GRANARY_TOKEN=req["token"])
+    if req.get("cargo_private"):
+        config += (
+            f'\n[registries.{PRIVATE_REGISTRY}]\nindex = "sparse+{req["cargo_private"]}"\n'
+            'credential-provider = "cargo:token"\n'
+        )
+    return config
+
+
+def cargo_env(req, d, env):
+    cargo_home = os.path.join(d, "cargo-home")
+    write(os.path.join(cargo_home, "config.toml"), cargo_config(req))
+    env = dict(env, CARGO_HOME=cargo_home, CARGO_REGISTRIES_GRANARY_TOKEN=req["token"])
+    if req.get("cargo_private"):
+        env[f"CARGO_REGISTRIES_{PRIVATE_REGISTRY.upper().replace('-', '_')}_TOKEN"] = req["token"]
+    return env
+
+
+def repo_registries(folder):
+    """The registries a checkout's crates come from besides crates.io: the
+    names its Cargo.toml files give (`registry = "..."`) and the index URLs
+    its Cargo.lock files record."""
+    names, sources = set(), []
+
+    def deps(table):
+        for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+            for spec in (table.get(key) or {}).values():
+                if isinstance(spec, dict) and isinstance(spec.get("registry"), str):
+                    names.add(spec["registry"])
+
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [x for x in dirs if x not in (".git", "target")]
+        for name in files:
+            path = os.path.join(root, name)
+            try:
+                if name == "Cargo.toml":
+                    with open(path, "rb") as f:
+                        doc = tomllib.load(f)
+                    deps(doc)
+                    deps(doc.get("workspace") or {})
+                    for target in (doc.get("target") or {}).values():
+                        if isinstance(target, dict):
+                            deps(target)
+                elif name == "Cargo.lock":
+                    with open(path, "rb") as f:
+                        doc = tomllib.load(f)
+                    for pkg in doc.get("package") or []:
+                        src = pkg.get("source") or ""
+                        if src.startswith(("sparse+", "registry+")) and src not in CRATES_IO and src not in sources:
+                            sources.append(src)
+            except (OSError, tomllib.TOMLDecodeError):
+                continue
+    return sorted(names), sources
+
+
+def private_crates(job, req, folder):
+    """Cargo config that sends a checkout's private crates to Granary's
+    private registry: each registry name the repo uses, and each private
+    index its lockfile records, is replaced by it. The lockfile keeps its own
+    URLs, so `cargo fetch --locked` still works."""
+    names, sources = repo_registries(folder)
+    if not names and not sources:
+        return ""
+    if not req.get("cargo_private"):
+        job.emit(
+            "This repo uses crates from another registry (" + ", ".join(names or sources) + "). "
+            "They can only come from Granary's private Cargo registry, and whoever started this job has no private access, so they will fail."
+        )
+        return ""
+    if len(sources) > 1:
+        job.warn("The repo's Cargo.lock names several private registries; all of them are fetched from Granary's private registry.")
+    config = ""
+    # The repo's own registry names: the URL its lockfile records, so the
+    # lockfile still matches; without one, the private registry itself.
+    index = sources[0] if sources else f"sparse+{req['cargo_private']}"
+    for name in names:
+        config += f'\n[registries.{name}]\nindex = "{index}"\n'
+    for i, src in enumerate(sources):
+        config += f'\n[source.granary-lock-{i}]\nregistry = "{src}"\nreplace-with = "{PRIVATE_REGISTRY}"\n'
+    job.emit(f"Private crates ({', '.join(names or sources)}) come from Granary's private Cargo registry.")
+    return config
 
 
 def warm_cargo(job, req, d, env):
@@ -266,6 +350,9 @@ def warm_cargo(job, req, d, env):
         folder = checkout(job, req, d, env)
         if folder is None:
             return False, {}
+        extra = private_crates(job, req, folder)
+        if extra:
+            write(os.path.join(env["CARGO_HOME"], "config.toml"), cargo_config(req) + extra)
         if job.run(["cargo", "fetch", "--locked"], folder, env):
             return True, {}
         # A lockfile that's out of date with its manifests (common for fuzz
@@ -434,6 +521,11 @@ def check_request(req):
         return "granary_url must be an http(s) URL"
     if not str(req.get("token", "")):
         return "no token"
+    if req.get("cargo_private") is not None:
+        # The token goes with it, so only ever to Granary itself.
+        private = urllib.parse.urlsplit(str(req["cargo_private"]))
+        if (private.scheme, private.netloc) != (url.scheme, url.netloc) or not private.path.endswith("/"):
+            return "cargo_private must be a path on granary_url, ending in /"
     ver = str(req.get("python_version", ""))
     if not (len(ver.split(".")) == 2 and all(p.isdigit() for p in ver.split("."))):
         return "python_version must look like 3.12"

@@ -774,3 +774,218 @@ async fn namespaces_are_edited_on_the_system_page_unless_the_environment_sets_th
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn warm_jobs_get_the_private_cargo_registry_only_for_starters_with_access() {
+    use super::jobs::{Plan, wait_for, with_fake};
+    let g = MockGitea::start().await;
+    let (h, fake, admin) = with_fake(
+        Plan::default(),
+        Opts {
+            gitea: Some(g.gitea()),
+            extra_ca: Some(g.ca.clone()),
+            namespaces: preset(&[(Eco::Cargo, "acme")]),
+            ..Opts::default()
+        },
+    )
+    .await;
+    let warm = |eco: &'static str, name: &'static str| {
+        let (h, admin) = (&h, admin.clone());
+        async move {
+            let (status, _, body) = h
+                .send(
+                    "POST",
+                    "/api/packages/warm",
+                    Some(&admin),
+                    Some(json!({"eco": eco, "name": name, "version": "1.0.0"})),
+                )
+                .await;
+            assert_eq!(status, StatusCode::CREATED);
+            let id = serde_json::from_slice::<Value>(&body).unwrap()["id"]
+                .as_i64()
+                .unwrap();
+            wait_for(h, &admin, id, &["done", "failed"]).await;
+        }
+    };
+    // An admin's Cargo job: the private registry, on Granary's own address.
+    warm("cargo", "itoa").await;
+    // Other ecosystems never get it.
+    warm("npm", "left-pad").await;
+    // A job acting for someone without private access doesn't either.
+    h.viewer_login().await;
+    let (viewer,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE username = 'viewer'")
+        .fetch_one(&h.state.auth.db)
+        .await
+        .unwrap();
+    let spec = crate::templates::build::single(
+        Eco::Cargo,
+        "itoa",
+        "1.0.0",
+        crate::templates::default_platforms(),
+    )
+    .unwrap();
+    let job = crate::jobs::enqueue(
+        &h.state,
+        crate::jobs::NewJob {
+            kind: "package",
+            template_id: None,
+            title: "Cargo itoa 1.0.0",
+            spec: &spec,
+            repo: None,
+            private: None,
+        },
+        &crate::jobs::JobBy {
+            name: "viewer".into(),
+            user: Some(viewer),
+        },
+    )
+    .await
+    .unwrap();
+    wait_for(&h, &admin, job, &["done", "failed"]).await;
+
+    let runs = fake.runs.lock().unwrap().clone();
+    assert_eq!(runs.len(), 3);
+    let private = runs[0]["cargo_private"].as_str().unwrap();
+    assert_eq!(
+        private,
+        format!("{}/cargo-private/", h.url.as_ref().unwrap())
+    );
+    assert!(runs[1]["cargo_private"].is_null(), "npm: {}", runs[1]);
+    assert!(runs[2]["cargo_private"].is_null(), "viewer: {}", runs[2]);
+}
+
+/// The real warmer.py warms a repo template whose Cargo.lock names a
+/// private registry by the URL its developer used: the crates come from
+/// Granary's private registry, and `cargo fetch --locked` still holds.
+/// Skipped when git, python3 or cargo is missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_warmer_warms_private_crates_from_a_repo_lockfile() {
+    use std::time::Duration;
+
+    use super::{
+        git::Upstream as GitUpstream,
+        git_templates::{preview, save},
+        jobs::wait_for,
+    };
+    let have = |cmd: &str| {
+        std::process::Command::new(cmd)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if !have_git() || !have("python3") || !have("cargo") {
+        return eprintln!("skipping: git, python3 and cargo are needed");
+    }
+    // A real .crate, as `cargo package` makes it.
+    let work = super::git::TempDir::new("private-crate");
+    std::fs::create_dir_all(work.0.join("src")).unwrap();
+    std::fs::write(
+        work.0.join("Cargo.toml"),
+        "[package]\nname = \"mycrate\"\nversion = \"1.0.0\"\nedition = \"2021\"\nlicense = \"MIT\"\ndescription = \"private\"\n",
+    )
+    .unwrap();
+    std::fs::write(work.0.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+    let out = std::process::Command::new("cargo")
+        .args(["package", "-q", "--allow-dirty", "--no-verify"])
+        .current_dir(&work.0)
+        .env("CARGO_TARGET_DIR", work.0.join("target"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let krate = std::fs::read(work.0.join("target/package/mycrate-1.0.0.crate")).unwrap();
+
+    let g = MockGitea::start().await;
+    publish_crate(&g, &krate, true);
+    let up = GitUpstream::start().await;
+    let lock = format!(
+        "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"mycrate\",\n]\n\n[[package]]\nname = \"mycrate\"\nversion = \"1.0.0\"\nsource = \"sparse+https://granary.example.invalid/cargo-private/\"\nchecksum = \"{}\"\n",
+        sha256(&krate)
+    );
+    up.create(
+        "acme",
+        "app",
+        &[
+            (
+                "Cargo.toml",
+                b"[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nmycrate = { version = \"1\", registry = \"company\" }\n",
+            ),
+            ("Cargo.lock", lock.as_bytes()),
+            ("src/main.rs", b"fn main() { mycrate::hello() }\n"),
+        ],
+    );
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let _warmer = tokio::process::Command::new("python3")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/warmer/warmer.py"))
+        .env("WARMER_SECRET", super::WARMER_SECRET)
+        .env("WARMER_LISTEN", format!("127.0.0.1:{port}"))
+        .env("WARMER_ALLOW_FROM", "127.0.0.1")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let h = granary(
+        &g,
+        &[(Eco::Cargo, "acme")],
+        Opts {
+            warmer_url: Some(format!("http://127.0.0.1:{port}")),
+            git_upstream: Some(up.url.clone()),
+            serve: true,
+            ..Opts::default()
+        },
+    )
+    .await;
+    let cookie = h.login().await;
+    let start = std::time::Instant::now();
+    while h.api(&cookie, "/api/warmer").await["available"] != true {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "warmer did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let p = preview(&h, &cookie, "https://github.com/acme/app", "").await;
+    let (id, _) = save(&h, &cookie, &p, "Private app").await;
+    let (status, _, body) = h
+        .send(
+            "POST",
+            &format!("/api/templates/{id}/warm"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let job = serde_json::from_slice::<Value>(&body).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let d = wait_for(&h, &cookie, job, &["done", "failed"]).await;
+    let log = d["lines"].to_string();
+    assert_eq!(d["job"]["status"], "done", "{log}");
+    assert_eq!(d["job"]["warnings"], json!([]), "{log}");
+    assert!(
+        log.contains("Private crates (company) come from Granary's private Cargo registry."),
+        "{log}"
+    );
+    assert!(
+        h.data
+            .join("files/gitea-cargo/acme/mycrate/mycrate-1.0.0.crate")
+            .exists()
+    );
+    assert!(!log.contains(TOKEN));
+}
