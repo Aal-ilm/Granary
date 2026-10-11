@@ -184,7 +184,7 @@ For Gradle it writes `~/.gradle/init.d/granary.gradle`; `use-public` and
 | Browse | Every cached package, filterable and sortable by size, versions, cache date and last download; the sidebar search covers all repositories. The Git tab lists cached repos with Add repo, Refresh and Delete |
 | Package detail | Each cached version and file, with download and delete |
 | Get packages | Search a registry and cache a version before anyone needs it (admins only; see [Getting packages ahead of time](#getting-packages-ahead-of-time)) |
-| Templates | Named sets of packages for a kind of project: browse, create, edit, clone, delete, export, warm, schedule re-warms and download a starter project (see [Templates](#templates)) |
+| Templates | Named sets of packages for a kind of project: browse, create (also from a git repo), edit, clone, delete, export, warm, schedule re-warms and download a starter project (see [Templates](#templates)) |
 | Jobs | Warm jobs with their status, live log, what they cached, and cancel (see [Warming](#warming-templates-with-the-warmer)) |
 | Cleanup | Delete packages nobody has downloaded in *N* days, per repository, with a dry-run preview and an optional daily schedule |
 | Tasks | Scheduled jobs (cleanup, upstream checks, saving download history) with last run, result and **Run now** |
@@ -330,6 +330,48 @@ Viewers can see templates and export them; creating, editing, cloning,
 deleting and warming them needs an admin. Every change is recorded in the
 audit log.
 
+### Templates from repos
+
+**New from repo** on the Templates page builds a template from a git repo:
+paste its URL (on an [allowed host](#git-repos)) and, optionally, a branch,
+tag or commit. If Granary doesn't have the repo yet it caches it first, with
+the clone's progress shown on the page. It then pins the ref to a commit and
+reads these files there, from the root and up to two levels down:
+`Cargo.toml`, `Cargo.lock`, `package.json`, `package-lock.json`,
+`requirements*.txt`, `pyproject.toml`, `pom.xml` and `build.gradle(.kts)`.
+
+- Cargo and npm workspace members are included wherever they are.
+  Dependencies that are part of the repo (other workspace members, path
+  dependencies, Maven modules) are left out; `workspace = true`
+  dependencies take their version and features from the workspace.
+- `pyproject.toml`: PEP 621 dependencies and optional dependencies, and
+  Poetry's dependency tables (`^` and `~` ranges are translated for pip).
+- Gradle: string coordinates such as `implementation("g:a:v")`. Version
+  catalogs, variables and map notation are listed as skipped.
+- Git dependencies (Cargo `git = ...`, npm `github:` or git URLs, pip
+  `name @ git+https://...`) on an allowed host are cached through the git
+  cache when the template is saved.
+
+A preview shows the manifests and lockfiles found, how many packages each
+ecosystem gets, the git dependencies and everything left out, with the
+reason, before anything is saved. The template is an ordinary custom
+template that also records the repo, the ref and the commit.
+
+**Warming a repo template** with lockfiles installs exactly the locked
+versions: the warmer checks the repo out at the recorded commit through
+Granary's git cache (never from upstream) and runs `cargo fetch --locked`
+or `npm ci --ignore-scripts` (once per platform) in each lockfile's folder.
+Tool settings in the repo (`.cargo/config.toml`, `.npmrc`,
+`rust-toolchain.toml`) are removed from the checkout first, so they can't
+send downloads elsewhere. A lockfile that no longer matches its manifest is
+reported in the log and installed without it. Ecosystems without a lockfile
+are warmed from the template's lines as usual.
+
+**Resync from repo** on a repo template reads the repo again (a branch
+moves to its newest commit) and, after the same preview, replaces the
+template's package lines with what the repo lists now. Lines edited by hand
+are replaced too; the name, tags, platforms and schedule stay.
+
 ### Download starter
 
 **Download starter** gives a zip with a minimal project for a template, set
@@ -367,6 +409,11 @@ cached on the way.
 | npm | `npm install --ignore-scripts --no-audit --no-fund` on a generated package.json, once per platform with `--os` and `--cpu`, so platform packages (esbuild, swc, sharp...) are cached too |
 | PyPI | `pip download --only-binary=:all:` once per platform, with that platform's wheel tags, `--python-version` (`GRANARY_WARM_PYTHON`) and `--implementation cp` |
 | Maven | `mvn dependency:go-offline` on a generated pom.xml; Maven lines without a version use the latest stable release |
+
+For [templates made from a repo](#templates-from-repos) with lockfiles,
+the warmer checks the repo out through Granary's git cache and installs the
+locked versions instead (`cargo fetch --locked`, `npm ci`). Git
+dependencies go through Granary's git cache too.
 
 Install scripts and build steps never run: npm gets `--ignore-scripts` and
 pip downloads wheels only, unless the template allows source distributions.

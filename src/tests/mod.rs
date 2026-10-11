@@ -3,6 +3,7 @@
 
 mod cache_limit;
 mod git;
+mod git_templates;
 mod jobs;
 mod maven;
 mod offline;

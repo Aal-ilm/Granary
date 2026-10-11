@@ -596,6 +596,127 @@ pub async fn delete(st: &AppState, id: &RepoId) -> AppResult<u64> {
         .await
 }
 
+// --------------------------------------------------- reading files at a ref
+
+/// Branch, tag or commit names: letters, digits and `._/-`, no leading `-`
+/// and no `..`.
+pub fn valid_ref(r: &str) -> bool {
+    !r.is_empty()
+        && r.len() <= 200
+        && !r.starts_with('-')
+        && !r.contains("..")
+        && !r.ends_with('/')
+        && r.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
+}
+
+async fn git_out(st: &AppState, id: &RepoId, args: &[&str]) -> AppResult<Option<Vec<u8>>> {
+    let out = git(st)
+        .arg("-C")
+        .arg(id.dir(st))
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| {
+            AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not run git: {e}"),
+            )
+        })?;
+    Ok(out.status.success().then_some(out.stdout))
+}
+
+/// The commit a ref (or the default branch, when `None`) points at in the
+/// cached mirror.
+pub async fn resolve_ref(st: &AppState, id: &RepoId, r: Option<&str>) -> AppResult<String> {
+    let r = r.map(str::trim).filter(|r| !r.is_empty()).unwrap_or("HEAD");
+    if r != "HEAD" && !valid_ref(r) {
+        return Err(AppError::bad_request(format!(
+            "{r:?} is not a branch, tag or commit name"
+        )));
+    }
+    let spec = format!("{r}^{{commit}}");
+    let out = git_out(
+        st,
+        id,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &spec,
+        ],
+    )
+    .await?;
+    out.map(|o| String::from_utf8_lossy(&o).trim().to_string())
+        .filter(|c| c.len() == 40 && c.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| {
+            AppError::new(
+                StatusCode::NOT_FOUND,
+                format!("{} has no branch, tag or commit named {r}", id.display()),
+            )
+        })
+}
+
+/// Every file path at a commit.
+pub async fn list_files(st: &AppState, id: &RepoId, commit: &str) -> AppResult<Vec<String>> {
+    let out = git_out(
+        st,
+        id,
+        &[
+            "ls-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            "--end-of-options",
+            commit,
+        ],
+    )
+    .await?
+    .ok_or_else(AppError::not_found)?;
+    Ok(out
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).to_string())
+        .collect())
+}
+
+/// One file's contents at a commit, if it exists and is at most `max` bytes.
+pub async fn read_file(
+    st: &AppState,
+    id: &RepoId,
+    commit: &str,
+    path: &str,
+    max: u64,
+) -> AppResult<Option<String>> {
+    let object = format!("{commit}:{path}");
+    let Some(size) = git_out(st, id, &["cat-file", "-s", "--end-of-options", &object]).await?
+    else {
+        return Ok(None);
+    };
+    let size: u64 = String::from_utf8_lossy(&size)
+        .trim()
+        .parse()
+        .unwrap_or(u64::MAX);
+    if size > max {
+        return Ok(None);
+    }
+    Ok(
+        git_out(st, id, &["cat-file", "blob", "--end-of-options", &object])
+            .await?
+            .map(|b| String::from_utf8_lossy(&b).to_string()),
+    )
+}
+
+/// Whether the cached mirror has this commit.
+pub async fn has_commit(st: &AppState, id: &RepoId, commit: &str) -> bool {
+    let spec = format!("{commit}^{{commit}}");
+    matches!(
+        git_out(st, id, &["cat-file", "-e", "--end-of-options", &spec]).await,
+        Ok(Some(_))
+    )
+}
+
 /// A cached repo, for listings.
 #[derive(Clone, Debug, Serialize)]
 pub struct Cached {
@@ -697,8 +818,12 @@ async fn handle(
     ensure(&st, &id, refresh, None).await?;
 
     let mut cmd = git(&st);
+    // Fetching one commit by its SHA (what the warmer does for a repo
+    // template) needs allowReachableSHA1InWant; the repos are public.
     cmd.arg("-c")
         .arg("uploadpack.allowFilter=true")
+        .arg("-c")
+        .arg("uploadpack.allowReachableSHA1InWant=true")
         .arg("http-backend");
     let path_info = format!("/{}/{tail}", id.rel());
     cgi(
@@ -865,6 +990,16 @@ mod tests {
             &"x".repeat(101),
         ] {
             assert!(!valid_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn refs() {
+        for ok in ["main", "v1.2.3", "release/2026-10", "0123abc", "feature_x"] {
+            assert!(valid_ref(ok), "{ok}");
+        }
+        for bad in ["", "-x", "a..b", "a b", "main/", "$(x)", "a;b", "@{-1}"] {
+            assert!(!valid_ref(bad), "{bad}");
         }
     }
 

@@ -66,6 +66,7 @@ pub fn app(state: AppState, sessions: SqliteSessionStore) -> Router {
         .merge(audit::router())
         .merge(search::router())
         .merge(templates::api::router())
+        .merge(templates::repo_api::router())
         .merge(jobs::api::router())
         .route_layer(middleware::from_fn(auth::api_guard));
 

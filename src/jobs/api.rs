@@ -158,9 +158,18 @@ async fn warm_template(
         .map_err(db_error)?
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "no such template"))?;
     need_warmer(&st).await?;
-    let job = super::enqueue(&st, "template", Some(id), &t.input.name, &t.input, &admin)
-        .await
-        .map_err(db_error)?;
+    let repo = t.source.as_ref().and_then(super::RepoWarm::from_source);
+    let job = super::enqueue(
+        &st,
+        "template",
+        Some(id),
+        &t.input.name,
+        &t.input,
+        repo,
+        &admin,
+    )
+    .await
+    .map_err(db_error)?;
     audit(
         &st,
         &admin,
@@ -202,7 +211,7 @@ async fn warm_package(
         body.name.trim(),
         body.version.trim()
     );
-    let job = super::enqueue(&st, "package", None, &title, &spec, &admin)
+    let job = super::enqueue(&st, "package", None, &title, &spec, None, &admin)
         .await
         .map_err(db_error)?;
     audit(

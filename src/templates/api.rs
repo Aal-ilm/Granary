@@ -56,6 +56,7 @@ fn summary(t: &Template) -> Value {
         "platforms": t.input.platforms,
         "allow_sdist": t.input.allow_sdist,
         "counts": t.input.counts(),
+        "source": t.source.as_ref().map(|s| s.summary()),
         "updated_at": t.updated_at,
         "last_warmed_at": t.last_warmed_at,
         "schedule": t.schedule,

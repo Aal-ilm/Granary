@@ -4,7 +4,10 @@ everything they download lands in Granary's cache.
 
 Granary sends one job per ecosystem to POST /run with the manifests to use
 (Cargo.toml, package.json, requirements.txt or pom.xml), the platforms to
-cover and an access token. The warmer writes them to a fresh temporary
+cover and an access token. For a template made from a repo with lockfiles,
+it sends the repo instead: the warmer clones it at the pinned commit through
+Granary's git cache and runs `cargo fetch --locked` or `npm ci` in the
+lockfile's folder, so exactly the locked versions are cached. The warmer writes them to a fresh temporary
 directory, points the tools at Granary only, runs them, streams their output
 back line by line and deletes the directory. Install scripts and build steps
 never run: npm uses --ignore-scripts and pip downloads wheels only, unless
@@ -21,6 +24,7 @@ Settings (environment variables):
 Only the Python standard library is used.
 """
 
+import base64
 import hmac
 import json
 import os
@@ -181,17 +185,88 @@ def write(path, text):
         f.write(text)
 
 
-def warm_cargo(job, req, d, env):
+def git_config(req, d):
+    """A git config for the job: clones of allowed hosts (git dependencies,
+    the template's repo) go through Granary with the job's token, and git
+    runs no hooks and never uses the file protocol."""
+    url = req["granary_url"]
+    basic = base64.b64encode(f"token:{req['token']}".encode()).decode()
+    lines = [
+        "[core]\n\thooksPath = /dev/null\n",
+        "[protocol \"file\"]\n\tallow = never\n",
+        "[protocol \"ext\"]\n\tallow = never\n",
+        "[advice]\n\tdetachedHead = false\n",
+        f"[http \"{url}/\"]\n\textraHeader = Authorization: Basic {basic}\n",
+    ]
+    for host in req.get("git_hosts") or []:
+        lines.append(f"[url \"{url}/git/{host}/\"]\n\tinsteadOf = https://{host}/\n")
+    path = os.path.join(d, "gitconfig")
+    write(path, "".join(lines))
+    return path
+
+
+# Tool settings a repo may carry that could send downloads elsewhere or ask
+# for a toolchain the warmer can't install without the internet.
+REPO_CONFIG = {".npmrc", ".yarnrc", ".yarnrc.yml", "rust-toolchain", "rust-toolchain.toml"}
+
+
+def checkout(job, req, d, env):
+    """Clone the repo at its commit through Granary; returns the folder to
+    run in, or None."""
+    repo = req["repo"]
+    src = os.path.join(d, "src")
+    os.makedirs(src)
+    if not (
+        job.run(["git", "init", "-q"], src, env)
+        and job.run(["git", "fetch", "-q", "--depth", "1", "--no-tags", repo["url"], repo["commit"]], src, env)
+        and job.run(["git", "checkout", "-q", "--detach", "FETCH_HEAD"], src, env)
+    ):
+        return None
+    removed = 0
+    for root, dirs, files in os.walk(src):
+        dirs[:] = [x for x in dirs if x != ".git"]
+        for name in files:
+            in_cargo = os.path.basename(root) == ".cargo" and name in ("config", "config.toml")
+            if name in REPO_CONFIG or in_cargo:
+                os.remove(os.path.join(root, name))
+                removed += 1
+    if removed:
+        job.emit(f"Removed {removed} tool config file(s) from the checkout so downloads go through Granary.")
+    folder = os.path.normpath(os.path.join(src, repo["dir"]))
+    if not folder.startswith(src) or not os.path.isdir(folder):
+        job.emit(f"The repo has no folder {repo['dir']!r} at this commit")
+        return None
+    return folder
+
+
+def cargo_env(req, d, env):
     url = req["granary_url"]
     cargo_home = os.path.join(d, "cargo-home")
     write(
         os.path.join(cargo_home, "config.toml"),
         f'[registries.granary]\nindex = "sparse+{url}/cargo/"\ncredential-provider = "cargo:token"\n\n'
-        '[source.crates-io]\nreplace-with = "granary"\n\n[net]\nretry = 3\n',
+        '[source.crates-io]\nreplace-with = "granary"\n\n'
+        # Cargo's built-in git client can't send the token header.
+        '[net]\nretry = 3\ngit-fetch-with-cli = true\n',
     )
-    env = dict(env, CARGO_HOME=cargo_home, CARGO_REGISTRIES_GRANARY_TOKEN=req["token"])
+    return dict(env, CARGO_HOME=cargo_home, CARGO_REGISTRIES_GRANARY_TOKEN=req["token"])
+
+
+def warm_cargo(job, req, d, env):
+    env = cargo_env(req, d, env)
     # cargo fetch downloads every target's dependencies, so one run covers
     # all platforms.
+    if req.get("repo"):
+        folder = checkout(job, req, d, env)
+        if folder is None:
+            return False, {}
+        if job.run(["cargo", "fetch", "--locked"], folder, env):
+            return True, {}
+        # A lockfile that's out of date with its manifests (common for fuzz
+        # targets and examples) can't be used as it is; cache the newest
+        # matching versions instead of failing.
+        job.emit("Cargo.lock doesn't match its Cargo.toml, so the newest matching versions are fetched instead.")
+        return job.run(["cargo", "fetch"], folder, env), {}
     ok = job.run(["cargo", "generate-lockfile"], d, env) and job.run(["cargo", "fetch"], d, env)
     return ok, lockfiles(d, ["Cargo.lock"])
 
@@ -199,11 +274,27 @@ def warm_cargo(job, req, d, env):
 def warm_npm(job, req, d, env):
     url = req["granary_url"]
     hostport = urllib.parse.urlsplit(url).netloc
-    write(
-        os.path.join(d, ".npmrc"),
-        f"registry={url}/npm/\n//{hostport}/npm/:_authToken={req['token']}\nfund=false\naudit=false\n",
-    )
+    npmrc = f"registry={url}/npm/\n//{hostport}/npm/:_authToken={req['token']}\nfund=false\naudit=false\n"
+    write(os.path.join(d, ".npmrc"), npmrc)
     env = dict(env, npm_config_cache=os.path.join(d, "npm-cache"))
+    if req.get("repo"):
+        # The repo's own .npmrc was removed; the registry also comes from the
+        # environment, which outranks any project setting.
+        write(os.path.join(d, "user.npmrc"), npmrc)
+        env = dict(env, npm_config_userconfig=os.path.join(d, "user.npmrc"), npm_config_registry=f"{url}/npm/")
+        folder = checkout(job, req, d, env)
+        if folder is None:
+            return False, {}
+        ok = True
+        for plat in req["platforms"]:
+            os_, cpu = PLATFORMS[plat]["npm"]
+            flags = ["--ignore-scripts", "--no-audit", "--no-fund", f"--os={os_}", f"--cpu={cpu}"]
+            if job.run(["npm", "ci"] + flags, folder, env):
+                continue
+            # npm ci refuses a lockfile that's out of step with package.json.
+            job.emit("package-lock.json doesn't match package.json, so npm install picks the versions instead.")
+            ok = job.run(["npm", "install"] + flags, folder, env) and ok
+        return ok, {}
     ok = True
     for plat in req["platforms"]:
         os_, cpu = PLATFORMS[plat]["npm"]
@@ -302,11 +393,26 @@ def check_request(req):
     if eco not in WARMERS:
         return f"unknown ecosystem {eco!r}"
     files = req.get("files")
-    if not isinstance(files, dict) or not files:
+    repo = req.get("repo")
+    if repo is not None:
+        if eco not in ("cargo", "npm") or not isinstance(repo, dict):
+            return "a repo checkout is only used for Cargo and npm lockfiles"
+        prefix = str(req.get("granary_url", "")) + "/git/"
+        url, commit, folder = str(repo.get("url", "")), str(repo.get("commit", "")), str(repo.get("dir", ""))
+        if not url.startswith(prefix) or not url.endswith(".git"):
+            return "the repo must be cloned through Granary's /git/ path"
+        if len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit):
+            return "commit must be a full SHA"
+        if folder.startswith("/") or ".." in folder.split("/") or "\\" in folder:
+            return "dir must be a folder inside the repo"
+    elif not isinstance(files, dict) or not files:
         return "no files"
-    for path in files:
+    for path in files or {}:
         if path not in FILES[eco]:
             return f"unexpected file {path!r}"
+    for host in req.get("git_hosts") or []:
+        if not isinstance(host, str) or not host or any(not (c.isalnum() or c in ".-") for c in host):
+            return "git_hosts must be host names"
     plats = req.get("platforms") or []
     if not plats or any(p not in PLATFORMS for p in plats):
         return "unknown platform"
@@ -325,15 +431,22 @@ def check_request(req):
 
 def run_job(req, emit):
     """Run one ecosystem's tools. Returns the result dict."""
-    job = Job(req["job"], emit, [req["token"], urllib.parse.quote(req["token"], safe="")])
+    token = req["token"]
+    basic = base64.b64encode(f"token:{token}".encode()).decode()
+    job = Job(req["job"], emit, [token, urllib.parse.quote(token, safe=""), basic])
     with JOBS_LOCK:
         JOBS[job.id] = job
     d = tempfile.mkdtemp(prefix=f"granary-job-{job.id}-", dir=WORKDIR)
     try:
-        for path, text in req["files"].items():
+        for path, text in (req.get("files") or {}).items():
             write(os.path.join(d, path), text)
         env = base_env(os.path.join(d, "home"))
         os.makedirs(env["HOME"], exist_ok=True)
+        env.update(
+            GIT_CONFIG_GLOBAL=git_config(req, d),
+            GIT_CONFIG_NOSYSTEM="1",
+            GIT_TERMINAL_PROMPT="0",
+        )
         ok, locks = WARMERS[req["ecosystem"]](job, req, d, env)
         if ok:
             return {"ok": True, "lockfiles": locks}

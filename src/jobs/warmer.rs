@@ -33,6 +33,20 @@ pub struct RunRequest {
     pub granary_url: String,
     /// The warmer's access token for downloads.
     pub token: String,
+    /// For a repo template's lockfile install: the checkout to run in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<RepoCheckout>,
+    /// Git hosts whose clones go through Granary (git dependencies).
+    pub git_hosts: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RepoCheckout {
+    /// Granary's /git/ URL for the repo.
+    pub url: String,
+    pub commit: String,
+    /// The lockfile's folder within the repo ("" for the root).
+    pub dir: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -81,10 +95,18 @@ pub async fn run(
         return Err(Stop::Error("GRANARY_WARMER_URL is not set".into()));
     };
     let send = http.json_body(req).send();
+    // The warmer may already have started the tools when a stop arrives
+    // before its answer, so tell it to stop in that case too.
     let resp = tokio::select! {
         r = send => r.map_err(|e| Stop::Error(format!("the warmer could not be reached: {e}")))?,
-        _ = cancel.cancelled() => return Err(Stop::Cancelled),
-        _ = tokio::time::sleep_until(deadline) => return Err(Stop::Timeout),
+        _ = cancel.cancelled() => {
+            abort(st, req.job).await;
+            return Err(Stop::Cancelled);
+        }
+        _ = tokio::time::sleep_until(deadline) => {
+            abort(st, req.job).await;
+            return Err(Stop::Timeout);
+        }
     };
     if !resp.status().is_success() {
         let status = resp.status();

@@ -1,4 +1,6 @@
-# Granary warmer: cargo, node/npm, pip and Maven, run against Granary only.
+# Granary warmer: cargo, node/npm, pip, Maven and git, run against Granary only.
+# git checks out repo templates (through Granary's git cache) and fetches
+# Cargo and npm git dependencies.
 # Base images are pinned by digest; update the tag and digest together.
 
 FROM node:24-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66 AS node
@@ -7,7 +9,7 @@ FROM rust:1.98-slim-trixie@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates python3 python3-venv maven openjdk-21-jdk-headless \
+        ca-certificates git python3 python3-venv maven openjdk-21-jdk-headless \
     && rm -rf /var/lib/apt/lists/*
 
 # Node and npm from the official image.

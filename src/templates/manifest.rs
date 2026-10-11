@@ -81,10 +81,10 @@ pub fn import(filename: Option<&str>, content: &str) -> Result<Imported, String>
     })
 }
 
-type Lines = (Vec<String>, Vec<String>);
+pub(super) type Lines = (Vec<String>, Vec<String>);
 
 /// A TOML basic string. JSON string escaping is valid TOML.
-fn toml_str(s: &str) -> String {
+pub(super) fn toml_str(s: &str) -> String {
     serde_json::to_string(s).unwrap()
 }
 
@@ -127,7 +127,7 @@ fn cargo(content: &str) -> Result<Lines, String> {
     Ok((lines, skipped))
 }
 
-fn cargo_line(name: &str, value: &toml::Value) -> Result<String, String> {
+pub(super) fn cargo_line(name: &str, value: &toml::Value) -> Result<String, String> {
     let t = match value {
         toml::Value::String(req) => return Ok(format!("{name} = {}", toml_str(req))),
         toml::Value::Table(t) => t,
@@ -193,7 +193,7 @@ fn npm(content: &str) -> Result<Lines, String> {
     Ok((lines, skipped))
 }
 
-fn pypi(content: &str) -> Lines {
+pub(super) fn pypi(content: &str) -> Lines {
     let (mut lines, mut skipped) = (Vec::new(), Vec::new());
     // Join continuation lines ending in a backslash.
     let joined = content.replace("\\\r\n", " ").replace("\\\n", " ");
@@ -218,7 +218,7 @@ fn pypi(content: &str) -> Lines {
     (lines, skipped)
 }
 
-fn maven(content: &str) -> Result<Lines, String> {
+pub(super) fn maven(content: &str) -> Result<Lines, String> {
     let doc =
         roxmltree::Document::parse(content).map_err(|e| format!("not a valid pom.xml: {e}"))?;
     let project = doc.root_element();

@@ -361,6 +361,7 @@ const routes = [
   [/^\/get(?:\/(npm|cargo|pypi|maven))?$/, 'get', renderGet, { admin: true }],
   [/^\/templates$/, 'templates', renderTemplates],
   [/^\/templates\/new$/, 'templates', renderTemplateEditor, { admin: true }],
+  [/^\/templates\/from-repo$/, 'templates', renderFromRepo, { admin: true }],
   [/^\/templates\/(\d+)$/, 'templates', renderTemplate],
   [/^\/templates\/(\d+)\/edit$/, 'templates', renderTemplateEditor, { admin: true }],
   [/^\/jobs$/, 'jobs', renderJobs],
@@ -1067,7 +1068,7 @@ async function renderTemplates({ query, isCurrent }) {
       <article class="tpl-card panel" data-search="${esc([t.name, t.description, ...t.tags].join(' ').toLowerCase())}">
         <div class="tpl-head">
           <h2><a href="#/templates/${t.id}">${esc(t.name)}</a></h2>
-          ${t.builtin ? '<span class="kind">Built-in</span>' : '<span class="kind custom">Custom</span>'}
+          ${t.builtin ? '<span class="kind">Built-in</span>' : t.source ? '<span class="kind custom">From repo</span>' : '<span class="kind custom">Custom</span>'}
         </div>
         <p class="tpl-desc">${esc(t.description || 'No description.')}</p>
         <div class="tpl-counts">${packageCounts(t.counts)}</div>
@@ -1090,7 +1091,7 @@ async function renderTemplates({ query, isCurrent }) {
   setView(`
     <div class="page-head">
       <div><h1>Templates</h1><p>Named sets of packages for a kind of project. Built-in templates are read-only; clone one to change it.</p></div>
-      <div class="page-actions admin-only"><a class="btn primary" href="#/templates/new">New template</a></div>
+      <div class="page-actions admin-only"><a class="btn" href="#/templates/from-repo">New from repo</a><a class="btn primary" href="#/templates/new">New template</a></div>
     </div>
     ${warmerNote(warmer)}
     <div class="toolbar">
@@ -1212,7 +1213,7 @@ async function renderTemplate({ params, isCurrent }) {
       <div>
         <h1>${esc(t.name)}</h1>
         <div class="summary-line">
-          ${t.builtin ? '<span class="kind">Built-in</span>' : '<span class="kind custom">Custom</span>'}
+          ${t.builtin ? '<span class="kind">Built-in</span>' : t.source ? '<span class="kind custom">From repo</span>' : '<span class="kind custom">Custom</span>'}
           ${t.tags.map((x) => `<a class="tag" href="#/templates?tag=${esc(encodeURIComponent(x))}">${esc(x)}</a>`).join('')}
           <span>Last warmed ${t.last_warmed_at ? timeTag(t.last_warmed_at) : 'never'}</span>
         </div>
@@ -1230,6 +1231,10 @@ async function renderTemplate({ params, isCurrent }) {
     <dl class="panel panel-pad tpl-facts">
       <div><dt>Platforms</dt><dd>${t.platforms.map((p) => esc(label(p))).join(', ')}</dd></div>
       <div><dt>Source distributions</dt><dd>${t.allow_sdist ? 'Allowed (building one can run code)' : 'Wheels only'}</dd></div>
+      ${t.source ? `<div><dt>Source</dt><dd><a href="${esc(safeUrl(t.source.url))}" target="_blank" rel="noopener noreferrer">${esc(t.source.url.replace(/^https:\/\//, ''))}</a>
+        ${t.source.ref ? esc(t.source.ref) : 'default branch'} at <span class="mono">${esc(shortSha(t.source.commit))}</span>, read ${timeTag(t.source.synced_at)}
+        ${t.source.lockfiles.length ? `<div class="help">Warming installs the versions in ${t.source.lockfiles.map((l) => `<code>${esc(l)}</code>`).join(', ')}.</div>` : ''}
+        <div class="admin-only"><a class="btn small" href="#/templates/from-repo?resync=${t.id}">Resync from repo</a></div></dd></div>` : ''}
       <div><dt><label for="tpl-schedule">Re-warm automatically</label></dt><dd>${
         isAdmin()
           ? `<select id="tpl-schedule">${Object.entries(SCHEDULE_LABELS).map(([id, label]) => `<option value="${id}" ${t.schedule === id ? 'selected' : ''}>${label}</option>`).join('')}</select>`
@@ -1678,6 +1683,213 @@ async function renderGitRepos({ isCurrent }) {
       }
     }
   });
+}
+
+// --------------------------------------------------------- template from repo
+
+const shortSha = (c) => String(c || '').slice(0, 12);
+
+async function renderFromRepo({ query, isCurrent }) {
+  const resyncId = query.get('resync');
+  const [list, current] = await Promise.all([api('/api/templates'), resyncId ? api(`/api/templates/${resyncId}`) : null]);
+  if (!isCurrent()) return;
+  const url = query.get('url') || current?.source?.url || '';
+  const gitRef = query.get('ref') ?? current?.source?.ref ?? '';
+
+  setView(`
+    <div class="crumbs"><a href="#/templates">Templates</a>${current ? ` <span aria-hidden="true">/</span> <a href="#/templates/${current.id}">${esc(current.name)}</a>` : ''}</div>
+    <div class="page-head"><div>
+      <h1>${current ? 'Resync from repo' : 'New template from repo'}</h1>
+      <p>${current
+        ? 'Granary reads the repo again and replaces this template\'s package lines with what it lists now. The name, tags, platforms and schedule stay.'
+        : 'Granary caches the repo, reads its manifests and lockfiles, and shows what the template will hold before you save it.'}</p></div></div>
+    <form class="panel panel-pad" id="repo-form" novalidate>
+      <div class="form-grid">
+        <div class="label"><label for="repo-url">Repo URL</label></div>
+        <div><input type="text" id="repo-url" value="${esc(url)}" placeholder="https://github.com/owner/repo" autocomplete="off" spellcheck="false" ${current ? 'readonly' : ''}></div>
+        <div class="label"><label for="repo-ref">Branch, tag or commit</label></div>
+        <div><input type="text" id="repo-ref" value="${esc(gitRef)}" placeholder="default branch" autocomplete="off" spellcheck="false">
+          <div class="help">Leave empty for the default branch. The template records the exact commit it was read at.</div></div>
+      </div>
+      <p class="err hidden" id="repo-err"></p>
+      <div class="page-actions tpl-save"><button class="primary" type="submit">Preview</button></div>
+    </form>
+    <div id="repo-progress"></div>
+    <div id="repo-preview"></div>`);
+
+  const err = $('#repo-err');
+  const progress = $('#repo-progress');
+  const out = $('#repo-preview');
+  let pollTimer;
+  onLeave(() => clearTimeout(pollTimer));
+
+  /** Follow a clone job until it ends; resolves true when it succeeded. */
+  const follow = (job) =>
+    new Promise((resolve) => {
+      let after = 0;
+      progress.innerHTML = `<h2>Caching the repo</h2><p class="page-note">Job <a href="#/jobs/${job}">#${esc(job)}</a>. Submodules and Git LFS objects are not fetched.</p><div class="panel log" id="clone-log" role="log" aria-live="polite"></div>`;
+      const box = $('#clone-log');
+      const tick = async () => {
+        if (!isCurrent()) return resolve(false);
+        try {
+          const d = await api(`/api/jobs/${job}?after=${after}`);
+          if (d.lines.length) {
+            box.insertAdjacentHTML('beforeend', d.lines.map((l) => `<div class="job-line">${esc(l.line)}</div>`).join(''));
+            after = d.lines[d.lines.length - 1].n;
+            box.scrollTop = box.scrollHeight;
+          }
+          if (d.job.status === 'done') return resolve(true);
+          if (d.job.status === 'failed' || d.job.status === 'cancelled') {
+            showError(err, d.job.message ? d.job.message[0].toUpperCase() + d.job.message.slice(1) + '.' : 'The repo could not be cached.');
+            return resolve(false);
+          }
+        } catch {
+          /* try again */
+        }
+        pollTimer = setTimeout(tick, 1500);
+      };
+      tick();
+    });
+
+  const runPreview = async () => {
+    showError(err, '');
+    out.innerHTML = '';
+    const body = { url: $('#repo-url').value.trim(), ref: $('#repo-ref').value.trim() };
+    if (!body.url) return showError(err, 'Paste a repo URL first.');
+    const button = $('#repo-form button[type="submit"]');
+    button.disabled = true;
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const res = await fetch('/api/templates/from-repo/preview', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json', 'X-Granary-Request': '1', Accept: 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!isCurrent()) return;
+        if (res.status === 202) {
+          const d = await res.json();
+          if (!(await follow(d.job))) return;
+          continue;
+        }
+        if (!res.ok) {
+          const text = (await res.text()).trim();
+          return showError(err, text ? text[0].toUpperCase() + text.slice(1) + '.' : `Preview failed (HTTP ${res.status}).`);
+        }
+        progress.innerHTML = '';
+        return showPreview(await res.json());
+      }
+    } catch (e) {
+      showError(err, e.message || 'Granary is not responding.');
+    } finally {
+      button.disabled = false;
+    }
+  };
+
+  const showPreview = (p) => {
+    const counts = TEMPLATE_ECOS.filter((e) => p.counts[e] || current?.counts[e])
+      .map((e) => {
+        const was = current ? current.counts[e] : null;
+        const change = was == null || was === p.counts[e] ? '' : ` <span class="muted">(was ${esc(was)})</span>`;
+        return `<span class="count">${chip(e)} <b class="num">${esc(count(p.counts[e]))}</b>${change}</span>`;
+      })
+      .join('');
+    const manifests = p.manifests
+      .map((m) => `<tr><td class="mono">${esc(m.path)}</td><td>${m.ecosystem ? chip(m.ecosystem) : ''}</td><td class="r num">${esc(count(m.packages))}</td></tr>`)
+      .join('');
+    const gitDeps = p.git_deps.length
+      ? `<section><h2>Git dependencies</h2><p class="page-note">${p.git_deps.some((d) => d.allowed && !d.cached) ? 'Allowed repos that aren\'t cached yet are cached when you save.' : ''}</p>
+          <div class="panel table-wrap"><table><thead><tr><th>Repo</th><th>Named in</th><th>Status</th></tr></thead><tbody>${p.git_deps
+            .map(
+              (d) => `<tr><td class="mono">${esc(d.url)}</td><td class="mono">${esc(d.path)}</td><td>${
+                !d.allowed ? '<span class="status"><span class="dot bad"></span>Host not allowed</span>' : d.cached ? '<span class="status"><span class="dot ok"></span>Cached</span>' : '<span class="status"><span class="dot"></span>Will be cached</span>'
+              }</td></tr>`
+            )
+            .join('')}</tbody></table></div></section>`
+      : '';
+    const skipped = p.skipped.length
+      ? `<details class="setup"><summary>${esc(plural(p.skipped.length, 'item'))} left out</summary>
+          <ul class="line-errors skipped-list">${p.skipped.map((s) => `<li><code>${esc(s.path)}</code> <b>${esc(s.item)}</b> ${esc(s.reason)}</li>`).join('')}</ul></details>`
+      : '';
+    const lines = TEMPLATE_ECOS.filter((e) => p.lines[e])
+      .map((e) => `<details class="setup"><summary>${chip(e)} lines</summary><div class="snippet"><pre>${esc(p.lines[e])}</pre></div></details>`)
+      .join('');
+    const total = TEMPLATE_ECOS.reduce((s, e) => s + (p.counts[e] || 0), 0);
+    const where = `${esc(p.repo)} at <span class="mono">${esc(shortSha(p.commit))}</span>${p.ref ? ` (${esc(p.ref)})` : ' (default branch)'}`;
+
+    out.innerHTML = `
+      <section>
+        <h2>What Granary found</h2>
+        <p>${where}</p>
+        ${current && current.source && current.source.commit === p.commit ? '<p class="page-note">This template already matches this commit; resyncing changes nothing.</p>' : ''}
+        ${p.manifests.length
+          ? `<div class="tpl-counts preview-counts">${counts}</div>
+             <div class="panel table-wrap"><table><thead><tr><th>Manifest</th><th>Ecosystem</th><th class="r">New packages</th></tr></thead><tbody>${manifests}</tbody></table></div>
+             <p class="page-note after-table">${p.lockfiles.length ? `Lockfiles: ${p.lockfiles.map((l) => `<code>${esc(l)}</code>`).join(', ')}. Warming installs exactly the versions they list (<code>cargo fetch --locked</code>, <code>npm ci</code>).` : 'No lockfiles, so warming uses the newest versions that match.'}</p>
+             ${lines}${skipped}`
+          : '<div class="panel empty"><strong>No manifests found</strong>Granary looks for Cargo, npm, Python, Maven and Gradle manifests in the root and two levels down.</div>'}
+      </section>
+      ${gitDeps}
+      ${total ? (current ? `
+        <div class="banner"><span class="dot warn"></span><span>Resyncing replaces this template's package lines with the ones above. Any lines you edited by hand are lost.</span></div>
+        <div class="page-actions tpl-save"><button class="primary" id="repo-save">Resync template</button></div>
+        <p class="err hidden" id="save-err"></p>` : `
+        <form class="panel panel-pad" id="repo-save-form" novalidate>
+          <div class="form-grid">
+            <div class="label"><label for="new-name">Name</label></div>
+            <div><input type="text" id="new-name" maxlength="80" value="${esc(p.name)}"></div>
+            <div class="label"><label for="new-desc">Description</label></div>
+            <div><input type="text" id="new-desc" maxlength="500" value="${esc(p.description)}"></div>
+            <div class="label"><label for="new-tags">Tags</label></div>
+            <div><input type="text" id="new-tags" placeholder="rust, web"><div class="help">Comma-separated.</div></div>
+            <div class="label">Platforms</div>
+            <div><div class="inline">${list.platforms.map((pl) => `<label class="check"><input type="checkbox" name="new-platform" value="${esc(pl.id)}" ${list.default_platforms.includes(pl.id) ? 'checked' : ''}> ${esc(pl.label)}</label>`).join('')}</div></div>
+          </div>
+          <p class="err hidden" id="save-err"></p>
+          <div class="page-actions tpl-save"><button class="primary" type="submit">Create template</button></div>
+        </form>`) : ''}`;
+
+    if (current) {
+      $('#repo-save').addEventListener('click', async (e) => {
+        e.target.disabled = true;
+        try {
+          await act(() => api(`/api/templates/${current.id}/resync`, { method: 'POST', body: { commit: p.commit } }));
+          toast(`${current.name} resynced`);
+          location.hash = `#/templates/${current.id}`;
+        } catch (ex) {
+          showError($('#save-err'), ex.message);
+          e.target.disabled = false;
+        }
+      });
+    } else if (total) {
+      $('#repo-save-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const body = {
+          url: p.url,
+          ref: p.ref,
+          commit: p.commit,
+          name: $('#new-name').value,
+          description: $('#new-desc').value,
+          tags: $('#new-tags').value.split(',').map((s) => s.trim()).filter(Boolean),
+          platforms: $$('input[name="new-platform"]:checked', view()).map((c) => c.value),
+        };
+        try {
+          const r = await act(() => api('/api/templates/from-repo', { method: 'POST', body }));
+          toast(r.git_jobs ? `Template created; caching ${plural(r.git_jobs, 'git dependency', 'git dependencies')}` : 'Template created');
+          location.hash = `#/templates/${r.id}`;
+        } catch (ex) {
+          showError($('#save-err'), ex.message);
+        }
+      });
+    }
+  };
+
+  $('#repo-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    runPreview();
+  });
+  if (current) runPreview();
+  else $('#repo-url').focus();
 }
 
 // ----------------------------------------------------------------- cleanup

@@ -24,10 +24,10 @@ use serde_json::{Value, json};
 use super::{Harness, Opts};
 
 /// A temporary directory removed when dropped.
-struct TempDir(PathBuf);
+pub(super) struct TempDir(pub(super) PathBuf);
 
 impl TempDir {
-    fn new(tag: &str) -> Self {
+    pub(super) fn new(tag: &str) -> Self {
         static N: AtomicUsize = AtomicUsize::new(0);
         let p = std::env::temp_dir().join(format!(
             "granary-git-{tag}-{}-{}",
@@ -48,7 +48,7 @@ impl Drop for TempDir {
 
 /// Run git as a client: no user or system config, so the developer's own
 /// settings (insteadOf rules, credential helpers) can't interfere.
-fn client_git(args: &[&str], cwd: &Path) -> std::process::Output {
+pub(super) fn client_git(args: &[&str], cwd: &Path) -> std::process::Output {
     Command::new("git")
         .args([
             "-c",
@@ -68,7 +68,7 @@ fn client_git(args: &[&str], cwd: &Path) -> std::process::Output {
         .unwrap()
 }
 
-fn ok(out: std::process::Output) -> String {
+pub(super) fn ok(out: std::process::Output) -> String {
     assert!(
         out.status.success(),
         "git failed: {}{}",
@@ -81,9 +81,9 @@ fn ok(out: std::process::Output) -> String {
 /// A stand-in for GitHub: bare repos under `root`, served with
 /// `git http-backend` at `{url}/{host}/{owner}/{repo}.git`.
 #[derive(Clone)]
-struct Upstream {
-    root: Arc<TempDir>,
-    url: String,
+pub(super) struct Upstream {
+    pub(super) root: Arc<TempDir>,
+    pub(super) url: String,
     refs_hits: Arc<AtomicUsize>,
     fail: Arc<AtomicBool>,
     delay: Arc<Mutex<Duration>>,
@@ -122,7 +122,7 @@ async fn serve_upstream(
 }
 
 impl Upstream {
-    async fn start() -> Self {
+    pub(super) async fn start() -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let u = Upstream {
             root: Arc::new(TempDir::new("upstream")),
@@ -139,7 +139,7 @@ impl Upstream {
     }
 
     /// Create `github.com/{owner}/{name}.git` with one commit holding `files`.
-    fn create(&self, owner: &str, name: &str, files: &[(&str, &[u8])]) -> PathBuf {
+    pub(super) fn create(&self, owner: &str, name: &str, files: &[(&str, &[u8])]) -> PathBuf {
         let bare = self
             .root
             .0
@@ -155,7 +155,9 @@ impl Upstream {
         std::fs::create_dir_all(&work).unwrap();
         ok(client_git(&["init", "-q", "-b", "main", "."], &work));
         for (path, data) in files {
-            std::fs::write(work.join(path), data).unwrap();
+            let file = work.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, data).unwrap();
         }
         ok(client_git(&["add", "."], &work));
         ok(client_git(&["commit", "-q", "-m", "first"], &work));
@@ -167,7 +169,25 @@ impl Upstream {
         work
     }
 
-    fn commit(&self, work: &Path, msg: &str) {
+    /// Tag the current commit and push the tag.
+    pub(super) fn tag(&self, work: &Path, tag: &str) {
+        ok(client_git(&["tag", tag], work));
+        ok(client_git(&["push", "-q", "origin", tag], work));
+    }
+
+    /// Write files and push them as a new commit.
+    pub(super) fn change(&self, work: &Path, files: &[(&str, &[u8])], msg: &str) {
+        for (path, data) in files {
+            let file = work.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, data).unwrap();
+        }
+        ok(client_git(&["add", "."], work));
+        ok(client_git(&["commit", "-q", "-m", msg], work));
+        ok(client_git(&["push", "-q", "origin", "main"], work));
+    }
+
+    pub(super) fn commit(&self, work: &Path, msg: &str) {
         std::fs::write(work.join(format!("{msg}.txt")), msg).unwrap();
         ok(client_git(&["add", "."], work));
         ok(client_git(&["commit", "-q", "-m", msg], work));
@@ -179,14 +199,14 @@ impl Upstream {
     }
 }
 
-fn have_git() -> bool {
+pub(super) fn have_git() -> bool {
     Command::new("git")
         .arg("--version")
         .output()
         .is_ok_and(|o| o.status.success())
 }
 
-async fn granary(up: &Upstream, opts: Opts) -> Harness {
+pub(super) async fn granary(up: &Upstream, opts: Opts) -> Harness {
     Harness::with(Opts {
         serve: true,
         git_upstream: Some(up.url.clone()),

@@ -9,6 +9,8 @@ pub mod api;
 pub mod build;
 pub mod lines;
 pub mod manifest;
+pub mod repo;
+pub mod repo_api;
 pub mod starter;
 
 use serde::{Deserialize, Serialize};
@@ -358,6 +360,46 @@ pub struct Template {
     pub last_warmed_at: Option<i64>,
     /// "off", "daily" or "weekly".
     pub schedule: String,
+    /// Set for templates made with "New from repo".
+    #[serde(skip)]
+    pub source: Option<RepoSource>,
+}
+
+/// Where a "New from repo" template came from, and the files read there.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RepoSource {
+    /// `https://{host}/{owner}/{repo}`
+    pub url: String,
+    /// The ref as entered; empty for the default branch.
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+    /// The commit the files were read at.
+    pub commit: String,
+    pub synced_at: i64,
+    /// The manifests and lockfiles read: path -> contents.
+    pub files: std::collections::BTreeMap<String, String>,
+}
+
+impl RepoSource {
+    pub fn lockfiles(&self) -> Vec<&str> {
+        self.files
+            .keys()
+            .map(String::as_str)
+            .filter(|p| p.ends_with("Cargo.lock") || p.ends_with("package-lock.json"))
+            .collect()
+    }
+
+    /// What the UI shows: everything but the file contents.
+    pub fn summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "url": self.url,
+            "ref": self.git_ref,
+            "commit": self.commit,
+            "synced_at": self.synced_at,
+            "files": self.files.keys().collect::<Vec<_>>(),
+            "lockfiles": self.lockfiles(),
+        })
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -377,6 +419,7 @@ struct Row {
     updated_at: i64,
     last_warmed_at: Option<i64>,
     schedule: String,
+    source: Option<String>,
 }
 
 impl From<Row> for Template {
@@ -400,16 +443,52 @@ impl From<Row> for Template {
             updated_at: r.updated_at,
             last_warmed_at: r.last_warmed_at,
             schedule: r.schedule,
+            source: r.source.and_then(|s| serde_json::from_str(&s).ok()),
         }
     }
 }
 
-const COLUMNS: &str = "id, builtin_key, name, description, tags, platforms, allow_sdist, cargo, npm, pypi, maven, created_at, updated_at, last_warmed_at, schedule";
+const COLUMNS: &str = "id, builtin_key, name, description, tags, platforms, allow_sdist, cargo, npm, pypi, maven, created_at, updated_at, last_warmed_at, schedule, source";
 
 /// Columns added after templates first shipped.
 pub async fn migrate(db: &SqlitePool) -> sqlx::Result<()> {
     crate::auth::add_column(db, "templates", "schedule", "TEXT NOT NULL DEFAULT 'off'").await?;
-    crate::auth::add_column(db, "templates", "schedule_queued_at", "INTEGER").await
+    crate::auth::add_column(db, "templates", "schedule_queued_at", "INTEGER").await?;
+    crate::auth::add_column(db, "templates", "source", "TEXT").await
+}
+
+/// Record (or replace) where a repo template came from.
+pub async fn set_source(db: &SqlitePool, id: i64, source: &RepoSource) -> sqlx::Result<()> {
+    sqlx::query("UPDATE templates SET source = ? WHERE id = ?")
+        .bind(serde_json::to_string(source).unwrap())
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Replace a repo template's package lines with what the repo lists now.
+/// Its name, description, tags, platforms and schedule stay as they are.
+pub async fn resync(
+    db: &SqlitePool,
+    id: i64,
+    t: &TemplateInput,
+    source: &RepoSource,
+) -> sqlx::Result<bool> {
+    let r = sqlx::query(
+        "UPDATE templates SET cargo = ?, npm = ?, pypi = ?, maven = ?, source = ?, updated_at = ?
+         WHERE id = ? AND builtin_key IS NULL AND source IS NOT NULL",
+    )
+    .bind(&t.cargo)
+    .bind(&t.npm)
+    .bind(&t.pypi)
+    .bind(&t.maven)
+    .bind(serde_json::to_string(source).unwrap())
+    .bind(now_secs() as i64)
+    .bind(id)
+    .execute(db)
+    .await?;
+    Ok(r.rows_affected() == 1)
 }
 
 pub async fn set_schedule(db: &SqlitePool, id: i64, schedule: &str) -> sqlx::Result<bool> {

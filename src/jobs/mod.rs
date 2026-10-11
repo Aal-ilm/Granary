@@ -140,14 +140,73 @@ pub struct JobRow {
 pub const JOB_COLUMNS: &str = "id, kind, template_id, title, status, message, created_by, created_at, started_at, finished_at, new_packages, new_files, new_bytes";
 
 /// Queue a job. Returns its id.
+/// What a warm job installs: a template, and for templates made from a
+/// repo, the commit whose lockfiles to use.
+#[derive(Clone, Debug, Default, serde::Deserialize, Serialize)]
+pub struct WarmSpec {
+    #[serde(flatten)]
+    pub input: TemplateInput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<RepoWarm>,
+}
+
+/// A repo template's checkout: the warmer clones it through Granary's git
+/// cache and runs the lockfile installs in each lockfile's folder.
+#[derive(Clone, Debug, serde::Deserialize, Serialize)]
+pub struct RepoWarm {
+    /// `https://{host}/{owner}/{repo}`
+    pub url: String,
+    pub commit: String,
+    pub locks: Vec<LockDir>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, Serialize)]
+pub struct LockDir {
+    pub ecosystem: Eco,
+    /// Folder holding the lockfile, relative to the repo root ("" for the root).
+    pub dir: String,
+}
+
+impl RepoWarm {
+    /// From a template's source; `None` when it has no lockfiles to use.
+    pub fn from_source(s: &crate::templates::RepoSource) -> Option<Self> {
+        let locks: Vec<LockDir> = s
+            .lockfiles()
+            .into_iter()
+            .filter_map(|p| {
+                let (dir, name) = p.rsplit_once('/').unwrap_or(("", p));
+                let ecosystem = match name {
+                    "Cargo.lock" => Eco::Cargo,
+                    "package-lock.json" => Eco::Npm,
+                    _ => return None,
+                };
+                Some(LockDir {
+                    ecosystem,
+                    dir: dir.to_string(),
+                })
+            })
+            .collect();
+        (!locks.is_empty()).then(|| Self {
+            url: s.url.clone(),
+            commit: s.commit.clone(),
+            locks,
+        })
+    }
+}
+
 pub async fn enqueue(
     st: &AppState,
     kind: &str,
     template_id: Option<i64>,
     title: &str,
     spec: &TemplateInput,
+    repo: Option<RepoWarm>,
     created_by: &str,
 ) -> sqlx::Result<i64> {
+    let spec = WarmSpec {
+        input: spec.clone(),
+        repo,
+    };
     let r = sqlx::query(
         "INSERT INTO jobs (kind, template_id, title, spec, status, created_by, created_at)
          VALUES (?, ?, ?, ?, 'queued', ?, ?)",
@@ -155,7 +214,7 @@ pub async fn enqueue(
     .bind(kind)
     .bind(template_id)
     .bind(title)
-    .bind(serde_json::to_string(spec).unwrap())
+    .bind(serde_json::to_string(&spec).unwrap())
     .bind(created_by)
     .bind(now_secs() as i64)
     .execute(&st.auth.db)
@@ -445,7 +504,7 @@ async fn run_inner(
     let Some((title, spec)) = row else {
         return Outcome::failed("the job disappeared");
     };
-    let spec: TemplateInput = match serde_json::from_str(&spec) {
+    let WarmSpec { input: spec, repo } = match serde_json::from_str(&spec) {
         Ok(s) => s,
         Err(e) => return Outcome::failed(format!("the job's template could not be read: {e}")),
     };
@@ -513,33 +572,67 @@ async fn run_inner(
         Err(e) => return Outcome::failed(e),
     };
 
+    // A repo template with lockfiles installs exactly those versions, in a
+    // checkout of the repo at its commit; other ecosystems use the lines.
+    let mut steps: Vec<Step> = Vec::new();
+    if let Some(r) = &repo {
+        let checkout = match prepare_checkout(st, r, log).await {
+            Ok(url) => url,
+            Err(e) => return Outcome::failed(e),
+        };
+        for lock in &r.locks {
+            steps.push(Step::Lock {
+                eco: lock.ecosystem,
+                repo: warmer::RepoCheckout {
+                    url: checkout.clone(),
+                    commit: r.commit.clone(),
+                    dir: lock.dir.clone(),
+                },
+            });
+        }
+    }
+    let locked: Vec<Eco> = steps.iter().map(Step::eco).collect();
+    steps.extend(
+        manifests
+            .into_iter()
+            .filter(|m| !locked.contains(&m.eco))
+            .map(Step::Manifest),
+    );
+
     let deadline = tokio::time::Instant::now() + st.cfg.warm_timeout;
     let mut lockfiles = HashMap::new();
     let mut failures = Vec::new();
-    for m in manifests {
-        let label = m.eco.label();
+    for step in steps {
+        let eco = step.eco();
+        let label = step.label();
         log.push(db, &format!("--- {label} ({})", spec.platforms.join(", ")))
             .await;
+        let (files, checkout) = match step {
+            Step::Manifest(m) => (m.files, None),
+            Step::Lock { repo, .. } => (Vec::new(), Some(repo)),
+        };
         // Maven has no lockfile; keep the pom.xml that was warmed, with
         // every version filled in, for the template's starter.
-        let warmed_pom = (m.eco == Eco::Maven)
-            .then(|| m.files.iter().find(|(p, _)| p == "pom.xml").cloned())
+        let warmed_pom = (eco == Eco::Maven)
+            .then(|| files.iter().find(|(p, _)| p == "pom.xml").cloned())
             .flatten();
         let req = warmer::RunRequest {
             job: id,
-            ecosystem: m.eco,
-            files: m.files.into_iter().collect(),
+            ecosystem: eco,
+            files: files.into_iter().collect(),
             platforms: spec.platforms.clone(),
             allow_sdist: spec.allow_sdist,
             python_version: st.cfg.warm_python.clone(),
             granary_url: st.cfg.warmer_granary_url.clone(),
             token: token.clone(),
+            repo: checkout,
+            git_hosts: st.cfg.git_hosts.clone(),
         };
         match warmer::run(st, &req, log, cancel, deadline, budget).await {
             Ok(r) if r.ok => {
                 let mut locks = r.lockfiles;
                 locks.extend(warmed_pom);
-                lockfiles.insert(m.eco.as_str().to_string(), locks);
+                lockfiles.insert(eco.as_str().to_string(), locks);
             }
             Ok(r) => {
                 let why = r
@@ -586,6 +679,75 @@ async fn run_inner(
             lockfiles,
         }
     }
+}
+
+/// One run of the warmer within a job.
+enum Step {
+    /// Generated manifests from the template's lines.
+    Manifest(build::Manifest),
+    /// A lockfile install in the repo's checkout.
+    Lock {
+        eco: Eco,
+        repo: warmer::RepoCheckout,
+    },
+}
+
+impl Step {
+    fn eco(&self) -> Eco {
+        match self {
+            Step::Manifest(m) => m.eco,
+            Step::Lock { eco, .. } => *eco,
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Step::Manifest(m) => m.eco.label().to_string(),
+            Step::Lock { eco, repo } => {
+                let file = if *eco == Eco::Cargo {
+                    "Cargo.lock"
+                } else {
+                    "package-lock.json"
+                };
+                let at = if repo.dir.is_empty() {
+                    String::new()
+                } else {
+                    format!(" in {}", repo.dir)
+                };
+                format!("{} from the repo's {file}{at}", eco.label())
+            }
+        }
+    }
+}
+
+/// Make sure the repo and its commit are in the git cache; returns the URL
+/// the warmer clones it from (Granary's own /git/ path, never upstream).
+async fn prepare_checkout(st: &AppState, r: &RepoWarm, log: &mut JobLog) -> Result<String, String> {
+    use crate::formats::git::{self, Refresh, RepoId};
+    let id = RepoId::from_url(&st.cfg, &r.url)?;
+    if !git::has_commit(st, &id, &r.commit).await {
+        log.push(
+            &st.auth.db,
+            &format!("Fetching {} into the git cache", id.display()),
+        )
+        .await;
+        let refresh = if id.dir(st).exists() {
+            Refresh::Now
+        } else {
+            Refresh::Never
+        };
+        git::ensure(st, &id, refresh, None)
+            .await
+            .map_err(|e| e.message)?;
+        if !git::has_commit(st, &id, &r.commit).await {
+            return Err(format!(
+                "{} no longer has commit {}",
+                id.display(),
+                &r.commit[..12.min(r.commit.len())]
+            ));
+        }
+    }
+    Ok(format!("{}/git/{}", st.cfg.warmer_granary_url, id.rel()))
 }
 
 /// What a git job does.
@@ -838,12 +1000,14 @@ pub async fn queue_scheduled(st: &AppState) -> usize {
             .bind(id)
             .execute(&st.auth.db)
             .await;
+        let repo = t.source.as_ref().and_then(RepoWarm::from_source);
         match enqueue(
             st,
             "template",
             Some(id),
             &t.input.name,
             &t.input,
+            repo,
             "schedule",
         )
         .await
