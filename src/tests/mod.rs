@@ -9,6 +9,7 @@ mod maven;
 mod offline;
 mod search;
 mod starter;
+mod system_user;
 mod templates;
 
 use std::{

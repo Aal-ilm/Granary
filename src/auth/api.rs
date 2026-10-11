@@ -624,11 +624,13 @@ async fn ensure_other_admin(st: &AppState, target: &User) -> AppResult<()> {
     Ok(())
 }
 
+/// A user account for the admin pages. The system account isn't one.
 async fn load_user(st: &AppState, id: i64) -> AppResult<User> {
     st.auth
         .user_by_id(id)
         .await
         .map_err(db_err)?
+        .filter(|u| !u.system)
         .ok_or_else(AppError::not_found)
 }
 

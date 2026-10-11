@@ -86,6 +86,9 @@ pub struct User {
     totp_secret: Option<String>,
     #[serde(skip)]
     totp_last_step: i64,
+    /// Granary's own account for the warmer: no sign-in, never listed.
+    #[serde(skip)]
+    pub system: bool,
 }
 
 // Never print password hashes or 2FA secrets, even in debug output.
@@ -114,7 +117,7 @@ impl AuthUser for User {
 }
 
 const USER_COLUMNS: &str = "id, username, role, totp_enabled, disabled, must_change_password, \
-                            created_at, last_login, password_hash, totp_secret, totp_last_step";
+                            created_at, last_login, password_hash, totp_secret, totp_last_step, system";
 
 type UserRow = (
     i64,
@@ -128,7 +131,12 @@ type UserRow = (
     String,
     Option<String>,
     i64,
+    bool,
 );
+
+/// The warmer's system account. `@` can't appear in a real username, so
+/// nobody can create, rename to or sign in as it.
+pub const WARMER_USER: &str = "@warmer";
 
 fn user_from_row(r: UserRow) -> User {
     User {
@@ -143,6 +151,7 @@ fn user_from_row(r: UserRow) -> User {
         password_hash: r.8,
         totp_secret: r.9,
         totp_last_step: r.10,
+        system: r.11,
     }
 }
 
@@ -210,9 +219,53 @@ pub async fn open_db(data_dir: &Path) -> anyhow::Result<SqlitePool> {
     }
     // Columns added after the first release.
     add_column(&pool, "tokens", "system", "INTEGER NOT NULL DEFAULT 0").await?;
+    add_column(&pool, "users", "system", "INTEGER NOT NULL DEFAULT 0").await?;
+    move_system_tokens(&pool).await?;
     crate::templates::migrate(&pool).await?;
     crate::jobs::migrate(&pool).await?;
     Ok(pool)
+}
+
+/// The warmer's system account, created on first use. It has the viewer role
+/// and a password hash nothing can match, so it can't sign in; its tokens
+/// can only download packages.
+pub async fn system_user(pool: &SqlitePool) -> sqlx::Result<i64> {
+    if let Some((id,)) =
+        sqlx::query_as::<_, (i64,)>("SELECT id FROM users WHERE system = 1 AND username = ?")
+            .bind(WARMER_USER)
+            .fetch_optional(pool)
+            .await?
+    {
+        return Ok(id);
+    }
+    let r = sqlx::query(
+        "INSERT INTO users (username, password_hash, role, system, created_at) VALUES (?, '!', 'viewer', 1, ?)",
+    )
+    .bind(WARMER_USER)
+    .bind(now_secs() as i64)
+    .execute(pool)
+    .await?;
+    Ok(r.last_insert_rowid())
+}
+
+/// Earlier versions attached the warmer's token to the first admin. Move any
+/// such token to the system account, so it keeps working and no admin owns it.
+async fn move_system_tokens(pool: &SqlitePool) -> sqlx::Result<()> {
+    let (misplaced,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM tokens t JOIN users u ON u.id = t.user_id WHERE t.system = 1 AND u.system = 0",
+    )
+    .fetch_one(pool)
+    .await?;
+    if misplaced == 0 {
+        return Ok(());
+    }
+    let owner = system_user(pool).await?;
+    sqlx::query("UPDATE tokens SET user_id = ? WHERE system = 1")
+        .bind(owner)
+        .execute(pool)
+        .await?;
+    tracing::info!("moved the warmer's token to its own system account");
+    Ok(())
 }
 
 /// Add a column to an existing table unless it's already there.
@@ -288,7 +341,7 @@ pub async fn ensure_admin(
     username: &str,
     password: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
-    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE system = 0")
         .fetch_one(pool)
         .await?;
     if count > 0 {
@@ -337,7 +390,7 @@ pub async fn reset_password_cli(
             totp_enabled = CASE WHEN ? THEN 0 ELSE totp_enabled END,
             totp_secret = CASE WHEN ? THEN NULL ELSE totp_secret END,
             totp_pending = CASE WHEN ? THEN NULL ELSE totp_pending END
-         WHERE username = ?",
+         WHERE username = ? AND system = 0",
     )
     .bind(&hash)
     .bind(disable_2fa)
@@ -347,9 +400,10 @@ pub async fn reset_password_cli(
     .execute(&pool)
     .await?;
     if r.rows_affected() == 0 {
-        let names: Vec<(String,)> = sqlx::query_as("SELECT username FROM users ORDER BY username")
-            .fetch_all(&pool)
-            .await?;
+        let names: Vec<(String,)> =
+            sqlx::query_as("SELECT username FROM users WHERE system = 0 ORDER BY username")
+                .fetch_all(&pool)
+                .await?;
         let names: Vec<String> = names.into_iter().map(|n| n.0).collect();
         anyhow::bail!("no user named {username:?}. Users: {}", names.join(", "));
     }
@@ -520,9 +574,9 @@ impl Backend {
     }
 
     /// The warmer's access token: a system token named "warmer", owned by
-    /// the first active admin and only usable for downloads. It is created
-    /// when first needed and again if it was revoked or stopped working; its
-    /// plain text is never stored.
+    /// the system account and only usable for downloads. It is created when
+    /// first needed and again if it was revoked or stopped working; its plain
+    /// text is never stored.
     pub async fn warmer_token(&self) -> anyhow::Result<String> {
         let mut held = self.warmer_token.lock().await;
         if let Some(t) = held.as_ref()
@@ -533,14 +587,7 @@ impl Backend {
         sqlx::query("DELETE FROM tokens WHERE system = 1 AND name = 'warmer'")
             .execute(&self.db)
             .await?;
-        let owner: Option<(i64,)> = sqlx::query_as(
-            "SELECT id FROM users WHERE role = 'admin' AND disabled = 0 ORDER BY id LIMIT 1",
-        )
-        .fetch_optional(&self.db)
-        .await?;
-        let Some((owner,)) = owner else {
-            anyhow::bail!("there is no active admin account to own the warmer's token");
-        };
+        let owner = system_user(&self.db).await?;
         let (id, token) = self.create_token(owner, "warmer", None).await?;
         sqlx::query("UPDATE tokens SET system = 1 WHERE id = ?")
             .bind(id)
@@ -563,7 +610,7 @@ impl Backend {
 
     async fn user_by_name(&self, name: &str) -> sqlx::Result<Option<User>> {
         let row: Option<UserRow> = sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT {USER_COLUMNS} FROM users WHERE username = ?"
+            "SELECT {USER_COLUMNS} FROM users WHERE username = ? AND system = 0"
         )))
         .bind(name)
         .fetch_optional(&self.db)
@@ -573,7 +620,7 @@ impl Backend {
 
     pub async fn list_users(&self) -> sqlx::Result<Vec<User>> {
         let rows: Vec<UserRow> = sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT {USER_COLUMNS} FROM users ORDER BY username"
+            "SELECT {USER_COLUMNS} FROM users WHERE system = 0 ORDER BY username"
         )))
         .fetch_all(&self.db)
         .await?;
@@ -704,8 +751,12 @@ impl AuthnBackend for Backend {
     }
 
     async fn get_user(&self, id: &UserId<Self>) -> Result<Option<User>, sqlx::Error> {
-        // Disabled accounts lose their sessions on the next request.
-        Ok(self.user_by_id(*id).await?.filter(|u| !u.disabled))
+        // Disabled accounts lose their sessions on the next request. The
+        // system account never has one.
+        Ok(self
+            .user_by_id(*id)
+            .await?
+            .filter(|u| !u.disabled && !u.system))
     }
 }
 
