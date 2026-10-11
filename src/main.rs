@@ -4,13 +4,16 @@ mod admin;
 mod audit;
 mod auth;
 mod config;
+mod egress;
 mod error;
 mod formats;
+mod gitea;
 mod inventory;
 mod jobs;
 mod logbuf;
 mod metrics;
 mod net;
+mod policy;
 mod search;
 mod store;
 mod templates;
@@ -43,6 +46,8 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub admin: Arc<Admin>,
     pub auth: Backend,
+    pub policy: Arc<policy::Policy>,
+    pub gitea: Arc<gitea::Gitea>,
 }
 
 pub fn app(state: AppState, sessions: SqliteSessionStore) -> Router {
@@ -154,7 +159,14 @@ async fn run() -> anyhow::Result<()> {
         .init();
 
     let cfg = Config::from_env()?;
-    let store = Store::new(cfg.data_dir.clone(), cfg.meta_ttl, cfg.offline).await?;
+    let egress = Arc::new(egress::Egress::new(&cfg)?);
+    let store = Store::new(
+        cfg.data_dir.clone(),
+        cfg.meta_ttl,
+        cfg.offline,
+        egress.clone(),
+    )
+    .await?;
     let admin = Admin::new(&cfg.data_dir, logs).await?;
 
     let db = auth::open_db(&cfg.data_dir).await?;
@@ -178,6 +190,7 @@ async fn run() -> anyhow::Result<()> {
     {
         tracing::info!("removed {n} sessions saved in the old format");
     }
+    let policy = policy::Policy::load(&db, cfg.private_access).await?;
     let backend = Backend::new(db).await?;
     tracing::info!(
         data_dir = %store.root().display(),
@@ -209,12 +222,30 @@ async fn run() -> anyhow::Result<()> {
             "GRANARY_CLIENT_AUTH is off: anyone who can reach Granary can download packages through it"
         );
     }
+    if let Some(g) = &cfg.gitea {
+        tracing::info!(
+            "Gitea at {}; its repos and packages are private (private access: {}{})",
+            g.url,
+            policy.mode().as_str(),
+            if policy.locked() {
+                ", set by GRANARY_PRIVATE_ACCESS"
+            } else {
+                ""
+            }
+        );
+    }
     let state = AppState {
+        gitea: Arc::new(gitea::Gitea::new(&egress)?),
         cfg: Arc::new(cfg),
         store: Arc::new(store),
         admin: Arc::new(admin),
         auth: backend,
+        policy: Arc::new(policy),
     };
+    {
+        let st = state.clone();
+        tokio::spawn(async move { st.gitea.check(&st.cfg).await });
+    }
     admin::spawn_scheduler(state.clone(), sessions.clone());
     jobs::spawn_runner(state.clone());
     let service = app(state.clone(), sessions).into_make_service_with_connect_info::<SocketAddr>();

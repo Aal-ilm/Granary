@@ -4,6 +4,7 @@
 mod cache_limit;
 mod git;
 mod git_templates;
+mod gitea;
 mod jobs;
 mod maven;
 mod npm;
@@ -139,6 +140,12 @@ pub struct Opts {
     pub git_max_size: u64,
     pub git_timeout: Duration,
     pub npm_rewrite_tarballs: bool,
+    pub gitea: Option<crate::config::Gitea>,
+    pub extra_ca: Option<PathBuf>,
+    pub private_access: Option<crate::policy::Mode>,
+    /// Hosts allowed past the private-address rule. The default allows the
+    /// local mock upstreams.
+    pub private_hosts: Vec<String>,
 }
 
 /// The shared secret test warmers expect.
@@ -161,6 +168,10 @@ impl Default for Opts {
             git_max_size: 2 << 30,
             git_timeout: Duration::from_secs(600),
             npm_rewrite_tarballs: true,
+            gitea: None,
+            extra_ca: None,
+            private_access: None,
+            private_hosts: vec!["127.0.0.1".into(), "localhost".into()],
         }
     }
 }
@@ -195,6 +206,10 @@ impl Harness {
             git_max_size,
             git_timeout,
             npm_rewrite_tarballs,
+            gitea,
+            extra_ca,
+            private_access,
+            private_hosts,
         } = opts;
         // Bind first so the config can name Granary's own address.
         let own = if serve {
@@ -256,8 +271,19 @@ impl Harness {
             offline,
             npm_rewrite_tarballs,
             cache_limit,
+            gitea: None,
+            extra_ca,
+            private_hosts,
+            private_access,
         };
-        let store = Store::new(data.clone(), meta_ttl, offline).await.unwrap();
+        let mut cfg = cfg;
+        if let Some(g) = gitea {
+            cfg.set_gitea(g);
+        }
+        let egress = Arc::new(crate::egress::Egress::new(&cfg).unwrap());
+        let store = Store::new(data.clone(), meta_ttl, offline, egress.clone())
+            .await
+            .unwrap();
         let admin = Admin::new(&data, LogBuffer::default()).await.unwrap();
         let db = auth::open_db(&data).await.unwrap();
         auth::ensure_admin(&db, "admin", Some("a long test password"))
@@ -265,15 +291,20 @@ impl Harness {
             .unwrap();
         crate::templates::sync_builtins(&db).await.unwrap();
         let sessions = auth::SqliteSessionStore::new(db.clone());
+        let policy = crate::policy::Policy::load(&db, cfg.private_access)
+            .await
+            .unwrap();
         let backend = auth::Backend::new(db).await.unwrap();
         let user = backend.list_users().await.unwrap().remove(0);
         let (_, token) = backend.create_token(user.id, "test", None).await.unwrap();
 
         let state = AppState {
+            gitea: Arc::new(crate::gitea::Gitea::new(&egress).unwrap()),
             cfg: Arc::new(cfg),
             store: Arc::new(store),
             admin: Arc::new(admin),
             auth: backend,
+            policy: Arc::new(policy),
         };
         crate::jobs::spawn_runner(state.clone());
         let app = crate::app(state.clone(), sessions);

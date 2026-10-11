@@ -124,6 +124,10 @@ pub mod tests {
             offline: false,
             npm_rewrite_tarballs: true,
             cache_limit: None,
+            gitea: None,
+            extra_ca: None,
+            private_hosts: Vec::new(),
+            private_access: None,
         }
     }
 }

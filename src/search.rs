@@ -228,6 +228,7 @@ async fn search_upstream(st: &AppState, user: i64, eco: Eco, q: &str) -> AppResu
 
     let client = st.store.passthrough_client();
     let get = |url: String, query: Vec<(&'static str, String)>| async move {
+        st.store.check_url(&url)?;
         let resp = client
             .get(&url)
             .query(&query)

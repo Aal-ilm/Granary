@@ -248,9 +248,102 @@ git config --global url."http://HOST/git/github.com/".insteadOf "https://github.
 git config --global http."http://HOST/".extraHeader "Authorization: Basic $(printf 'token:%s' TOKEN | base64)"
 ```
 
-**Limits.** Submodules and Git LFS objects are not fetched, only public
-repos can be cached (Granary sends no credentials upstream), and repos must
-live at `host/owner/repo` (GitLab subgroups aren't supported yet).
+**Limits.** Submodules and Git LFS objects are not fetched, repos from
+public hosts must be public (Granary sends credentials only to
+[Gitea](#gitea)), and repos must live at `host/owner/repo` (GitLab
+subgroups aren't supported yet).
+
+## Gitea
+
+Granary can use a self-hosted [Gitea](https://about.gitea.com) as a private
+upstream. Your private Gitea repos then come through Granary next to the
+public ones, under the same `/git/` URLs. Gitea does the hosting; Granary
+does the caching. Everything that comes from Gitea is **private**: who may
+read it is decided by [private access](#private-access).
+
+**Setup.** Create an access token in Gitea (**Settings → Applications**)
+with read-only scopes: `read:repository` and `read:package`, plus
+`read:user` if you want the System page to show whose token it is. Save it
+in a file, readable only by Granary's user (UID 10001 in the image), and
+give Granary its address and the file:
+
+```yaml
+services:
+  granary:
+    volumes:
+      - granary-data:/data
+      - ./secrets/gitea-token:/run/secrets/gitea-token:ro
+      # Only if Gitea's certificate comes from your own CA:
+      - ./certs/internal-ca.pem:/etc/granary/internal-ca.pem:ro
+    environment:
+      GRANARY_GITEA_URL: "https://gitea.skynet.core"
+      GRANARY_GITEA_TOKEN_FILE: "/run/secrets/gitea-token"
+      GRANARY_EXTRA_CA: "/etc/granary/internal-ca.pem"
+```
+
+`GRANARY_GITEA_URL` is `https://` plus a host name and an optional port;
+Gitea served under a sub-path isn't supported. The token is read once at
+startup and never shown in the web UI, API responses, logs or job output.
+**System → Gitea** shows the address, whether Granary can connect, Gitea's
+version and the token's owner, with a **Test connection** button.
+
+**Private repos.** Gitea's host joins the git allowlist on its own, so
+`make use-granary TOOLS=git` points it at Granary like GitHub:
+
+```sh
+git clone http://HOST/git/gitea.skynet.core/acme/firmware.git
+```
+
+Granary fetches from Gitea with its token. git sends the token only for
+URLs under `GRANARY_GITEA_URL`, never follows redirects, and gets the token
+through its environment rather than its command line, so it never reaches
+another host or another process's view. Private repos work everywhere
+public ones do: cloning, **Browse → Git**, and [templates from
+repos](#templates-from-repos). They carry a **Private** badge.
+
+### Private access
+
+Who may read private content is set in one place, and applies to every
+way of reaching it: git clones and package downloads, the Git and Browse
+pages, search, templates and their starters, jobs and their logs, and the
+Overview's counts. To anyone else, private content doesn't exist: they get
+a 404, and it is left out of lists and counts, so not even its name shows.
+Someone who isn't signed in and has no token is asked for one (a 401),
+whether or not the repo exists.
+
+| Mode | Who can read private content |
+|---|---|
+| `scoped` (default) | Admins, plus users and access tokens given **private access** |
+| `signed-in` | Anyone signed in, and any valid access token |
+
+In `scoped` mode, admins give a user private access with the checkbox on
+the **Users** page. Tokens need it too: tick **Private access** when
+creating a token. Only someone who has private access can create such a
+token, and a token never has more access than its owner. An admin's
+existing tokens can't read private content until they're made again with
+the box ticked, so a forgotten CI token doesn't gain access when Gitea is
+connected.
+
+**Changing the mode.** Admins choose it under **System → Private access**.
+When `GRANARY_PRIVATE_ACCESS` is set, it wins: the System page shows the
+mode as locked by the environment. Neither mode stores anything of its
+own, so switching takes effect at once and needs no migration; changes are
+recorded in the audit log.
+
+**The warmer.** The warmer's own token never reads private content. Each
+warm job gets a token of its own instead, acting for whoever started the
+job: the warmer reads private content during that job only if they may,
+and the token is deleted when the job ends. A scheduled warm acts for the
+admin who set the schedule, checked again each time it runs.
+
+### Extra CA
+
+Internal services often use certificates from your own CA. Point
+`GRANARY_EXTRA_CA` at a PEM file of extra root certificates and Granary
+trusts them for everything it fetches over HTTPS, Gitea and the public
+upstreams alike, next to the system's own roots. git gets a bundle of both
+(written to `state/ca-bundle.pem` in the data directory), so public hosts
+keep working. Mount the file read-only, as in the example above.
 
 ## Getting packages ahead of time
 
@@ -530,7 +623,8 @@ recorded in the audit log; viewers can see the job history.
   (`authorization: Bearer gran_…`); the System page has a ready-made scrape
   config.
 
-Granary never contacts anything except the upstream registries it caches.
+Granary never contacts anything except the upstream registries it caches
+(and Gitea, when you connect one).
 There are no update checks, analytics, fonts or avatars from outside services.
 
 ![System page in dark mode](docs/system-dark.png)
@@ -588,13 +682,19 @@ All settings are environment variables.
 | `GRANARY_GIT_HOSTS` | `github.com,gitlab.com,codeberg.org` | Hosts git repos may be cached from (HTTPS only; no IP addresses or localhost) |
 | `GRANARY_GIT_MAX_SIZE` | `2GB` | Largest a cached git repo may grow; bigger clones are stopped and deleted |
 | `GRANARY_GIT_TIMEOUT_MINS` | `10` | Longest a git clone or refresh may run |
+| `GRANARY_GITEA_URL` | *(none)* | A self-hosted Gitea used as a private upstream, e.g. `https://gitea.skynet.core` (see [Gitea](#gitea)) |
+| `GRANARY_GITEA_TOKEN_FILE` | *(none)* | File holding a Gitea access token with read-only repository and package scopes. Needed with `GRANARY_GITEA_URL` |
+| `GRANARY_PRIVATE_ACCESS` | *(set on the System page)* | `scoped` or `signed-in`: who may read private content (see [Private access](#private-access)). When set, the System page can't change it |
+| `GRANARY_EXTRA_CA` | *(none)* | PEM file of extra root certificates trusted for every HTTPS upstream, e.g. an internal CA (see [Extra CA](#extra-ca)) |
+| `GRANARY_PRIVATE_HOSTS` | *(none)* | Comma-separated host names or IP addresses Granary may connect to although they're private addresses, besides the Gitea host (see [Private addresses](#private-addresses)) |
 | `GRANARY_SEARCH` | `on` | `off`: **Get packages** never sends search text to a search host and looks packages up by exact name only |
 | `GRANARY_CARGO_API` | `https://crates.io/api/v1` | crates.io web API, used only for search |
 | `GRANARY_MAVEN_SEARCH` | `https://search.maven.org/solrsearch/select` | Maven Central search, used only for search |
 | `RUST_LOG` | `granary=info` | Log level (`granary=debug` logs every cache hit) |
 
 Granary honors the standard `HTTPS_PROXY` / `NO_PROXY` variables for its own
-outbound requests, and reads extra trusted CAs from `SSL_CERT_FILE`.
+outbound requests, and reads extra trusted CAs from `SSL_CERT_FILE` (or use
+`GRANARY_EXTRA_CA`, which git honors too).
 
 ### Offline mode
 
@@ -631,6 +731,26 @@ offline mode or without internet access. That includes Yarn 1, npm with
 `GRANARY_NPM_UPSTREAM` is not registry.npmjs.org (the URLs then name that
 registry, which npm doesn't map). Leave it on unless portable lockfiles
 matter more than that.
+
+### Private addresses
+
+Upstreams are on the internet, so Granary refuses to connect to loopback,
+private, link-local and other non-public addresses (such as `127.0.0.1`,
+`10.0.0.0/8`, `192.168.0.0/16`, `169.254.169.254` and `fd00::/8`). That
+keeps an upstream name, a redirect or a DNS answer from steering Granary
+into your local network. A refused connection fails with a message naming
+the host and address.
+
+Two kinds of host are let through: the Gitea host, and those listed in
+`GRANARY_PRIVATE_HOSTS`, for example an internal npm or Maven mirror set as
+an upstream. Hosts named in `HTTPS_PROXY` and friends are let through too,
+since every connection goes to them; with a proxy, the proxy resolves the
+upstream names, so the rule then only checks IP addresses written in URLs.
+
+Each connection goes to exactly the addresses that were checked: Granary's
+HTTP clients resolve names through the rule, and git gets the checked
+addresses with `http.curloptResolve`, so DNS can't change between the check
+and the connection. Every redirect is checked the same way.
 
 ## How it works
 
@@ -681,12 +801,27 @@ cached.
 - **Read-only.** There is no `cargo publish` / `npm publish` / `twine upload`
   / `mvn deploy` yet; npm and Maven write requests are refused, and so are
   git pushes.
-- **Git: public repos only, no submodules or LFS.** See [Git repos](#git-repos).
+- **Git: public repos only (and private ones from Gitea), no submodules or
+  LFS.** See [Git repos](#git-repos) and [Gitea](#gitea).
 - **No single sign-on yet.** Accounts live in Granary itself; LDAP and OpenID
   Connect aren't supported. Granary serves plain HTTP, so put it behind a
   reverse proxy with TLS if it's reachable from untrusted networks.
 - **Single instance.** Granary stores everything on one local volume and isn't
   designed for running several replicas against shared storage.
+
+## Upgrade notes
+
+**Upgrading from 0.9:**
+
+- **Private addresses are refused.** Granary no longer connects to
+  upstreams at loopback, private or link-local addresses (see [Private
+  addresses](#private-addresses)). If an upstream setting
+  (`GRANARY_NPM_UPSTREAM`, `GRANARY_MAVEN_UPSTREAM` and so on) points at an
+  internal mirror, add its host to `GRANARY_PRIVATE_HOSTS`; the System
+  page's upstream check shows any host that is refused.
+- **Gitea and private access are new.** Nothing changes until
+  `GRANARY_GITEA_URL` is set. The database gains a few columns on the
+  first start; no data is changed.
 
 ## Roadmap
 

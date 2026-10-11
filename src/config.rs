@@ -77,6 +77,64 @@ pub struct Config {
     /// Byte budget for the cache (files plus metadata). Shown on the
     /// Overview gauges; warm jobs stop before going past it.
     pub cache_limit: Option<u64>,
+    /// A self-hosted Gitea used as a private upstream.
+    pub gitea: Option<Gitea>,
+    /// Extra root certificates (PEM) trusted for every HTTPS upstream.
+    pub extra_ca: Option<PathBuf>,
+    /// Internal hosts Granary may connect to although they resolve to a
+    /// private address (besides the Gitea host).
+    pub private_hosts: Vec<String>,
+    /// Who may read private content, when the environment decides it. When
+    /// `None`, admins choose on the System page.
+    pub private_access: Option<crate::policy::Mode>,
+}
+
+/// The Gitea connection.
+#[derive(Clone, Debug)]
+pub struct Gitea {
+    /// `https://host[:port]`, without a trailing slash.
+    pub url: String,
+    /// `host[:port]`, lowercase, as it appears in git paths.
+    pub host: String,
+    pub token: Secret,
+}
+
+impl Gitea {
+    /// The host name alone, without a port.
+    pub fn hostname(&self) -> &str {
+        host_without_port(&self.host)
+    }
+}
+
+/// A value that must never be printed: its `Debug` output is a placeholder
+/// and it has no `Display` or `Serialize`.
+#[derive(Clone)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(hidden)")
+    }
+}
+
+/// `host` from `host:port` (and `[v6]` from `[v6]:port`).
+pub fn host_without_port(authority: &str) -> &str {
+    if authority.starts_with('[') {
+        return authority
+            .split_once(']')
+            .map_or(authority, |(h, _)| &authority[..h.len() + 1]);
+    }
+    authority.split(':').next().unwrap_or(authority)
 }
 
 /// An IP network such as `10.0.0.0/8` or `fd00::/8` (a bare address is a /32 or /128).
@@ -169,6 +227,65 @@ pub fn parse_git_hosts(raw: &str) -> anyhow::Result<Vec<String>> {
     Ok(hosts)
 }
 
+/// `GRANARY_GITEA_URL`: `https://host` or `https://host:port`, nothing else.
+pub fn parse_gitea_url(raw: &str) -> anyhow::Result<(String, String)> {
+    let url = raw.trim().trim_end_matches('/');
+    let bad = || {
+        anyhow::anyhow!(
+            "GRANARY_GITEA_URL must look like https://gitea.example.com (https, a host name and an optional port, no path), not {raw:?}"
+        )
+    };
+    let authority = url.strip_prefix("https://").ok_or_else(bad)?;
+    if authority.is_empty() || authority.contains(['/', '?', '#', '@', '[', ']']) {
+        return Err(bad());
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    let host_ok = !host.is_empty()
+        && host.split('.').all(|l| {
+            !l.is_empty()
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    if !host_ok || port.is_some_and(|p| p.parse::<u16>().map_or(true, |p| p == 0)) {
+        return Err(bad());
+    }
+    let authority = authority.to_ascii_lowercase();
+    Ok((format!("https://{authority}"), authority))
+}
+
+/// `GRANARY_PRIVATE_HOSTS`: host names or IP addresses, without ports.
+pub fn parse_private_hosts(raw: &str) -> anyhow::Result<Vec<String>> {
+    let mut hosts = Vec::new();
+    for h in raw
+        .split([',', ' '])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let h = h.to_ascii_lowercase();
+        let bare = h.trim_start_matches('[').trim_end_matches(']');
+        let ok = bare.parse::<IpAddr>().is_ok()
+            || bare.split('.').all(|l| {
+                !l.is_empty()
+                    && !l.starts_with('-')
+                    && !l.ends_with('-')
+                    && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            });
+        if !ok {
+            anyhow::bail!(
+                "GRANARY_PRIVATE_HOSTS: {h:?} is not a host name or IP address (no ports, paths or schemes)"
+            );
+        }
+        if !hosts.iter().any(|x| x == bare) {
+            hosts.push(bare.to_string());
+        }
+    }
+    Ok(hosts)
+}
+
 /// A size such as `20GB`, `1.5 TB`, `500MiB` or a plain number of bytes.
 /// KB, MB, GB and TB are powers of 1024, as the web UI shows sizes.
 pub fn parse_size(s: &str) -> Option<u64> {
@@ -218,7 +335,7 @@ impl Config {
             .as_deref()
             .is_some_and(|u| u.starts_with("https://"));
 
-        Ok(Self {
+        Self {
             listen: var("GRANARY_LISTEN", "0.0.0.0:8080"),
             data_dir: var("GRANARY_DATA_DIR", "./data").into(),
             public_url,
@@ -324,7 +441,65 @@ impl Config {
                 .parse::<u32>()
                 .context("GRANARY_AUDIT_DAYS must be a whole number of days")?
                 .clamp(1, 3650),
-        })
+            gitea: None,
+            extra_ca: Some(var("GRANARY_EXTRA_CA", ""))
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            private_hosts: parse_private_hosts(&var("GRANARY_PRIVATE_HOSTS", ""))?,
+            private_access: match var("GRANARY_PRIVATE_ACCESS", "").as_str() {
+                "" => None,
+                s => Some(crate::policy::Mode::parse(s).with_context(|| {
+                    format!("GRANARY_PRIVATE_ACCESS must be \"signed-in\" or \"scoped\", not {s:?}")
+                })?),
+            },
+        }
+        .with_gitea_from_env()
+    }
+
+    /// Read the Gitea settings; its host joins the git allowlist.
+    fn with_gitea_from_env(mut self) -> anyhow::Result<Self> {
+        let url = var("GRANARY_GITEA_URL", "");
+        let token_file = var("GRANARY_GITEA_TOKEN_FILE", "");
+        if url.is_empty() {
+            if !token_file.is_empty() {
+                anyhow::bail!("GRANARY_GITEA_TOKEN_FILE is set but GRANARY_GITEA_URL is not");
+            }
+            return Ok(self);
+        }
+        let (url, host) = parse_gitea_url(&url)?;
+        if token_file.is_empty() {
+            anyhow::bail!(
+                "GRANARY_GITEA_URL is set, so GRANARY_GITEA_TOKEN_FILE must name a file holding a Gitea access token"
+            );
+        }
+        let token = std::fs::read_to_string(&token_file)
+            .with_context(|| format!("GRANARY_GITEA_TOKEN_FILE: could not read {token_file}"))?
+            .trim()
+            .to_string();
+        if token.is_empty() || token.contains(char::is_whitespace) {
+            anyhow::bail!("GRANARY_GITEA_TOKEN_FILE: {token_file} must hold a single access token");
+        }
+        self.set_gitea(Gitea {
+            url,
+            host,
+            token: Secret::new(token),
+        });
+        Ok(self)
+    }
+
+    /// Connect to Gitea: its host joins the git allowlist.
+    pub fn set_gitea(&mut self, gitea: Gitea) {
+        if !self.git_hosts.contains(&gitea.host) {
+            self.git_hosts.push(gitea.host.clone());
+        }
+        self.gitea = Some(gitea);
+    }
+
+    /// Whether a git host is the Gitea host, whose content is private.
+    pub fn is_gitea_host(&self, host: &str) -> bool {
+        self.gitea
+            .as_ref()
+            .is_some_and(|g| g.host.eq_ignore_ascii_case(host))
     }
 }
 
@@ -351,6 +526,42 @@ mod tests {
         ] {
             assert!(parse_git_hosts(bad).is_err(), "{bad:?} should be refused");
         }
+    }
+
+    #[test]
+    fn gitea_urls() {
+        assert_eq!(
+            parse_gitea_url("https://Gitea.Skynet.Core/").unwrap(),
+            (
+                "https://gitea.skynet.core".to_string(),
+                "gitea.skynet.core".to_string()
+            )
+        );
+        assert_eq!(
+            parse_gitea_url("https://git.lan:3000").unwrap().1,
+            "git.lan:3000"
+        );
+        for bad in [
+            "http://gitea.lan",
+            "gitea.lan",
+            "https://gitea.lan/sub",
+            "https://user@gitea.lan",
+            "https://gitea.lan:0",
+            "https://gitea.lan:x",
+            "https://[::1]",
+            "https://",
+        ] {
+            assert!(parse_gitea_url(bad).is_err(), "{bad:?} should be refused");
+        }
+        assert_eq!(host_without_port("git.lan:3000"), "git.lan");
+        assert_eq!(host_without_port("[::1]:3000"), "[::1]");
+        assert_eq!(
+            parse_private_hosts("Nexus.lan, 10.0.0.5,[fd00::1]").unwrap(),
+            vec!["nexus.lan", "10.0.0.5", "fd00::1"]
+        );
+        assert!(parse_private_hosts("nexus.lan:8081").is_err());
+        assert!(parse_private_hosts("https://nexus.lan").is_err());
+        assert_eq!(format!("{:?}", Secret::new("s3cret")), "Secret(hidden)");
     }
 
     #[test]

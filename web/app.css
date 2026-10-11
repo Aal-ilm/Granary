@@ -1178,6 +1178,7 @@ td.desc { color: var(--muted); max-width: 420px; }
   white-space: nowrap;
 }
 .kind.custom { color: var(--link); border-color: var(--link); }
+.kind.private { color: var(--ink); border-color: var(--ink); }
 .tag {
   font-size: 12px;
   padding: 1px 7px;

@@ -69,8 +69,24 @@ impl From<std::io::Error> for AppError {
 
 impl From<reqwest::Error> for AppError {
     fn from(e: reqwest::Error) -> Self {
-        Self::bad_gateway(format!("upstream error: {e}"))
+        Self::bad_gateway(format!("upstream error: {}", error_chain(&e)))
     }
+}
+
+/// An error with its causes, which say what actually went wrong (such as a
+/// certificate problem, or an address the private-address rule refused).
+pub fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(s) = source {
+        let text = s.to_string();
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = s.source();
+    }
+    out
 }
 
 pub type AppResult<T> = Result<T, AppError>;

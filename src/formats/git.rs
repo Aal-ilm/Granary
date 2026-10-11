@@ -18,7 +18,13 @@
 //! in `GRANARY_GIT_HOSTS` are contacted, git never follows redirects, hooks
 //! are off, and clones that grow past `GRANARY_GIT_MAX_SIZE` or run longer
 //! than `GRANARY_GIT_TIMEOUT_MINS` are stopped and deleted. Submodules and
-//! LFS objects are not fetched, and only public repos can be cached.
+//! LFS objects are not fetched. Every fetch is pinned to the addresses that
+//! passed the private-address rule (see `egress`).
+//!
+//! Repos on public hosts must be public. The Gitea host (`GRANARY_GITEA_URL`)
+//! joins the allowlist on its own: Granary fetches from it with the Gitea
+//! token, which git sends only for URLs under the Gitea address, and its
+//! repos are private, so serving them follows the access policy.
 
 use std::{
     path::{Path, PathBuf},
@@ -47,6 +53,7 @@ use crate::{
     AppState,
     config::Config,
     error::{AppError, AppResult},
+    policy::{Principal, Resource},
     store::{dir_size, now_secs},
 };
 
@@ -152,10 +159,19 @@ impl RepoId {
     }
 
     pub fn upstream(&self, cfg: &Config) -> String {
+        if let Some(g) = cfg.gitea.as_ref().filter(|g| g.host == self.host) {
+            return format!("{}/{}/{}.git", g.url, self.owner, self.name);
+        }
         match &cfg.git_upstream_override {
             Some(base) => format!("{base}/{}", self.rel()),
             None => format!("https://{}/{}/{}.git", self.host, self.owner, self.name),
         }
+    }
+
+    /// The access policy's description of this repo, when it is private.
+    pub fn resource(&self, cfg: &Config) -> Option<Resource> {
+        cfg.is_gitea_host(&self.host)
+            .then(|| Resource::gitea_repo(&self.owner, &self.name))
     }
 
     fn lock_key(&self) -> String {
@@ -176,6 +192,10 @@ pub struct RepoInfo {
     pub default_branch: Option<String>,
     /// Why the last refresh failed, if it did.
     pub last_error: Option<String>,
+    /// Fetched from Gitea, so it stays private even if the Gitea settings
+    /// change later.
+    #[serde(default)]
+    pub private: bool,
 }
 
 async fn read_info(st: &AppState, id: &RepoId) -> Option<RepoInfo> {
@@ -236,6 +256,62 @@ pub fn git(st: &AppState) -> Command {
     cmd
 }
 
+/// A git command that fetches from `id`'s upstream: pinned to the addresses
+/// that passed the private-address rule, trusting the extra CA, and for the
+/// Gitea host, sending the token. The token goes in through the environment
+/// (not the command line, where other processes could see it) and git sends
+/// it only for URLs under the Gitea address.
+async fn upstream_git(st: &AppState, id: &RepoId) -> AppResult<Command> {
+    let upstream = id.upstream(&st.cfg);
+    let settings = st
+        .store
+        .egress()
+        .git_settings(&upstream)
+        .await
+        .map_err(|e| AppError::bad_gateway(format!("can't fetch {}: {e}", id.display())))?;
+    let mut cmd = git(st);
+    for s in settings {
+        cmd.arg("-c").arg(s);
+    }
+    if let Some(g) = st.cfg.gitea.as_ref().filter(|g| g.host == id.host) {
+        cmd.env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", format!("http.{}/.extraHeader", g.url))
+            .env("GIT_CONFIG_VALUE_0", gitea_auth_header(g));
+    }
+    Ok(cmd)
+}
+
+/// The header git sends to Gitea: Basic auth with the token as the password.
+fn gitea_auth_header(g: &crate::config::Gitea) -> String {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    format!(
+        "Authorization: Basic {}",
+        STANDARD.encode(format!("granary:{}", g.token.expose()))
+    )
+}
+
+/// The forms the Gitea token could take in git's output, to hide them.
+fn secrets(cfg: &Config) -> Vec<String> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    cfg.gitea
+        .iter()
+        .flat_map(|g| {
+            [
+                g.token.expose().to_string(),
+                STANDARD.encode(format!("granary:{}", g.token.expose())),
+            ]
+        })
+        .collect()
+}
+
+fn hide(line: &str, secrets: &[String]) -> String {
+    let mut out = line.to_string();
+    for s in secrets.iter().filter(|s| !s.is_empty()) {
+        out = out.replace(s.as_str(), "[hidden]");
+    }
+    out
+}
+
 /// Why a git run failed.
 #[derive(Debug)]
 pub enum GitError {
@@ -260,18 +336,14 @@ async fn run_watched(
         .map_err(GitError::Io)?;
     let mut stderr = child.stderr.take().unwrap();
     let sink = lines.cloned();
+    let secrets = secrets(&st.cfg);
     // git rewrites progress lines with \r; keep each line's final state.
     let reader = tokio::spawn(async move {
         let mut tail: Vec<String> = Vec::new();
         let mut buf = Vec::new();
         let mut chunk = [0u8; 8192];
         let emit = |line: &str, tail: &mut Vec<String>| {
-            let line = line
-                .rsplit('\r')
-                .next()
-                .unwrap_or("")
-                .trim_end()
-                .to_string();
+            let line = hide(line.rsplit('\r').next().unwrap_or("").trim_end(), &secrets);
             if line.is_empty() {
                 return;
             }
@@ -370,13 +442,12 @@ fn to_app_error(id: &RepoId, e: GitError, cfg: &Config) -> AppError {
                 || lower.contains("authentication")
                 || lower.contains(" 404")
             {
-                AppError::new(
-                    StatusCode::NOT_FOUND,
-                    format!(
-                        "{} was not found upstream, or is private (only public repos can be cached)",
-                        id.display()
-                    ),
-                )
+                let why = if cfg.is_gitea_host(&id.host) {
+                    "was not found on Gitea, or Granary's Gitea token can't read it"
+                } else {
+                    "was not found upstream, or is private (only public repos can be cached)"
+                };
+                AppError::new(StatusCode::NOT_FOUND, format!("{} {why}", id.display()))
             } else {
                 let last = out.lines().last().unwrap_or("git failed").to_string();
                 AppError::bad_gateway(format!("fetching {} failed: {last}", id.display()))
@@ -419,7 +490,7 @@ async fn clone_locked(
     let tmp = st.store.root().join("tmp").join(format!("git-{nanos}"));
     let upstream = id.upstream(&st.cfg);
     tracing::info!("git: cloning {upstream}");
-    let mut cmd = git(st);
+    let mut cmd = upstream_git(st, id).await?;
     cmd.args(["clone", "--mirror", "--progress", "--", &upstream])
         .arg(&tmp);
     let result = run_watched(st, cmd, &tmp, lines).await;
@@ -440,6 +511,7 @@ async fn clone_locked(
         refreshed_at: now,
         default_branch: default_branch(st, &tmp).await,
         last_error: None,
+        private: id.resource(&st.cfg).is_some(),
     };
     tokio::fs::rename(&tmp, &dir).await?;
     write_info(st, id, &info).await?;
@@ -478,7 +550,7 @@ async fn refresh_locked(
     })
     .await
     .unwrap_or(0);
-    let mut cmd = git(st);
+    let mut cmd = upstream_git(st, id).await?;
     cmd.arg("-C")
         .arg(&dir)
         .args(["remote", "update", "--prune"]);
@@ -727,6 +799,13 @@ pub struct Cached {
     pub size: u64,
 }
 
+/// The access policy's description of a cached repo, when it is private:
+/// fetched from Gitea, or on the Gitea host now.
+pub fn cached_resource(cfg: &Config, c: &Cached) -> Option<Resource> {
+    (c.info.private || cfg.is_gitea_host(&c.id.host))
+        .then(|| Resource::gitea_repo(&c.id.owner, &c.id.name))
+}
+
 /// Every cached repo (blocking; run on a blocking thread).
 pub fn list(root: &Path) -> Vec<Cached> {
     let mut out = Vec::new();
@@ -770,6 +849,7 @@ pub fn list(root: &Path) -> Vec<Cached> {
 
 async fn handle(
     State(st): State<AppState>,
+    who: Principal,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -815,6 +895,16 @@ async fn handle(
     };
     let id = RepoId::new(&st.cfg, host, owner, repo)
         .map_err(|e| AppError::new(StatusCode::NOT_FOUND, e))?;
+    // Private repos: ask who's there before anything else, whether or not
+    // the repo exists, so the answer never tells an outsider a name.
+    if let Some(r) = id.resource(&st.cfg)
+        && !st.policy.can_read_private(&who, &r)
+    {
+        if who.is_anonymous() {
+            return Ok(crate::auth::challenge(&st, &headers, uri.path()));
+        }
+        return Err(AppError::not_found());
+    }
     ensure(&st, &id, refresh, None).await?;
 
     let mut cmd = git(&st);

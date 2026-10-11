@@ -9,7 +9,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,6 +21,7 @@ use crate::{
     error::{AppError, AppResult},
     inventory::{self, Asset, REPOS},
     net::ClientIp,
+    policy::{Mode, Principal},
     store::{dir_size, now_secs},
     util::base_url,
 };
@@ -40,6 +41,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/tasks/{id}/run", post(task_run))
         .route("/api/system", get(system))
         .route("/api/system/check", post(system_check))
+        .route("/api/system/gitea/check", post(gitea_check))
+        .route("/api/system/private-access", put(set_private_access))
         .route("/api/logs", get(logs))
 }
 
@@ -94,14 +97,23 @@ pub(crate) async fn usage(st: &AppState, inv: &[Asset]) -> Vec<RepoUsage> {
         .collect()
 }
 
-async fn overview(State(st): State<AppState>) -> Json<Value> {
+async fn overview(State(st): State<AppState>, who: Principal) -> Json<Value> {
     let inv = st.admin.inventory(&st.store).await;
     let mut repos = usage(&st, &inv).await;
     // Cached git repos get their own gauge and count toward the budget.
+    // Private repos someone can't read are left out of their counts; their
+    // bytes still count toward the cache budget.
     let root = crate::formats::git::git_root(&st);
     let git = tokio::task::spawn_blocking(move || crate::formats::git::list(&root))
         .await
         .unwrap_or_default();
+    let (git, hidden): (Vec<_>, Vec<_>) = git.into_iter().partition(|r| {
+        st.policy.can_read(
+            &who,
+            crate::formats::git::cached_resource(&st.cfg, r).as_ref(),
+        )
+    });
+    let hidden_size: u64 = hidden.iter().map(|r| r.size).sum();
     repos.push(RepoUsage {
         repo: "git",
         packages: git.len(),
@@ -124,7 +136,7 @@ async fn overview(State(st): State<AppState>) -> Json<Value> {
     };
     let health = st.admin.health.lock().unwrap().clone();
 
-    let cache_used: u64 = repos.iter().map(|r| r.size + r.meta_size).sum();
+    let cache_used: u64 = repos.iter().map(|r| r.size + r.meta_size).sum::<u64>() + hidden_size;
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": now_secs().saturating_sub(st.admin.started_at),
@@ -728,8 +740,65 @@ async fn system(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
             {"key": "GRANARY_CARGO_API", "label": "Cargo search", "value": cfg.cargo_api},
             {"key": "GRANARY_MAVEN_SEARCH", "label": "Maven search", "value": cfg.maven_search},
             {"key": "GRANARY_MAVEN_UPSTREAM", "label": "Maven repository", "value": cfg.maven_upstream},
+            {"key": "GRANARY_GITEA_URL", "label": "Gitea", "value": cfg.gitea.as_ref().map_or("Not connected", |g| g.url.as_str())},
+            {"key": "GRANARY_PRIVATE_ACCESS", "label": "Private access", "value": match cfg.private_access {
+                Some(m) => format!("{}: {}", m.as_str(), m.describe()),
+                None => "Not set (chosen on this page)".to_string(),
+            }},
+            {"key": "GRANARY_PRIVATE_HOSTS", "label": "Internal hosts allowed", "value": if cfg.private_hosts.is_empty() { "None besides the Gitea host".to_string() } else { cfg.private_hosts.join(", ") }},
+            {"key": "GRANARY_EXTRA_CA", "label": "Extra root certificates", "value": cfg.extra_ca.as_ref().map_or_else(|| "None".to_string(), |p| p.display().to_string())},
         ],
+        "gitea": cfg.gitea.as_ref().map(|g| json!({
+            "url": g.url,
+            "host": g.host,
+            "status": st.gitea.status(),
+        })),
+        "private_access": private_access_json(&st),
     }))
+}
+
+fn private_access_json(st: &AppState) -> Value {
+    json!({
+        "mode": st.policy.mode().as_str(),
+        "locked": st.policy.locked(),
+        "modes": Mode::ALL.iter().map(|m| json!({"id": m.as_str(), "label": m.describe()})).collect::<Vec<_>>(),
+    })
+}
+
+/// "Test connection" for Gitea.
+async fn gitea_check(State(st): State<AppState>, auth: AuthSession) -> AppResult<Json<Value>> {
+    require_admin(&auth)?;
+    let status = st.gitea.check(&st.cfg).await.ok_or_else(|| {
+        AppError::new(
+            StatusCode::CONFLICT,
+            "Gitea is not set up (GRANARY_GITEA_URL)",
+        )
+    })?;
+    Ok(Json(json!({ "status": status })))
+}
+
+#[derive(Deserialize)]
+struct PrivateAccessBody {
+    mode: String,
+}
+
+/// Change who may read private content, unless the environment decides.
+async fn set_private_access(
+    State(st): State<AppState>,
+    auth: AuthSession,
+    Extension(ip): Extension<ClientIp>,
+    Json(body): Json<PrivateAccessBody>,
+) -> AppResult<Json<Value>> {
+    let admin = require_admin(&auth)?.username.clone();
+    let mode = Mode::parse(&body.mode)
+        .ok_or_else(|| AppError::bad_request("mode must be signed-in or scoped"))?;
+    st.policy
+        .set_mode(&st.auth.db, mode)
+        .await
+        .map_err(|e| AppError::new(StatusCode::CONFLICT, e))?;
+    tracing::info!("{admin} set private access to {}", mode.as_str());
+    audit(&st, &admin, "system.private_access", mode.as_str(), ip).await;
+    Ok(Json(private_access_json(&st)))
 }
 
 async fn system_check(State(st): State<AppState>, auth: AuthSession) -> AppResult<Json<Value>> {

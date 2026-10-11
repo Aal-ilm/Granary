@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    AuthSession, Credentials, Role, User, check_password_policy, current_user, hash_password,
-    random_password, require_admin, totp_for, valid_username,
+    AuthSession, Credentials, LocalPassword, LoginAttempt, LoginOutcome, LoginProvider, Role, User,
+    check_password_policy, current_user, hash_password, random_password, require_admin, totp_for,
+    valid_username,
 };
 use crate::{
     AppState,
@@ -137,34 +138,29 @@ async fn login(
         ));
     }
 
-    let wrong = || AppError::new(StatusCode::UNAUTHORIZED, "wrong username or password");
-
-    let creds = Credentials {
+    let attempt = LoginAttempt {
         username: username.clone(),
         password: body.password,
+        code: body.code,
     };
-    let user = match auth.authenticate(creds).await {
-        Ok(Some(u)) => u,
-        Ok(None) => {
+    let user = match LocalPassword
+        .verify(&st.auth, attempt)
+        .await
+        .map_err(db_err)?
+    {
+        LoginOutcome::Accepted(u) => u,
+        // Password was right; ask for the second factor.
+        LoginOutcome::SecondFactor => return Ok(Json(json!({ "status": "totp_required" }))),
+        LoginOutcome::Rejected => {
             limiter.record_failure(&username, ip);
             tracing::warn!("failed sign-in for {username:?} from {ip}");
             audit(&st, &username, "auth.login", &username, ip, false).await;
-            return Err(wrong());
-        }
-        Err(e) => {
             return Err(AppError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                e.to_string(),
+                StatusCode::UNAUTHORIZED,
+                "wrong username or password",
             ));
         }
-    };
-
-    if user.totp_enabled {
-        let Some(code) = body.code.filter(|c| !c.trim().is_empty()) else {
-            // Password was right; ask for the second factor.
-            return Ok(Json(json!({ "status": "totp_required" })));
-        };
-        if !st.auth.check_totp(&user, &code).await.map_err(db_err)? {
+        LoginOutcome::WrongCode(user) => {
             limiter.record_failure(&username, ip);
             tracing::warn!("failed two-factor code for {:?} from {ip}", user.username);
             audit(
@@ -181,7 +177,7 @@ async fn login(
                 "that code didn't work. Wait for a new one and try again",
             ));
         }
-    }
+    };
 
     auth.login(&user)
         .await
@@ -215,10 +211,16 @@ async fn logout(
 
 async fn me(State(st): State<AppState>, auth: AuthSession) -> AppResult<Json<Value>> {
     let user = current_user(&auth)?;
+    let me = crate::policy::Principal::from_session(&auth);
     Ok(Json(json!({
         "user": user,
         "client_auth": st.cfg.client_auth,
         "offline": st.cfg.offline,
+        "private": {
+            "gitea": st.cfg.gitea.is_some(),
+            "mode": st.policy.mode().as_str(),
+            "can_read": st.policy.has_private_access(&me),
+        },
         "min_password_length": super::MIN_PASSWORD_LEN,
     })))
 }
@@ -409,6 +411,8 @@ struct TokenRow {
     expires_at: Option<i64>,
     /// Created by Granary itself (the warmer's token).
     system: bool,
+    /// May read private content when private access is `scoped`.
+    private_access: bool,
 }
 
 #[derive(Deserialize)]
@@ -423,8 +427,8 @@ async fn list_tokens(
 ) -> AppResult<Json<Value>> {
     let user = current_user(&auth)?;
     let all = q.all.unwrap_or(false) && user.role == Role::Admin;
-    let sql = "SELECT t.id, t.user_id, u.username, t.name, t.hint, t.created_at, t.last_used, t.expires_at, t.system
-               FROM tokens t JOIN users u ON u.id = t.user_id";
+    let sql = "SELECT t.id, t.user_id, u.username, t.name, t.hint, t.created_at, t.last_used, t.expires_at, t.system,
+               t.private_access FROM tokens t JOIN users u ON u.id = t.user_id";
     let rows: Vec<TokenRow> = if all {
         sqlx::query_as(AssertSqlSafe(format!(
             "{sql} ORDER BY u.username, t.created_at DESC"
@@ -447,6 +451,9 @@ async fn list_tokens(
 struct NewToken {
     name: String,
     expires_days: Option<u32>,
+    /// Let the token read private content (`scoped` private access).
+    #[serde(default)]
+    private_access: bool,
 }
 
 async fn create_token(
@@ -467,12 +474,34 @@ async fn create_token(
         Some(d) if d <= 3650 => Some(now_secs() as i64 + d as i64 * 86_400),
         Some(_) => return Err(AppError::bad_request("tokens can last at most 3650 days")),
     };
+    // Only someone who may read private content can hand that on.
+    if body.private_access && !(user.role == Role::Admin || user.private_access) {
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "your account doesn't have private access, so its tokens can't either",
+        ));
+    }
     let (id, token) = st
         .auth
         .create_token(user.id, name, expires_at)
         .await
         .map_err(db_err)?;
-    tracing::info!("{} created access token {name:?}", user.username);
+    if body.private_access {
+        sqlx::query("UPDATE tokens SET private_access = 1 WHERE id = ?")
+            .bind(id)
+            .execute(&st.auth.db)
+            .await
+            .map_err(db_err)?;
+    }
+    tracing::info!(
+        "{} created access token {name:?}{}",
+        user.username,
+        if body.private_access {
+            " with private access"
+        } else {
+            ""
+        }
+    );
     audit(
         &st,
         &user.username,
@@ -482,9 +511,13 @@ async fn create_token(
         true,
     )
     .await;
-    Ok(Json(
-        json!({ "id": id, "token": token, "name": name, "expires_at": expires_at }),
-    ))
+    Ok(Json(json!({
+        "id": id,
+        "token": token,
+        "name": name,
+        "expires_at": expires_at,
+        "private_access": body.private_access,
+    })))
 }
 
 async fn revoke_token(
@@ -642,6 +675,7 @@ async fn load_user(st: &AppState, id: i64) -> AppResult<User> {
 struct UserUpdate {
     role: Option<String>,
     disabled: Option<bool>,
+    private_access: Option<bool>,
 }
 
 async fn update_user(
@@ -704,6 +738,26 @@ async fn update_user(
             "user.disable"
         } else {
             "user.enable"
+        };
+        audit(&st, &admin.username, action, &target.username, ip, true).await;
+    }
+    if let Some(private_access) = body.private_access {
+        sqlx::query("UPDATE users SET private_access = ? WHERE id = ?")
+            .bind(private_access)
+            .bind(id)
+            .execute(&st.auth.db)
+            .await
+            .map_err(db_err)?;
+        tracing::info!(
+            "{} {} private access for {}",
+            admin.username,
+            if private_access { "gave" } else { "removed" },
+            target.username
+        );
+        let action = if private_access {
+            "user.private_on"
+        } else {
+            "user.private_off"
         };
         audit(&st, &admin.username, action, &target.username, ip, true).await;
     }

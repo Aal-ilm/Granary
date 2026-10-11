@@ -37,6 +37,10 @@ const offlineBanner = (health) =>
     ? '<div class="banner"><span class="dot warn"></span><span>Offline mode is on. Granary serves only what is cached and never contacts the public registries. Turn off <code>GRANARY_OFFLINE</code> to fetch new packages.</span></div>'
     : '';
 
+/** Marks content from Gitea, which only people with private access see. */
+const privateBadge = (on) =>
+  on ? ' <span class="kind private" title="From Gitea. Only people with private access can see it.">Private</span>' : '';
+
 /** Display names for everything with a gauge: the package formats and Git. */
 const FORMAT_LABELS = { ...Object.fromEntries(REPO_IDS.map((id) => [id, REPOS[id].label])), git: 'Git' };
 
@@ -1068,7 +1072,7 @@ async function renderTemplates({ query, isCurrent }) {
       <article class="tpl-card panel" data-search="${esc([t.name, t.description, ...t.tags].join(' ').toLowerCase())}">
         <div class="tpl-head">
           <h2><a href="#/templates/${t.id}">${esc(t.name)}</a></h2>
-          ${t.builtin ? '<span class="kind">Built-in</span>' : t.source ? '<span class="kind custom">From repo</span>' : '<span class="kind custom">Custom</span>'}
+          ${t.builtin ? '<span class="kind">Built-in</span>' : t.source ? '<span class="kind custom">From repo</span>' : '<span class="kind custom">Custom</span>'}${privateBadge(t.private)}
         </div>
         <p class="tpl-desc">${esc(t.description || 'No description.')}</p>
         <div class="tpl-counts">${packageCounts(t.counts)}</div>
@@ -1214,7 +1218,7 @@ async function renderTemplate({ params, isCurrent }) {
       <div>
         <h1>${esc(t.name)}</h1>
         <div class="summary-line">
-          ${t.builtin ? '<span class="kind">Built-in</span>' : t.source ? '<span class="kind custom">From repo</span>' : '<span class="kind custom">Custom</span>'}
+          ${t.builtin ? '<span class="kind">Built-in</span>' : t.source ? '<span class="kind custom">From repo</span>' : '<span class="kind custom">Custom</span>'}${privateBadge(t.private)}
           ${t.tags.map((x) => `<a class="tag" href="#/templates?tag=${esc(encodeURIComponent(x))}">${esc(x)}</a>`).join('')}
           <span>Last warmed ${t.last_warmed_at ? timeTag(t.last_warmed_at) : 'never'}</span>
           ${t.last_warm_warnings?.length ? `<span class="status"><span class="dot warn"></span>${esc(plural(t.last_warm_warnings.length, 'warning'))}</span>` : ''}
@@ -1495,7 +1499,7 @@ async function renderJobs({ isCurrent }) {
     .map(
       (j) => `<tr>
         <td class="num">#${esc(j.id)}</td>
-        <td><a href="#/jobs/${j.id}">${esc(j.title)}</a> <span class="muted">${j.kind === 'git' ? 'repo' : j.kind}</span></td>
+        <td><a href="#/jobs/${j.id}">${esc(j.title)}</a> <span class="muted">${j.kind === 'git' ? 'repo' : j.kind}</span>${privateBadge(j.private)}</td>
         <td>${jobStatus(j)}</td>
         <td>${timeTag(j.created_at)} <span class="muted">by ${esc(j.created_by)}</span></td>
         <td class="num hide-sm">${esc(jobDuration(j))}</td>
@@ -1546,7 +1550,7 @@ async function renderJob({ params, isCurrent }) {
     <div class="crumbs"><a href="#/jobs">Jobs</a>${j.template_id ? ` <span aria-hidden="true">/</span> <a href="#/templates/${j.template_id}">Template</a>` : ''}</div>
     <div class="page-head">
       <div><h1>${esc(j.title)}</h1>
-        <div class="summary-line">${jobStatus(j)}<span>Job #${esc(j.id)}</span><span>Queued ${timeTag(j.created_at)} by ${esc(j.created_by)}</span></div></div>
+        <div class="summary-line">${jobStatus(j)}${privateBadge(j.private)}<span>Job #${esc(j.id)}</span><span>Queued ${timeTag(j.created_at)} by ${esc(j.created_by)}</span></div></div>
       <div class="page-actions">${jobActive(j) ? `<button class="admin-only" data-cancel-job="${j.id}">Cancel job</button>` : ''}</div>
     </div>
     ${j.message ? `<div class="banner"><span class="dot ${j.status === 'failed' ? 'bad' : ''}"></span><span>${esc(j.message[0].toUpperCase() + j.message.slice(1))}</span></div>` : ''}
@@ -1617,7 +1621,7 @@ async function renderGitRepos({ isCurrent }) {
   const rows = d.repos
     .map(
       (r) => `<tr>
-        <td><span class="pkg mono">${esc(r.host)}/${esc(r.owner)}/${esc(r.name)}</span>
+        <td><span class="pkg mono">${esc(r.host)}/${esc(r.owner)}/${esc(r.name)}</span>${privateBadge(r.private)}
           ${r.last_error ? `<div class="err" title="${esc(r.last_error)}">Last refresh failed; serving the cached copy</div>` : ''}</td>
         <td class="mono">${esc(r.default_branch || '-')}</td>
         <td class="r num">${esc(bytes(r.size))}</td>
@@ -1635,7 +1639,7 @@ async function renderGitRepos({ isCurrent }) {
       <div><h1>Git</h1><p>${esc(plural(d.repos.length, 'repo'))} cached, from ${esc(d.hosts.join(', '))}.</p></div>
     </div>
     <div class="toolbar"><nav class="seg" aria-label="Repository">${browseTabs('git')}</nav></div>
-    <p class="page-note">Granary keeps a mirror of each repo and serves it read-only. Submodules and Git LFS objects are not cached, and only public repos can be added.</p>
+    <p class="page-note">Granary keeps a mirror of each repo and serves it read-only. Submodules and Git LFS objects are not cached. ${d.gitea_host ? `Repos from ${esc(d.gitea_host)} (Gitea) are private; from other hosts, only public repos can be added.` : 'Only public repos can be added.'}</p>
     ${d.offline ? '' : `<form class="panel panel-pad admin-only add-repo" id="add-repo">
       <label for="repo-url">Add repo</label>
       <div class="get-search">
@@ -2092,6 +2096,23 @@ async function renderTasks({ isCurrent }) {
 
 // ------------------------------------------------------------------ system
 
+/** The Gitea connection's facts: address, status, version and token owner. */
+function giteaFacts(g) {
+  const s = g.status;
+  const state = !s
+    ? '<span class="status"><span class="dot"></span>Not checked yet</span>'
+    : s.offline
+    ? '<span class="status"><span class="dot"></span>Not contacted: offline mode</span>'
+    : s.ok
+    ? '<span class="status"><span class="dot ok"></span>Connected</span>'
+    : `<span class="status"><span class="dot bad"></span>${esc(s.error || 'Unreachable')}</span>`;
+  return `
+    <div class="fact"><dt>Address</dt><dd class="mono">${esc(g.url)}</dd></div>
+    <div class="fact"><dt>Status</dt><dd>${state}${s ? ` <small>${timeTag(s.checked_at)}</small>` : ''}</dd></div>
+    <div class="fact"><dt>Gitea version</dt><dd class="mono">${esc(s?.version || '-')}</dd></div>
+    <div class="fact"><dt>Token owner</dt><dd><span class="mono">${esc(s?.user || '-')}</span>${s?.note ? `<small>${esc(s.note)}</small>` : ''}</dd></div>`;
+}
+
 async function renderSystem({ isCurrent }) {
   const d = await api('/api/system');
   if (!isCurrent()) return;
@@ -2119,11 +2140,31 @@ async function renderSystem({ isCurrent }) {
     return `<tr><td>${chip(id)}</td><td class="mono">${esc(h.url)}</td><td>${status}</td><td class="r num">${esc(h.latency_ms)} ms</td><td>${timeTag(h.checked_at)}</td></tr>`;
   }).join('');
 
+  const pa = d.private_access;
+  const giteaSection = d.gitea ? `
+    <section>
+      <h2>Gitea</h2>
+      <dl class="panel facts" id="gitea-facts">${giteaFacts(d.gitea)}</dl>
+      <p class="admin-only"><button data-gitea-check>Test connection</button></p>
+    </section>` : '';
+  const accessSection = `
+    <section>
+      <h2>Private access</h2>
+      <p class="muted">Who may read private content: repos and packages from Gitea, and the templates, starters and jobs made from them. Anyone else is shown nothing of it.</p>
+      <div class="panel panel-pad">
+        <div class="field"><label for="pa-mode">Who can read private content</label>
+          <select id="pa-mode" ${pa.locked || !isAdmin() ? 'disabled' : ''}>${pa.modes.map((m) => `<option value="${esc(m.id)}" ${m.id === pa.mode ? 'selected' : ''}>${esc(m.label)}</option>`).join('')}</select></div>
+        ${pa.locked ? '<p class="muted">Locked: set by <code>GRANARY_PRIVATE_ACCESS</code> in the environment.</p>' : pa.mode === 'scoped' ? '<p class="muted">Give people private access on the Users page, and tokens when they are created.</p>' : ''}
+      </div>
+    </section>`;
+
   setView(`
     <div class="page-head">
       <div><h1>System</h1><p>Granary ${esc(d.version)}, running for ${esc(duration(d.uptime_secs))}.</p></div>
       <div class="page-actions admin-only"><button data-check>Check upstreams now</button></div>
     </div>
+    ${giteaSection}
+    ${accessSection}
     <section>
       <h2>Upstream registries</h2>
       <div class="panel table-wrap"><table>
@@ -2152,6 +2193,32 @@ async function renderSystem({ isCurrent }) {
     </section>`);
 
   $$('.meter span', view()).forEach((el) => el.style.setProperty('--pct', el.dataset.pct + '%'));
+  $('[data-gitea-check]', view())?.addEventListener('click', async (e) => {
+    const b = e.currentTarget;
+    b.disabled = true;
+    b.textContent = 'Testing…';
+    try {
+      const r = await act(() => api('/api/system/gitea/check', { method: 'POST' }));
+      $('#gitea-facts').innerHTML = giteaFacts({ ...d.gitea, status: r.status });
+      toast(r.status.ok ? 'Connected to Gitea' : r.status.error, r.status.ok ? '' : 'error');
+    } catch (err) {
+      toast(err.message, 'error');
+    }
+    b.disabled = false;
+    b.textContent = 'Test connection';
+  });
+  $('#pa-mode', view()).addEventListener('change', async (e) => {
+    const sel = e.currentTarget;
+    try {
+      await api('/api/system/private-access', { method: 'PUT', body: { mode: sel.value } });
+      me = await api('/api/auth/me');
+      toast('Private access changed');
+      route();
+    } catch (err) {
+      toast(err.message, 'error');
+      sel.value = pa.mode;
+    }
+  });
   $('[data-check]', view()).addEventListener('click', async (e) => {
     const b = e.currentTarget;
     b.disabled = true;
@@ -2456,6 +2523,14 @@ function expiryText(t) {
   return timeTag(t.expires_at);
 }
 
+/** The token form's private access checkbox: only with Gitea, in scoped
+ *  mode, for someone who has private access to hand on. */
+function tokenPrivateOption() {
+  const p = me.private || {};
+  if (!p.gitea || p.mode !== 'scoped' || !p.can_read) return '';
+  return `<label class="check"><input id="tk-private" type="checkbox"> Private access <span class="muted">Lets this token download private repos and packages from Gitea.</span></label>`;
+}
+
 async function renderTokens({ query, isCurrent }) {
   const all = isAdmin() && query.get('all') === '1';
   const [d, repos] = await Promise.all([api('/api/tokens' + (all ? '?all=true' : '')), api('/api/repos')]);
@@ -2464,7 +2539,7 @@ async function renderTokens({ query, isCurrent }) {
   const tokenRows = (tokens) => tokens
     .map(
       (t) => `<tr>
-        <td><strong>${esc(t.name)}</strong>${t.system ? ' <span class="kind" title="Created by Granary for the warmer. It can only download packages, and is made again if revoked.">System</span>' : ''}</td>
+        <td><strong>${esc(t.name)}</strong>${t.system ? ' <span class="kind" title="Created by Granary for the warmer. It can only download packages, and is made again if revoked.">System</span>' : ''}${t.private_access && me.private?.mode === 'scoped' ? ' <span class="kind private" title="Can read private content from Gitea.">Private access</span>' : ''}</td>
         ${all ? `<td>${esc(t.system ? 'Granary' : t.username)}</td>` : ''}
         <td class="mono">${esc(t.hint)}</td>
         <td>${timeTag(t.created_at)}</td>
@@ -2492,6 +2567,7 @@ async function renderTokens({ query, isCurrent }) {
         <div class="field"><label for="tk-exp">Expires</label><select id="tk-exp">${EXPIRY_OPTIONS.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select></div>
         <div class="field"><span class="label">&nbsp;</span><button class="primary" type="submit">Create token</button></div>
       </div>
+      ${tokenPrivateOption()}
       <p class="err hidden" id="tk-err" role="alert"></p>
       <div id="tk-result"></div>
     </form>
@@ -2505,7 +2581,7 @@ async function renderTokens({ query, isCurrent }) {
     const name = $('#tk-name').value.trim();
     if (!name) return showError($('#tk-err'), 'Give the token a name so you can recognise it later.');
     try {
-      const r = await api('/api/tokens', { method: 'POST', body: { name, expires_days: Number($('#tk-exp').value) } });
+      const r = await api('/api/tokens', { method: 'POST', body: { name, expires_days: Number($('#tk-exp').value), private_access: !!$('#tk-private')?.checked } });
       showError($('#tk-err'), '');
       const snippets = repos.repos
         .flatMap((repo) =>
@@ -2556,6 +2632,8 @@ async function renderTokens({ query, isCurrent }) {
 async function renderUsers({ isCurrent }) {
   const d = await api('/api/users');
   if (!isCurrent()) return;
+  // Private access only means something with Gitea, in scoped mode.
+  const privateCol = me.private?.gitea && me.private?.mode === 'scoped';
   const rows = d.users
     .map((u) => {
       const self = u.id === me.user.id;
@@ -2569,6 +2647,9 @@ async function renderUsers({ isCurrent }) {
         <td>${u.totp_enabled ? '<span class="status"><span class="dot ok"></span>On</span>' : '<span class="muted">Off</span>'}</td>
         <td>${timeTag(u.last_login)}</td>
         <td class="r num">${esc(count(u.tokens))}</td>
+        ${privateCol ? `<td>${u.role === 'admin'
+          ? '<span class="muted" title="Admins can always read private content.">Always</span>'
+          : `<label class="check"><input type="checkbox" data-private-for="${u.id}" data-name="${esc(u.username)}" ${u.private_access ? 'checked' : ''}><span class="sr-only">Private access for ${esc(u.username)}</span></label>`}</td>` : ''}
         <td>${u.disabled ? '<span class="status"><span class="dot bad"></span>Disabled</span>' : u.must_change_password ? '<span class="status"><span class="dot warn"></span>Temporary password</span>' : '<span class="status"><span class="dot ok"></span>Active</span>'}</td>
         <td class="actions">
           <button class="small" data-user-action="reset-password" data-id="${u.id}" data-name="${esc(u.username)}">Reset password</button>
@@ -2593,7 +2674,7 @@ async function renderUsers({ isCurrent }) {
     </form>
     <section>
       <div class="panel table-wrap"><table>
-        <thead><tr><th>User</th><th>Role</th><th>Two-factor</th><th>Last sign-in</th><th class="r">Tokens</th><th>Status</th><th class="r"><span class="sr-only">Actions</span></th></tr></thead>
+        <thead><tr><th>User</th><th>Role</th><th>Two-factor</th><th>Last sign-in</th><th class="r">Tokens</th>${privateCol ? '<th title="Can read private repos and packages from Gitea">Private access</th>' : ''}<th>Status</th><th class="r"><span class="sr-only">Actions</span></th></tr></thead>
         <tbody>${rows}</tbody>
       </table></div>
     </section>`);
@@ -2619,6 +2700,17 @@ async function renderUsers({ isCurrent }) {
   });
 
   view().addEventListener('change', async (e) => {
+    const box = e.target.closest('[data-private-for]');
+    if (box) {
+      try {
+        await api(`/api/users/${box.dataset.privateFor}`, { method: 'PATCH', body: { private_access: box.checked } });
+        toast(`${box.dataset.name} ${box.checked ? 'now has' : 'no longer has'} private access`);
+      } catch (ex) {
+        toast(ex.message, 'error');
+        box.checked = !box.checked;
+      }
+      return;
+    }
     const sel = e.target.closest('[data-role-for]');
     if (!sel) return;
     try {

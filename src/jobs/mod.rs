@@ -25,6 +25,7 @@ use crate::{
     AppState,
     admin::human_bytes,
     inventory::{self, REPOS},
+    policy::Resource,
     search,
     store::{dir_size, now_secs},
     templates::{TemplateInput, build, lines::Eco},
@@ -150,9 +151,41 @@ pub struct JobRow {
     pub new_bytes: Option<i64>,
     #[serde(serialize_with = "warnings_list")]
     pub warnings: Option<String>,
+    /// The private content the job works on (a JSON resource), if any.
+    #[serde(serialize_with = "is_set")]
+    pub private: Option<String>,
 }
 
-pub const JOB_COLUMNS: &str = "id, kind, template_id, title, status, message, created_by, created_at, started_at, finished_at, new_packages, new_files, new_bytes, warnings";
+impl JobRow {
+    pub fn resource(&self) -> Option<Resource> {
+        self.private
+            .as_deref()
+            .and_then(|r| serde_json::from_str(r).ok())
+    }
+}
+
+/// Whether a column is set, as a boolean in responses.
+fn is_set<S: serde::Serializer>(v: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_bool(v.is_some())
+}
+
+pub const JOB_COLUMNS: &str = "id, kind, template_id, title, status, message, created_by, created_at, started_at, finished_at, new_packages, new_files, new_bytes, warnings, private";
+
+/// Who a job is for: the name it shows, and the user whose private access
+/// its warmer token gets (none for a schedule nobody owns any more).
+pub struct JobBy {
+    pub name: String,
+    pub user: Option<i64>,
+}
+
+impl JobBy {
+    pub fn user(u: &crate::auth::User) -> Self {
+        Self {
+            name: u.username.clone(),
+            user: Some(u.id),
+        }
+    }
+}
 
 /// Queue a job. Returns its id.
 /// What a warm job installs: a template, and for templates made from a
@@ -209,29 +242,35 @@ impl RepoWarm {
     }
 }
 
-pub async fn enqueue(
-    st: &AppState,
-    kind: &str,
-    template_id: Option<i64>,
-    title: &str,
-    spec: &TemplateInput,
-    repo: Option<RepoWarm>,
-    created_by: &str,
-) -> sqlx::Result<i64> {
+/// What a new warm job holds.
+pub struct NewJob<'a> {
+    pub kind: &'a str,
+    pub template_id: Option<i64>,
+    pub title: &'a str,
+    pub spec: &'a TemplateInput,
+    pub repo: Option<RepoWarm>,
+    /// The private content it works on, so only those who may read that
+    /// see the job.
+    pub private: Option<Resource>,
+}
+
+pub async fn enqueue(st: &AppState, job: NewJob<'_>, by: &JobBy) -> sqlx::Result<i64> {
     let spec = WarmSpec {
-        input: spec.clone(),
-        repo,
+        input: job.spec.clone(),
+        repo: job.repo,
     };
     let r = sqlx::query(
-        "INSERT INTO jobs (kind, template_id, title, spec, status, created_by, created_at)
-         VALUES (?, ?, ?, ?, 'queued', ?, ?)",
+        "INSERT INTO jobs (kind, template_id, title, spec, status, created_by, created_at, acting_for, private)
+         VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
     )
-    .bind(kind)
-    .bind(template_id)
-    .bind(title)
+    .bind(job.kind)
+    .bind(job.template_id)
+    .bind(job.title)
     .bind(serde_json::to_string(&spec).unwrap())
-    .bind(created_by)
+    .bind(&by.name)
     .bind(now_secs() as i64)
+    .bind(by.user)
+    .bind(job.private.map(|r| serde_json::to_string(&r).unwrap()))
     .execute(&st.auth.db)
     .await?;
     st.admin.jobs.wake.notify_one();
@@ -274,6 +313,10 @@ pub fn spawn_runner(st: AppState) {
         .bind(now_secs() as i64)
         .execute(&st.auth.db)
         .await;
+        // Tokens of jobs that were running when Granary stopped.
+        if let Err(e) = st.auth.drop_job_token(None).await {
+            tracing::warn!("removing old job tokens: {e}");
+        }
         let mut last_schedule_check: Option<Instant> = None;
         loop {
             if last_schedule_check.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
@@ -437,6 +480,9 @@ async fn run(st: &AppState, id: i64, cancel: CancellationToken) {
     }
     let before = snapshot(st).await;
     let outcome = run_inner(st, id, &mut log, &cancel).await;
+    if let Err(e) = st.auth.drop_job_token(Some(id)).await {
+        tracing::warn!("job {id}: could not remove its token: {e}");
+    }
     let after = snapshot(st).await;
 
     let new: Vec<&(String, u64)> = after
@@ -574,7 +620,7 @@ async fn run_inner(
         }
         None => None,
     };
-    let token = match st.auth.warmer_token().await {
+    let token = match warmer_token(st, id).await {
         Ok(t) => t,
         Err(e) => return Outcome::failed(format!("could not get the warmer's access token: {e}")),
     };
@@ -718,6 +764,27 @@ async fn run_inner(
     }
 }
 
+/// The warmer's token for a job. A job started by someone gets a token of
+/// its own that acts for them, so the warmer reads private content only if
+/// they may, and only while the job runs. Others use the standing token,
+/// which never reads private content.
+async fn warmer_token(st: &AppState, id: i64) -> anyhow::Result<String> {
+    let starter: Option<(Option<i64>,)> =
+        sqlx::query_as("SELECT acting_for FROM jobs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&st.auth.db)
+            .await?;
+    match starter.and_then(|(u,)| u) {
+        // A little longer than the job may run; it is removed when it ends.
+        Some(user) => {
+            st.auth
+                .job_token(id, user, st.cfg.warm_timeout + Duration::from_secs(600))
+                .await
+        }
+        None => st.auth.warmer_token().await,
+    }
+}
+
 /// One run of the warmer within a job.
 enum Step {
     /// Generated manifests from the template's lines.
@@ -796,15 +863,19 @@ pub struct GitJob {
 }
 
 /// Queue a git job ("Add repo" or "Refresh").
-pub async fn enqueue_git(st: &AppState, job: &GitJob, created_by: &str) -> sqlx::Result<i64> {
+pub async fn enqueue_git(st: &AppState, job: &GitJob, by: &JobBy) -> sqlx::Result<i64> {
     let title = format!("Git {}", job.repo.display());
+    let private = job.repo.resource(&st.cfg);
     let r = sqlx::query(
-        "INSERT INTO jobs (kind, title, spec, status, created_by, created_at) VALUES ('git', ?, ?, 'queued', ?, ?)",
+        "INSERT INTO jobs (kind, title, spec, status, created_by, created_at, acting_for, private)
+         VALUES ('git', ?, ?, 'queued', ?, ?, ?, ?)",
     )
     .bind(title)
     .bind(serde_json::to_string(job).unwrap())
-    .bind(created_by)
+    .bind(&by.name)
     .bind(now_secs() as i64)
+    .bind(by.user)
+    .bind(private.map(|r| serde_json::to_string(&r).unwrap()))
     .execute(&st.auth.db)
     .await?;
     st.admin.jobs.wake.notify_one();
@@ -945,7 +1016,15 @@ pub async fn migrate(db: &SqlitePool) -> sqlx::Result<()> {
     allow_git_jobs(db).await?;
     // Added after the rebuild above, which copies columns by position from
     // older databases.
-    crate::auth::add_column(db, "jobs", "warnings", "TEXT").await
+    crate::auth::add_column(db, "jobs", "warnings", "TEXT").await?;
+    crate::auth::add_column(db, "jobs", "private", "TEXT").await?;
+    crate::auth::add_column(
+        db,
+        "jobs",
+        "acting_for",
+        "INTEGER REFERENCES users(id) ON DELETE SET NULL",
+    )
+    .await
 }
 
 async fn allow_git_jobs(db: &SqlitePool) -> sqlx::Result<()> {
@@ -1045,17 +1124,23 @@ pub async fn queue_scheduled(st: &AppState) -> usize {
             .execute(&st.auth.db)
             .await;
         let repo = t.source.as_ref().and_then(RepoWarm::from_source);
-        match enqueue(
-            st,
-            "template",
-            Some(id),
-            &t.input.name,
-            &t.input,
+        // Scheduled warms act for whoever set the schedule.
+        let by = JobBy {
+            name: "schedule".into(),
+            user: crate::templates::schedule_by(&st.auth.db, id)
+                .await
+                .ok()
+                .flatten(),
+        };
+        let job = NewJob {
+            kind: "template",
+            template_id: Some(id),
+            title: &t.input.name,
+            spec: &t.input,
             repo,
-            "schedule",
-        )
-        .await
-        {
+            private: t.resource(&st.cfg),
+        };
+        match enqueue(st, job, &by).await {
             Ok(job) => {
                 tracing::info!(
                     "{}: scheduled {} warm queued as job {job}",

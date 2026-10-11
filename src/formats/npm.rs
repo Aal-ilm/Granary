@@ -208,6 +208,7 @@ async fn passthrough(
         url.push('?');
         url.push_str(q);
     }
+    st.store.check_url(&url)?;
     let mut req = st
         .store
         .passthrough_client()

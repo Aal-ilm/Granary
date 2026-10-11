@@ -447,15 +447,16 @@ async fn template_warm_records_results() {
     let t = h.api(&cookie, &format!("/api/templates/{tid}")).await;
     assert!(t["last_warmed_at"].as_i64().is_some());
 
-    // The warmer's token is a system token: listed, downloads only.
+    // The job had a token of its own, gone now that the job has ended.
     let tokens = h.api(&cookie, "/api/tokens?all=true").await;
-    let warmer = tokens["tokens"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|t| t["name"] == "warmer")
-        .expect("warmer token listed");
-    assert_eq!(warmer["system"], true);
+    assert!(
+        !tokens["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"].as_str().unwrap().starts_with("warmer")),
+        "{tokens}"
+    );
 }
 
 async fn warm_and_wait(h: &Harness, cookie: &str, template: i64) -> Value {

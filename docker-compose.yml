@@ -11,6 +11,11 @@ services:
       - "8080"
     volumes:
       - granary-data:/data
+      # A self-hosted Gitea as a private upstream (see the README's Gitea
+      # section): a file holding its access token, and your own CA if
+      # Gitea's certificate comes from one. Both read-only.
+      # - ./secrets/gitea-token:/run/secrets/gitea-token:ro
+      # - ./certs/internal-ca.pem:/etc/granary/internal-ca.pem:ro
     environment:
       # Set this when Granary sits behind a reverse proxy or is reached by a
       # name other than the one clients put in their config.
@@ -27,6 +32,15 @@ services:
       GRANARY_CLIENT_AUTH: "required"
       GRANARY_META_TTL_SECS: "300"
       RUST_LOG: "granary=info"
+      # Gitea, with the files mounted above. Who may read what comes from
+      # it is chosen on the System page, or fixed here with
+      # GRANARY_PRIVATE_ACCESS ("scoped" or "signed-in").
+      # GRANARY_GITEA_URL: "https://gitea.example.lan"
+      # GRANARY_GITEA_TOKEN_FILE: "/run/secrets/gitea-token"
+      # GRANARY_EXTRA_CA: "/etc/granary/internal-ca.pem"
+      # Granary refuses upstreams at private addresses. List internal
+      # mirrors you set as upstreams here (the Gitea host is always allowed).
+      # GRANARY_PRIVATE_HOSTS: "nexus.example.lan"
       # Warming templates (filling the cache with every dependency) uses the
       # optional granary-warmer service below. Start it with
       #   docker compose --profile warmer up -d

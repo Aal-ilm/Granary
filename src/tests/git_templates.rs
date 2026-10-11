@@ -65,7 +65,7 @@ fn fixture(up: &Upstream) -> std::path::PathBuf {
 }
 
 /// Preview a repo, following the clone job the first time.
-async fn preview(h: &Harness, cookie: &str, url: &str, git_ref: &str) -> Value {
+pub(super) async fn preview(h: &Harness, cookie: &str, url: &str, git_ref: &str) -> Value {
     for _ in 0..2 {
         let (status, _, body) = h
             .send(
@@ -91,7 +91,7 @@ async fn preview(h: &Harness, cookie: &str, url: &str, git_ref: &str) -> Value {
     panic!("the repo was never cached");
 }
 
-async fn save(h: &Harness, cookie: &str, p: &Value, name: &str) -> (i64, Value) {
+pub(super) async fn save(h: &Harness, cookie: &str, p: &Value, name: &str) -> (i64, Value) {
     let (status, _, body) = h
         .send(
             "POST",

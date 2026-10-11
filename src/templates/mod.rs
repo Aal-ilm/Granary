@@ -16,7 +16,7 @@ pub mod starter;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
-use crate::store::now_secs;
+use crate::{policy::Resource, store::now_secs};
 use lines::{Eco, LineError};
 
 pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS templates (
@@ -366,6 +366,19 @@ pub struct Template {
     /// Warnings from the latest successful warm (a JSON list), if any.
     #[serde(serialize_with = "crate::jobs::warnings_list")]
     pub last_warm_warnings: Option<String>,
+    /// Made from private content (a Gitea repo, or a clone of a template
+    /// that was), so the access policy decides who sees it.
+    #[serde(skip)]
+    pub private: Option<Resource>,
+}
+
+impl Template {
+    /// The private content this template comes from, if any.
+    pub fn resource(&self, cfg: &crate::config::Config) -> Option<Resource> {
+        self.private
+            .clone()
+            .or_else(|| self.source.as_ref().and_then(|s| s.resource(cfg)))
+    }
 }
 
 /// Where a "New from repo" template came from, and the files read there.
@@ -384,6 +397,15 @@ pub struct RepoSource {
 }
 
 impl RepoSource {
+    /// The Gitea repo this was read from, when it is one.
+    pub fn resource(&self, cfg: &crate::config::Config) -> Option<Resource> {
+        let rest = self.url.strip_prefix("https://")?;
+        let mut parts = rest.split('/');
+        let (host, owner, name) = (parts.next()?, parts.next()?, parts.next()?);
+        cfg.is_gitea_host(host)
+            .then(|| Resource::gitea_repo(owner, name))
+    }
+
     pub fn lockfiles(&self) -> Vec<&str> {
         self.files
             .keys()
@@ -424,6 +446,7 @@ struct Row {
     schedule: String,
     source: Option<String>,
     last_warm_warnings: Option<String>,
+    private: Option<String>,
 }
 
 impl From<Row> for Template {
@@ -449,18 +472,48 @@ impl From<Row> for Template {
             schedule: r.schedule,
             source: r.source.and_then(|s| serde_json::from_str(&s).ok()),
             last_warm_warnings: r.last_warm_warnings,
+            private: r.private.and_then(|s| serde_json::from_str(&s).ok()),
         }
     }
 }
 
-const COLUMNS: &str = "id, builtin_key, name, description, tags, platforms, allow_sdist, cargo, npm, pypi, maven, created_at, updated_at, last_warmed_at, schedule, source, last_warm_warnings";
+const COLUMNS: &str = "id, builtin_key, name, description, tags, platforms, allow_sdist, cargo, npm, pypi, maven, created_at, updated_at, last_warmed_at, schedule, source, last_warm_warnings, private";
 
 /// Columns added after templates first shipped.
 pub async fn migrate(db: &SqlitePool) -> sqlx::Result<()> {
     crate::auth::add_column(db, "templates", "schedule", "TEXT NOT NULL DEFAULT 'off'").await?;
     crate::auth::add_column(db, "templates", "schedule_queued_at", "INTEGER").await?;
     crate::auth::add_column(db, "templates", "source", "TEXT").await?;
-    crate::auth::add_column(db, "templates", "last_warm_warnings", "TEXT").await
+    crate::auth::add_column(db, "templates", "last_warm_warnings", "TEXT").await?;
+    crate::auth::add_column(db, "templates", "private", "TEXT").await?;
+    // Who set the schedule: scheduled warms act for them.
+    crate::auth::add_column(
+        db,
+        "templates",
+        "schedule_by",
+        "INTEGER REFERENCES users(id) ON DELETE SET NULL",
+    )
+    .await
+}
+
+/// Mark a template as made from private content.
+pub async fn set_private(db: &SqlitePool, id: i64, r: &Resource) -> sqlx::Result<()> {
+    sqlx::query("UPDATE templates SET private = ? WHERE id = ?")
+        .bind(serde_json::to_string(r).unwrap())
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Who set a template's schedule, if they are still around.
+pub async fn schedule_by(db: &SqlitePool, id: i64) -> sqlx::Result<Option<i64>> {
+    let row: Option<(Option<i64>,)> =
+        sqlx::query_as("SELECT schedule_by FROM templates WHERE id = ?")
+            .bind(id)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.and_then(|(by,)| by))
 }
 
 /// Record (or replace) where a repo template came from.
@@ -497,9 +550,10 @@ pub async fn resync(
     Ok(r.rows_affected() == 1)
 }
 
-pub async fn set_schedule(db: &SqlitePool, id: i64, schedule: &str) -> sqlx::Result<bool> {
-    let r = sqlx::query("UPDATE templates SET schedule = ? WHERE id = ?")
+pub async fn set_schedule(db: &SqlitePool, id: i64, schedule: &str, by: i64) -> sqlx::Result<bool> {
+    let r = sqlx::query("UPDATE templates SET schedule = ?, schedule_by = ? WHERE id = ?")
         .bind(schedule)
+        .bind(by)
         .bind(id)
         .execute(db)
         .await?;

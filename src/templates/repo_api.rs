@@ -26,8 +26,9 @@ use crate::{
     auth::{AuthSession, require_admin},
     error::{AppError, AppResult},
     formats::git::{self, Refresh, RepoId},
-    jobs::{GitJob, enqueue_git},
+    jobs::{GitJob, JobBy, enqueue_git},
     net::ClientIp,
+    policy::Principal,
     store::now_secs,
 };
 
@@ -61,8 +62,19 @@ async fn active_git_job(st: &AppState, repo: &RepoId) -> Option<i64> {
     .map(|(id,)| id)
 }
 
+/// A repo `who` may read, or "not found" as if it didn't exist.
+fn readable(st: &AppState, who: &Principal, repo: RepoId) -> AppResult<RepoId> {
+    match repo.resource(&st.cfg) {
+        Some(r) if !st.policy.can_read_private(who, &r) => Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            format!("{} was not found", repo.display()),
+        )),
+        _ => Ok(repo),
+    }
+}
+
 /// Queue a clone unless the repo is cached or already being cloned.
-async fn queue_clone(st: &AppState, repo: RepoId, by: &str) -> AppResult<Option<i64>> {
+async fn queue_clone(st: &AppState, repo: RepoId, by: &JobBy) -> AppResult<Option<i64>> {
     if repo.dir(st).exists() {
         return Ok(None);
     }
@@ -84,7 +96,7 @@ async fn queue_clone(st: &AppState, repo: RepoId, by: &str) -> AppResult<Option<
 
 /// Make sure the repo is cached (refreshing it if stale). `Some(job)` means
 /// a clone is under way and the caller should wait for that job.
-async fn ready(st: &AppState, repo: &RepoId, by: &str) -> AppResult<Option<i64>> {
+async fn ready(st: &AppState, repo: &RepoId, by: &JobBy) -> AppResult<Option<i64>> {
     if repo.dir(st).exists() {
         if !st.cfg.offline {
             git::ensure(st, repo, Refresh::IfStale, None).await?;
@@ -184,11 +196,13 @@ struct PreviewBody {
 async fn preview(
     State(st): State<AppState>,
     auth: AuthSession,
+    who: Principal,
     Json(body): Json<PreviewBody>,
 ) -> AppResult<Response> {
-    let admin = require_admin(&auth)?.username.clone();
+    let by = JobBy::user(require_admin(&auth)?);
     let repo = RepoId::from_url(&st.cfg, &body.url).map_err(AppError::bad_request)?;
-    if let Some(job) = ready(&st, &repo, &admin).await? {
+    let repo = readable(&st, &who, repo)?;
+    if let Some(job) = ready(&st, &repo, &by).await? {
         return Ok((
             StatusCode::ACCEPTED,
             Json(json!({ "cloning": true, "job": job })),
@@ -205,10 +219,12 @@ async fn preview(
 /// The repo at a previewed commit, read again.
 async fn read_at(
     st: &AppState,
+    who: &Principal,
     url: &str,
     commit: &str,
 ) -> AppResult<(RepoId, BTreeMap<String, String>, repo::Scan)> {
     let repo = RepoId::from_url(&st.cfg, url).map_err(AppError::bad_request)?;
+    let repo = readable(st, who, repo)?;
     let pinned = commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit());
     if !pinned || !repo.dir(st).exists() || !git::has_commit(st, &repo, commit).await {
         return Err(AppError::new(
@@ -222,7 +238,7 @@ async fn read_at(
 }
 
 /// Cache the allowed git dependencies that aren't cached yet.
-async fn queue_git_deps(st: &AppState, scan: &repo::Scan, by: &str) -> usize {
+async fn queue_git_deps(st: &AppState, scan: &repo::Scan, by: &JobBy) -> usize {
     let mut queued = 0;
     if st.cfg.offline {
         return 0;
@@ -271,11 +287,12 @@ struct CreateBody {
 async fn create(
     State(st): State<AppState>,
     auth: AuthSession,
+    who: Principal,
     Extension(ip): Extension<ClientIp>,
     Json(body): Json<CreateBody>,
 ) -> AppResult<Response> {
     let admin = require_admin(&auth)?.username.clone();
-    let (repo, files, scan) = read_at(&st, &body.url, &body.commit).await?;
+    let (repo, files, scan) = read_at(&st, &who, &body.url, &body.commit).await?;
     let mut input = TemplateInput {
         name: body.name,
         description: body.description,
@@ -309,7 +326,12 @@ async fn create(
     super::set_source(&st.auth.db, id, &source)
         .await
         .map_err(db_error)?;
-    let git_jobs = queue_git_deps(&st, &scan, &admin).await;
+    if let Some(r) = repo.resource(&st.cfg) {
+        super::set_private(&st.auth.db, id, &r)
+            .await
+            .map_err(db_error)?;
+    }
+    let git_jobs = queue_git_deps(&st, &scan, &JobBy::user(require_admin(&auth)?)).await;
     crate::audit::record(
         &st.auth.db,
         &admin,
@@ -341,21 +363,19 @@ struct ResyncBody {
 async fn resync(
     State(st): State<AppState>,
     auth: AuthSession,
+    who: Principal,
     Extension(ip): Extension<ClientIp>,
     Path(id): Path<i64>,
     Json(body): Json<ResyncBody>,
 ) -> AppResult<Json<Value>> {
     let admin = require_admin(&auth)?.username.clone();
-    let t = super::get(&st.auth.db, id)
-        .await
-        .map_err(db_error)?
-        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "no such template"))?;
+    let t = super::api::load(&st, &who, id).await?;
     let Some(old) = t.source.clone() else {
         return Err(AppError::bad_request(
             "this template wasn't made from a repo",
         ));
     };
-    let (_, files, scan) = read_at(&st, &old.url, &body.commit).await?;
+    let (_, files, scan) = read_at(&st, &who, &old.url, &body.commit).await?;
     let mut input = t.input.clone();
     input.cargo = scan.cargo.clone();
     input.npm = scan.npm.clone();
@@ -375,7 +395,7 @@ async fn resync(
     {
         return Err(AppError::bad_request("this template can't be resynced"));
     }
-    let git_jobs = queue_git_deps(&st, &scan, &admin).await;
+    let git_jobs = queue_git_deps(&st, &scan, &JobBy::user(require_admin(&auth)?)).await;
     crate::audit::record(
         &st.auth.db,
         &admin,

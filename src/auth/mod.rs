@@ -35,6 +35,7 @@ pub use store::SqliteSessionStore;
 use crate::{
     AppState,
     error::{AppError, AppResult},
+    policy::{self, Principal},
     store::now_secs,
     util::base_url,
 };
@@ -89,6 +90,29 @@ pub struct User {
     /// Granary's own account for the warmer: no sign-in, never listed.
     #[serde(skip)]
     pub system: bool,
+    /// May read private content when private access is `scoped`.
+    pub private_access: bool,
+}
+
+#[cfg(test)]
+impl User {
+    pub fn for_tests(role: Role, private_access: bool) -> Self {
+        Self {
+            id: 1,
+            username: "someone".into(),
+            role,
+            totp_enabled: false,
+            disabled: false,
+            must_change_password: false,
+            created_at: 0,
+            last_login: None,
+            password_hash: String::new(),
+            totp_secret: None,
+            totp_last_step: 0,
+            system: false,
+            private_access,
+        }
+    }
 }
 
 // Never print password hashes or 2FA secrets, even in debug output.
@@ -117,7 +141,8 @@ impl AuthUser for User {
 }
 
 const USER_COLUMNS: &str = "id, username, role, totp_enabled, disabled, must_change_password, \
-                            created_at, last_login, password_hash, totp_secret, totp_last_step, system";
+                            created_at, last_login, password_hash, totp_secret, totp_last_step, system, \
+                            private_access";
 
 type UserRow = (
     i64,
@@ -131,6 +156,7 @@ type UserRow = (
     String,
     Option<String>,
     i64,
+    bool,
     bool,
 );
 
@@ -152,6 +178,7 @@ fn user_from_row(r: UserRow) -> User {
         totp_secret: r.9,
         totp_last_step: r.10,
         system: r.11,
+        private_access: r.12,
     }
 }
 
@@ -204,6 +231,10 @@ pub async fn open_db(data_dir: &Path) -> anyhow::Result<SqlitePool> {
             last_used INTEGER,
             expires_at INTEGER
         )",
+        "CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
         "CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
             data BLOB NOT NULL,
@@ -220,6 +251,29 @@ pub async fn open_db(data_dir: &Path) -> anyhow::Result<SqlitePool> {
     // Columns added after the first release.
     add_column(&pool, "tokens", "system", "INTEGER NOT NULL DEFAULT 0").await?;
     add_column(&pool, "users", "system", "INTEGER NOT NULL DEFAULT 0").await?;
+    add_column(
+        &pool,
+        "users",
+        "private_access",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column(
+        &pool,
+        "tokens",
+        "private_access",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    // A warmer token made for one job, acting for the job's starter.
+    add_column(&pool, "tokens", "job_id", "INTEGER").await?;
+    add_column(
+        &pool,
+        "tokens",
+        "acting_for",
+        "INTEGER REFERENCES users(id) ON DELETE CASCADE",
+    )
+    .await?;
     move_system_tokens(&pool).await?;
     crate::templates::migrate(&pool).await?;
     crate::jobs::migrate(&pool).await?;
@@ -230,22 +284,20 @@ pub async fn open_db(data_dir: &Path) -> anyhow::Result<SqlitePool> {
 /// and a password hash nothing can match, so it can't sign in; its tokens
 /// can only download packages.
 pub async fn system_user(pool: &SqlitePool) -> sqlx::Result<i64> {
-    if let Some((id,)) =
-        sqlx::query_as::<_, (i64,)>("SELECT id FROM users WHERE system = 1 AND username = ?")
-            .bind(WARMER_USER)
-            .fetch_optional(pool)
-            .await?
-    {
-        return Ok(id);
-    }
-    let r = sqlx::query(
-        "INSERT INTO users (username, password_hash, role, system, created_at) VALUES (?, '!', 'viewer', 1, ?)",
+    // Jobs starting at the same moment may both get here first.
+    sqlx::query(
+        "INSERT INTO users (username, password_hash, role, system, created_at) VALUES (?, '!', 'viewer', 1, ?)
+         ON CONFLICT (username) DO NOTHING",
     )
     .bind(WARMER_USER)
     .bind(now_secs() as i64)
     .execute(pool)
     .await?;
-    Ok(r.last_insert_rowid())
+    let (id,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE system = 1 AND username = ?")
+        .bind(WARMER_USER)
+        .fetch_one(pool)
+        .await?;
+    Ok(id)
 }
 
 /// Earlier versions attached the warmer's token to the first admin. Move any
@@ -265,6 +317,27 @@ async fn move_system_tokens(pool: &SqlitePool) -> sqlx::Result<()> {
         .execute(pool)
         .await?;
     tracing::info!("moved the warmer's token to its own system account");
+    Ok(())
+}
+
+/// A saved setting, if one was saved.
+pub async fn setting(pool: &SqlitePool, key: &str) -> sqlx::Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT value FROM settings WHERE key = ?")
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(v,)| v))
+}
+
+pub async fn set_setting(pool: &SqlitePool, key: &str, value: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES (?, ?)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -628,7 +701,7 @@ impl Backend {
         {
             return Ok(t.clone());
         }
-        sqlx::query("DELETE FROM tokens WHERE system = 1 AND name = 'warmer'")
+        sqlx::query("DELETE FROM tokens WHERE system = 1 AND name = 'warmer' AND job_id IS NULL")
             .execute(&self.db)
             .await?;
         let owner = system_user(&self.db).await?;
@@ -640,6 +713,40 @@ impl Backend {
         tracing::info!("created the warmer's access token");
         *held = Some(token.clone());
         Ok(token)
+    }
+
+    /// A warmer token for one job, acting for the user who started it: it
+    /// reads what that user may, and only downloads. Removed when the job
+    /// ends ([`Backend::drop_job_token`]); it also expires on its own.
+    pub async fn job_token(
+        &self,
+        job_id: i64,
+        starter: i64,
+        lifetime: Duration,
+    ) -> anyhow::Result<String> {
+        let owner = system_user(&self.db).await?;
+        let expires = now_secs() as i64 + lifetime.as_secs() as i64;
+        let (id, token) = self
+            .create_token(owner, &format!("warmer, job #{job_id}"), Some(expires))
+            .await?;
+        sqlx::query("UPDATE tokens SET system = 1, job_id = ?, acting_for = ? WHERE id = ?")
+            .bind(job_id)
+            .bind(starter)
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(token)
+    }
+
+    /// Remove a job's token (`None`: every job's, after a restart).
+    pub async fn drop_job_token(&self, job_id: Option<i64>) -> sqlx::Result<()> {
+        match job_id {
+            Some(id) => sqlx::query("DELETE FROM tokens WHERE job_id = ?").bind(id),
+            None => sqlx::query("DELETE FROM tokens WHERE job_id IS NOT NULL"),
+        }
+        .execute(&self.db)
+        .await?;
+        Ok(())
     }
 
     pub async fn user_by_id(&self, id: i64) -> sqlx::Result<Option<User>> {
@@ -738,21 +845,51 @@ impl Backend {
 
     /// The account a token belongs to, if the token is valid right now.
     pub async fn user_for_token(&self, token: &str) -> sqlx::Result<Option<User>> {
+        Ok(self.token_principal(token).await?.map(|(user, _)| user))
+    }
+
+    /// Who a valid token acts as: its owner, or for a job's warmer token,
+    /// the job's starter.
+    pub async fn principal_for_token(&self, token: &str) -> sqlx::Result<Option<Principal>> {
+        let Some((owner, t)) = self.token_principal(token).await? else {
+            return Ok(None);
+        };
+        if !owner.system {
+            return Ok(Some(Principal::User {
+                user: owner,
+                token: Some(policy::Token {
+                    private_access: t.private_access,
+                }),
+            }));
+        }
+        let starter = match t.acting_for {
+            Some(id) => self.user_by_id(id).await?.filter(|u| !u.system),
+            None => None,
+        };
+        Ok(Some(match starter {
+            Some(starter) if t.job_id.is_some() => Principal::Job { starter },
+            _ => Principal::Warmer,
+        }))
+    }
+
+    async fn token_principal(&self, token: &str) -> sqlx::Result<Option<(User, TokenGrant)>> {
         if !token.starts_with(TOKEN_PREFIX) || token.len() != TOKEN_PREFIX.len() + 64 {
             return Ok(None);
         }
         let now = now_secs() as i64;
-        let row: Option<(i64, i64)> = sqlx::query_as(
-            "SELECT t.id, t.user_id FROM tokens t JOIN users u ON u.id = t.user_id
+        let row: Option<TokenGrant> = sqlx::query_as(
+            "SELECT t.id, t.user_id, t.private_access, t.job_id, t.acting_for
+             FROM tokens t JOIN users u ON u.id = t.user_id
              WHERE t.hash = ? AND u.disabled = 0 AND (t.expires_at IS NULL OR t.expires_at > ?)",
         )
         .bind(sha256_hex(token))
         .bind(now)
         .fetch_optional(&self.db)
         .await?;
-        let Some((token_id, user_id)) = row else {
+        let Some(grant) = row else {
             return Ok(None);
         };
+        let (token_id, user_id) = (grant.id, grant.user_id);
         // Record use at most once a minute per token, not on every file.
         let stale = {
             let mut used = self.token_used.lock().unwrap();
@@ -771,7 +908,75 @@ impl Backend {
                 .execute(&self.db)
                 .await?;
         }
-        self.user_by_id(user_id).await
+        Ok(self.user_by_id(user_id).await?.map(|u| (u, grant)))
+    }
+}
+
+/// What a token row adds to its owner.
+#[derive(sqlx::FromRow)]
+struct TokenGrant {
+    id: i64,
+    user_id: i64,
+    private_access: bool,
+    job_id: Option<i64>,
+    acting_for: Option<i64>,
+}
+
+// ------------------------------------------------------------------ login
+
+/// A sign-in attempt from the login form.
+pub struct LoginAttempt {
+    pub username: String,
+    pub password: String,
+    /// The two-factor code, once asked for.
+    pub code: Option<String>,
+}
+
+/// What a login provider decided.
+pub enum LoginOutcome {
+    Accepted(User),
+    /// The password was right; ask for the two-factor code.
+    SecondFactor,
+    /// Wrong username or password.
+    Rejected,
+    /// Right password, wrong two-factor code.
+    WrongCode(User),
+}
+
+/// How a sign-in is checked. Sessions, roles and tokens don't depend on it:
+/// the login route asks the provider, then starts a session for the user it
+/// accepted. Another way to sign in (such as OIDC) is another implementation.
+pub trait LoginProvider: Send + Sync {
+    fn verify(
+        &self,
+        backend: &Backend,
+        attempt: LoginAttempt,
+    ) -> impl std::future::Future<Output = sqlx::Result<LoginOutcome>> + Send;
+}
+
+/// Local accounts: a password, then a TOTP code when two-factor is on.
+pub struct LocalPassword;
+
+impl LoginProvider for LocalPassword {
+    async fn verify(&self, backend: &Backend, attempt: LoginAttempt) -> sqlx::Result<LoginOutcome> {
+        let creds = Credentials {
+            username: attempt.username,
+            password: attempt.password,
+        };
+        let Some(user) = backend.check_password(&creds).await? else {
+            return Ok(LoginOutcome::Rejected);
+        };
+        if !user.totp_enabled {
+            return Ok(LoginOutcome::Accepted(user));
+        }
+        let Some(code) = attempt.code.filter(|c| !c.trim().is_empty()) else {
+            return Ok(LoginOutcome::SecondFactor);
+        };
+        Ok(if backend.check_totp(&user, &code).await? {
+            LoginOutcome::Accepted(user)
+        } else {
+            LoginOutcome::WrongCode(user)
+        })
     }
 }
 
@@ -873,16 +1078,13 @@ pub fn token_from_headers(headers: &HeaderMap) -> Option<String> {
 pub async fn client_guard(
     State(st): State<AppState>,
     auth: AuthSession,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
-    if !st.cfg.client_auth || auth.user.is_some() {
-        return next.run(req).await;
-    }
-    if let Some(token) = token_from_headers(req.headers()) {
-        match st.auth.user_for_token(&token).await {
-            Ok(Some(_)) => return next.run(req).await,
-            Ok(None) => {}
+    let principal = match (&auth.user, token_from_headers(req.headers())) {
+        (Some(_), _) => Principal::from_session(&auth),
+        (None, Some(token)) => match st.auth.principal_for_token(&token).await {
+            Ok(p) => p.unwrap_or(Principal::Anonymous),
             Err(e) => {
                 return AppError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -890,10 +1092,21 @@ pub async fn client_guard(
                 )
                 .into_response();
             }
-        }
+        },
+        (None, None) => Principal::Anonymous,
+    };
+    let anonymous = principal.is_anonymous();
+    req.extensions_mut().insert(principal);
+    if !st.cfg.client_auth || !anonymous {
+        return next.run(req).await;
     }
-    let base = base_url(&st.cfg, req.headers());
-    let path = req.uri().path();
+    challenge(&st, req.headers(), req.uri().path())
+}
+
+/// A 401 asking for an access token, in the form the client fetching `path`
+/// understands.
+pub fn challenge(st: &AppState, headers: &HeaderMap, path: &str) -> Response {
+    let base = base_url(&st.cfg, headers);
     let challenge = if path.starts_with("/cargo/") {
         format!("Cargo login_url=\"{base}/#/tokens\"")
     } else if path.starts_with("/maven/") || path.starts_with("/git/") {

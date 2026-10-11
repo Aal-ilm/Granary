@@ -483,6 +483,18 @@ pub async fn check_upstreams(st: &AppState) -> Vec<UpstreamHealth> {
     let client = st.store.passthrough_client();
     let checks = targets.into_iter().map(|(repo, method, url)| async move {
         let start = Instant::now();
+        if let Err(e) = st.store.check_url(&url) {
+            return UpstreamHealth {
+                repo,
+                ok: false,
+                status: None,
+                latency_ms: 0,
+                error: Some(e.message),
+                checked_at: now_secs(),
+                url,
+                offline: false,
+            };
+        }
         let res = client
             .request(method, &url)
             .timeout(Duration::from_secs(8))
@@ -530,7 +542,13 @@ fn short_error(e: &reqwest::Error) -> String {
     if e.is_timeout() {
         "timed out".into()
     } else if e.is_connect() {
-        "connection failed".into()
+        // The innermost cause says why: refused, a certificate problem, or
+        // an address the private-address rule doesn't allow.
+        let mut cause: &dyn std::error::Error = e;
+        while let Some(next) = cause.source() {
+            cause = next;
+        }
+        format!("connection failed: {cause}")
     } else {
         e.to_string()
     }

@@ -11,12 +11,13 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{JOB_COLUMNS, JobRow, warmer};
+use super::{JOB_COLUMNS, JobBy, JobRow, NewJob, warmer};
 use crate::{
     AppState,
     auth::{AuthSession, require_admin},
     error::{AppError, AppResult},
     net::ClientIp,
+    policy::Principal,
     templates::{self, build, lines::Eco},
 };
 
@@ -71,7 +72,11 @@ struct ListQuery {
     template: Option<i64>,
 }
 
-async fn list(State(st): State<AppState>, Query(q): Query<ListQuery>) -> AppResult<Json<Value>> {
+async fn list(
+    State(st): State<AppState>,
+    who: Principal,
+    Query(q): Query<ListQuery>,
+) -> AppResult<Json<Value>> {
     let sql = format!("SELECT {JOB_COLUMNS} FROM jobs");
     let rows: Vec<JobRow> = match q.template {
         Some(t) => {
@@ -91,6 +96,10 @@ async fn list(State(st): State<AppState>, Query(q): Query<ListQuery>) -> AppResu
         }
     }
     .map_err(db_error)?;
+    let rows: Vec<JobRow> = rows
+        .into_iter()
+        .filter(|j| st.policy.can_read(&who, j.resource().as_ref()))
+        .collect();
     Ok(Json(
         json!({ "jobs": rows, "max_running": st.cfg.warm_jobs }),
     ))
@@ -102,19 +111,27 @@ struct OneQuery {
     after: Option<i64>,
 }
 
-async fn one(
-    State(st): State<AppState>,
-    Path(id): Path<i64>,
-    Query(q): Query<OneQuery>,
-) -> AppResult<Json<Value>> {
-    let job: JobRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+/// A job `who` may see; one on private content they can't read is "no such
+/// job", like one that doesn't exist.
+async fn load(st: &AppState, who: &Principal, id: i64) -> AppResult<JobRow> {
+    sqlx::query_as::<_, JobRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?"
     )))
     .bind(id)
     .fetch_optional(&st.auth.db)
     .await
     .map_err(db_error)?
-    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "no such job"))?;
+    .filter(|j| st.policy.can_read(who, j.resource().as_ref()))
+    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "no such job"))
+}
+
+async fn one(
+    State(st): State<AppState>,
+    who: Principal,
+    Path(id): Path<i64>,
+    Query(q): Query<OneQuery>,
+) -> AppResult<Json<Value>> {
+    let job = load(&st, &who, id).await?;
     let lines: Vec<(i64, i64, String)> = sqlx::query_as(
         "SELECT n, at, line FROM job_log WHERE job_id = ? AND n > ? ORDER BY n LIMIT 2000",
     )
@@ -132,10 +149,12 @@ async fn one(
 async fn cancel(
     State(st): State<AppState>,
     auth: AuthSession,
+    who: Principal,
     Extension(ip): Extension<ClientIp>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<Value>> {
     let admin = require_admin(&auth)?.username.clone();
+    load(&st, &who, id).await?;
     if !super::cancel(&st, id, &admin).await.map_err(db_error)? {
         return Err(AppError::new(
             StatusCode::CONFLICT,
@@ -149,27 +168,24 @@ async fn cancel(
 async fn warm_template(
     State(st): State<AppState>,
     auth: AuthSession,
+    who: Principal,
     Extension(ip): Extension<ClientIp>,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
-    let admin = require_admin(&auth)?.username.clone();
-    let t = templates::get(&st.auth.db, id)
-        .await
-        .map_err(db_error)?
-        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "no such template"))?;
+    let user = require_admin(&auth)?;
+    let (admin, by) = (user.username.clone(), JobBy::user(user));
+    let t = templates::api::load(&st, &who, id).await?;
     need_warmer(&st).await?;
     let repo = t.source.as_ref().and_then(super::RepoWarm::from_source);
-    let job = super::enqueue(
-        &st,
-        "template",
-        Some(id),
-        &t.input.name,
-        &t.input,
+    let new = NewJob {
+        kind: "template",
+        template_id: Some(id),
+        title: &t.input.name,
+        spec: &t.input,
         repo,
-        &admin,
-    )
-    .await
-    .map_err(db_error)?;
+        private: t.resource(&st.cfg),
+    };
+    let job = super::enqueue(&st, new, &by).await.map_err(db_error)?;
     audit(
         &st,
         &admin,
@@ -195,7 +211,8 @@ async fn warm_package(
     Extension(ip): Extension<ClientIp>,
     Json(body): Json<PackageBody>,
 ) -> AppResult<Response> {
-    let admin = require_admin(&auth)?.username.clone();
+    let user = require_admin(&auth)?;
+    let (admin, by) = (user.username.clone(), JobBy::user(user));
     let eco = Eco::parse(&body.eco).ok_or_else(|| AppError::bad_request("unknown ecosystem"))?;
     let spec = build::single(
         eco,
@@ -211,9 +228,15 @@ async fn warm_package(
         body.name.trim(),
         body.version.trim()
     );
-    let job = super::enqueue(&st, "package", None, &title, &spec, None, &admin)
-        .await
-        .map_err(db_error)?;
+    let new = NewJob {
+        kind: "package",
+        template_id: None,
+        title: &title,
+        spec: &spec,
+        repo: None,
+        private: None,
+    };
+    let job = super::enqueue(&st, new, &by).await.map_err(db_error)?;
     audit(
         &st,
         &admin,

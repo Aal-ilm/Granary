@@ -20,6 +20,7 @@ use crate::{
     auth::{AuthSession, require_admin},
     error::{AppError, AppResult},
     net::ClientIp,
+    policy::Principal,
     util::base_url,
 };
 
@@ -46,9 +47,10 @@ async fn audit(st: &AppState, actor: &str, action: &str, target: &str, ip: Clien
     crate::audit::record(&st.auth.db, actor, action, target, Some(ip.0), true).await;
 }
 
-fn summary(t: &Template) -> Value {
+fn summary(t: &Template, cfg: &crate::config::Config) -> Value {
     json!({
         "id": t.id,
+        "private": t.resource(cfg).is_some(),
         "builtin": t.builtin,
         "name": t.input.name,
         "description": t.input.description,
@@ -66,25 +68,36 @@ fn summary(t: &Template) -> Value {
     })
 }
 
-async fn load(st: &AppState, id: i64) -> AppResult<Template> {
+/// A template `who` may see; one made from private content they can't read
+/// is "no such template", like one that doesn't exist.
+pub async fn load(st: &AppState, who: &Principal, id: i64) -> AppResult<Template> {
     super::get(&st.auth.db, id)
         .await
         .map_err(db_error)?
+        .filter(|t| st.policy.can_read(who, t.resource(&st.cfg).as_ref()))
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "no such template"))
 }
 
-async fn list(State(st): State<AppState>) -> AppResult<Json<Value>> {
+async fn list(State(st): State<AppState>, who: Principal) -> AppResult<Json<Value>> {
     let all = super::list(&st.auth.db).await.map_err(db_error)?;
     Ok(Json(json!({
-        "templates": all.iter().map(summary).collect::<Vec<_>>(),
+        "templates": all
+            .iter()
+            .filter(|t| st.policy.can_read(&who, t.resource(&st.cfg).as_ref()))
+            .map(|t| summary(t, &st.cfg))
+            .collect::<Vec<_>>(),
         "platforms": PLATFORMS.iter().map(|(id, label)| json!({"id": id, "label": label})).collect::<Vec<_>>(),
         "default_platforms": default_platforms(),
     })))
 }
 
-async fn one(State(st): State<AppState>, Path(id): Path<i64>) -> AppResult<Json<Value>> {
-    let t = load(&st, id).await?;
-    let mut v = summary(&t);
+async fn one(
+    State(st): State<AppState>,
+    who: Principal,
+    Path(id): Path<i64>,
+) -> AppResult<Json<Value>> {
+    let t = load(&st, &who, id).await?;
+    let mut v = summary(&t, &st.cfg);
     for eco in lines::Eco::ALL {
         v[eco.as_str()] = json!(t.input.section(eco));
     }
@@ -163,12 +176,13 @@ async fn create(
 async fn update(
     State(st): State<AppState>,
     auth: AuthSession,
+    who: Principal,
     Extension(ip): Extension<ClientIp>,
     Path(id): Path<i64>,
     Json(input): Json<TemplateInput>,
 ) -> AppResult<Json<Value>> {
     let admin = require_admin(&auth)?.username.clone();
-    let existing = load(&st, id).await?;
+    let existing = load(&st, &who, id).await?;
     if existing.builtin {
         return Err(AppError::new(
             StatusCode::FORBIDDEN,
@@ -186,11 +200,12 @@ async fn update(
 async fn delete(
     State(st): State<AppState>,
     auth: AuthSession,
+    who: Principal,
     Extension(ip): Extension<ClientIp>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<Value>> {
     let admin = require_admin(&auth)?.username.clone();
-    let existing = load(&st, id).await?;
+    let existing = load(&st, &who, id).await?;
     if existing.builtin {
         return Err(AppError::new(
             StatusCode::FORBIDDEN,
@@ -205,16 +220,23 @@ async fn delete(
 async fn clone(
     State(st): State<AppState>,
     auth: AuthSession,
+    who: Principal,
     Extension(ip): Extension<ClientIp>,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
     let admin = require_admin(&auth)?.username.clone();
-    let source = load(&st, id).await?;
+    let source = load(&st, &who, id).await?;
     let mut copy = source.input.clone();
     copy.name = super::copy_name(&st.auth.db, &source.input.name)
         .await
         .map_err(db_error)?;
     let new_id = super::insert(&st.auth.db, &copy).await.map_err(db_error)?;
+    // A copy of private content is just as private.
+    if let Some(r) = source.resource(&st.cfg) {
+        super::set_private(&st.auth.db, new_id, &r)
+            .await
+            .map_err(db_error)?;
+    }
     audit(
         &st,
         &admin,
@@ -248,8 +270,12 @@ pub fn slug(name: &str) -> String {
     }
 }
 
-async fn export(State(st): State<AppState>, Path(id): Path<i64>) -> AppResult<Response> {
-    let t = load(&st, id).await?;
+async fn export(
+    State(st): State<AppState>,
+    who: Principal,
+    Path(id): Path<i64>,
+) -> AppResult<Response> {
+    let t = load(&st, &who, id).await?;
     let disposition = format!("attachment; filename=\"{}.toml\"", slug(&t.input.name));
     Ok((
         [
@@ -268,10 +294,11 @@ async fn export(State(st): State<AppState>, Path(id): Path<i64>) -> AppResult<Re
 /// It never contains a token.
 async fn starter(
     State(st): State<AppState>,
+    who: Principal,
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
-    let t = load(&st, id).await?;
+    let t = load(&st, &who, id).await?;
     let base = base_url(&st.cfg, &headers);
     // A template made from a repo: the repo's own manifests and lockfiles at
     // the pinned commit, instead of generated ones.
@@ -370,18 +397,20 @@ struct ScheduleBody {
 async fn schedule(
     State(st): State<AppState>,
     auth: AuthSession,
+    who: Principal,
     Extension(ip): Extension<ClientIp>,
     Path(id): Path<i64>,
     Json(body): Json<ScheduleBody>,
 ) -> AppResult<Json<Value>> {
-    let admin = require_admin(&auth)?.username.clone();
+    let user = require_admin(&auth)?;
+    let (admin, admin_id) = (user.username.clone(), user.id);
     if !SCHEDULES.iter().any(|(s, _)| *s == body.schedule) {
         return Err(AppError::bad_request(
             "schedule must be off, daily or weekly",
         ));
     }
-    let t = load(&st, id).await?;
-    super::set_schedule(&st.auth.db, id, &body.schedule)
+    let t = load(&st, &who, id).await?;
+    super::set_schedule(&st.auth.db, id, &body.schedule, admin_id)
         .await
         .map_err(db_error)?;
     audit(

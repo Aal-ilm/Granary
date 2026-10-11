@@ -87,6 +87,8 @@ pub(super) struct Upstream {
     refs_hits: Arc<AtomicUsize>,
     fail: Arc<AtomicBool>,
     delay: Arc<Mutex<Duration>>,
+    /// Set when any request carried an Authorization header.
+    pub(super) saw_auth: Arc<AtomicBool>,
 }
 
 async fn serve_upstream(
@@ -98,6 +100,9 @@ async fn serve_upstream(
 ) -> Response {
     if uri.path().ends_with("/info/refs") {
         u.refs_hits.fetch_add(1, Ordering::SeqCst);
+    }
+    if headers.contains_key(axum::http::header::AUTHORIZATION) {
+        u.saw_auth.store(true, Ordering::SeqCst);
     }
     if u.fail.load(Ordering::SeqCst) {
         return (StatusCode::INTERNAL_SERVER_ERROR, "upstream is down").into_response();
@@ -130,6 +135,7 @@ impl Upstream {
             refs_hits: Arc::default(),
             fail: Arc::default(),
             delay: Arc::default(),
+            saw_auth: Arc::default(),
         };
         let app = Router::new()
             .fallback(any(serve_upstream))

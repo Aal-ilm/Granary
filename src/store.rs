@@ -49,6 +49,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
 use crate::{
+    egress::Egress,
     error::{AppError, AppResult},
     util::safe_rel_path,
 };
@@ -144,6 +145,8 @@ pub struct Store {
     root: PathBuf,
     meta_client: reqwest::Client,
     file_client: reqwest::Client,
+    /// The private-address rule, checked before each request.
+    egress: Arc<Egress>,
     meta_ttl: Duration,
     offline: bool,
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -181,7 +184,12 @@ pub fn now_secs() -> u64 {
 }
 
 impl Store {
-    pub async fn new(root: PathBuf, meta_ttl: Duration, offline: bool) -> anyhow::Result<Self> {
+    pub async fn new(
+        root: PathBuf,
+        meta_ttl: Duration,
+        offline: bool,
+        egress: Arc<Egress>,
+    ) -> anyhow::Result<Self> {
         tokio::fs::create_dir_all(root.join("tmp")).await?;
         // Leftover partial downloads from a crash are useless; clear them.
         let mut rd = tokio::fs::read_dir(root.join("tmp")).await?;
@@ -189,14 +197,16 @@ impl Store {
             let _ = tokio::fs::remove_file(e.path()).await;
         }
 
-        let meta_client = reqwest::Client::builder()
+        let meta_client = egress
+            .client()
             .user_agent(USER_AGENT)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
             .build()?;
         // Files must arrive byte-for-byte, so never let the client transparently
         // decompress them (some servers mislabel .tar.gz with Content-Encoding).
-        let file_client = reqwest::Client::builder()
+        let file_client = egress
+            .client()
             .user_agent(USER_AGENT)
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(60))
@@ -213,6 +223,7 @@ impl Store {
             root,
             meta_client,
             file_client,
+            egress,
             meta_ttl,
             offline,
             locks: Mutex::new(HashMap::new()),
@@ -233,9 +244,21 @@ impl Store {
         self.offline
     }
 
-    /// Client for uncached pass-through requests.
+    /// Client for uncached pass-through requests. Check each URL with
+    /// [`Store::check_url`] first.
     pub fn passthrough_client(&self) -> &reqwest::Client {
         &self.meta_client
+    }
+
+    /// Outbound connection rules, for other clients (git) to follow too.
+    pub fn egress(&self) -> &Arc<Egress> {
+        &self.egress
+    }
+
+    /// Refuse a URL whose IP address breaks the private-address rule (names
+    /// are checked when the clients resolve them).
+    pub fn check_url(&self, url: &str) -> AppResult<()> {
+        self.egress.check_url(url).map_err(AppError::bad_gateway)
     }
 
     /// Run `f` while holding a per-key lock, so concurrent cache misses for the
@@ -395,6 +418,7 @@ impl Store {
         if self.offline {
             return Err(AppError::offline(url));
         }
+        self.check_url(url)?;
         let resp = self.file_client.get(url).send().await?;
         match resp.status() {
             s if s.is_success() => {}
@@ -440,6 +464,7 @@ impl Store {
     }
 
     async fn download(&self, url: &str, dest: &Path, expected: Option<&Checksum>) -> AppResult<()> {
+        self.check_url(url)?;
         let resp = self.file_client.get(url).send().await?;
         match resp.status() {
             s if s.is_success() => {}
@@ -578,6 +603,7 @@ impl Store {
         accept: &str,
     ) -> AppResult<Meta> {
         let cached = self.read_info(info_path).await;
+        self.check_url(url)?;
         let mut req = self.meta_client.get(url).header(ACCEPT, accept);
         if let Some(info) = &cached {
             if let Some(etag) = &info.etag {
