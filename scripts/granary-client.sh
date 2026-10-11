@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Point this machine's npm, pip, Cargo, Maven and Gradle at Granary, or
+# Point this machine's npm, pip, Cargo, Maven, Gradle and git at Granary, or
 # switch them back to the public registries, without retyping anything.
 #
 #   granary-client.sh use-granary   install through Granary
@@ -14,12 +14,14 @@
 #   GRANARY_URL     Granary's address, e.g. http://10.212.46.20:8480
 #                   (remembered after the first use-granary)
 #   GRANARY_TOKEN   access token; asked for once if not set, then remembered
-#   TOOLS           which tools to change, default "npm pip cargo maven"
+#   TOOLS           which tools to change, default "npm pip cargo maven git"
 #                   ("maven" covers both Maven and Gradle)
 #
 # Compatible with Bash 3.2 (macOS) and later. Only edits per-user config:
 # ~/.npmrc, your user pip.conf, $CARGO_HOME/config.toml, ~/.m2/settings.xml
-# and $GRADLE_USER_HOME/init.d/granary.gradle. Each file is backed up before
+# $GRADLE_USER_HOME/init.d/granary.gradle and, for git, one include.path line
+# in ~/.gitconfig pointing at granary-client's own gitconfig (mode 600, which
+# holds the token). Each file is backed up before
 # its first change. settings.xml is edited by m2-settings.py (next to this
 # script, needs python3), which works on the XML rather than on raw lines.
 
@@ -33,7 +35,10 @@ M2_DIR="$HOME/.m2"
 GRADLE_DIR="${GRADLE_USER_HOME:-$HOME/.gradle}"
 GRADLE_INIT="$GRADLE_DIR/init.d/granary.gradle"
 GRADLE_MARK="// Managed by granary-client; 'make use-public' and 'make remove' delete it."
-TOOLS="${TOOLS:-npm pip cargo maven}"
+TOOLS="${TOOLS:-npm pip cargo maven git}"
+GIT_CFG="$STATE_DIR/gitconfig"
+GITNET_BEGIN="# >>> granary git (managed by granary-client) >>>"
+GITNET_END="# <<< granary git <<<"
 PIP=(python3 -m pip)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 M2_SETTINGS=(python3 "$SCRIPT_DIR/m2-settings.py")
@@ -455,6 +460,112 @@ maven_status() {
   fi
 }
 
+# --------------------------------------------------------------------- git
+
+# Granary's git settings live in their own file, included from the global git
+# config, so the token never sits in ~/.gitconfig itself.
+git_global() { git config --global "$@"; }
+
+git_included() {
+  git_global --get-all include.path 2>/dev/null | grep -qxF "$GIT_CFG"
+}
+
+# The hosts Granary caches repos from; the defaults if it can't be asked.
+git_hosts() {
+  local hosts
+  hosts="$(curl -fsS -m 5 -H "Authorization: Bearer $TOKEN" "$URL/git/hosts" 2>/dev/null | tr -d '\r' || true)"
+  [ -n "$hosts" ] || hosts="github.com
+gitlab.com
+codeberg.org"
+  printf '%s\n' "$hosts"
+}
+
+git_use_granary() {
+  has git || { info "git: not installed, skipped"; return 0; }
+  local basic hosts host
+  basic="$(printf 'token:%s' "$TOKEN" | base64 | tr -d '\n')"
+  hosts="$(git_hosts)"
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+  (
+    umask 077
+    {
+      printf '# Managed by granary-client: clone from these hosts through Granary.\n'
+      printf '# make use-public stops using it; make remove deletes it.\n'
+      for host in $hosts; do
+        printf '[url "%s/git/%s/"]\n\tinsteadOf = https://%s/\n' "$URL" "$host" "$host"
+      done
+      printf '[http "%s/"]\n\textraHeader = Authorization: Basic %s\n' "$URL" "$basic"
+    } >"$GIT_CFG"
+  )
+  chmod 600 "$GIT_CFG"
+  git_included || git_global --add include.path "$GIT_CFG"
+  git_cargo_cli
+  ok "git  -> $URL/git/ for $(printf '%s' "$hosts" | tr '\n' ' ' | sed 's/ *$//')"
+}
+
+# Cargo's built-in git client follows insteadOf but not http.extraHeader, so
+# Cargo git dependencies authenticate only when Cargo runs the git command.
+git_cargo_cli() {
+  has cargo || return 0
+  local file
+  file="$(cargo_file)"
+  mkdir -p "$CARGO_DIR"
+  local outside
+  outside="$( [ -f "$file" ] && awk -v b="$GITNET_BEGIN" -v e="$GITNET_END" '
+    $0 == b { skip = 1; next }
+    $0 == e { skip = 0; next }
+    !skip
+  ' "$file" || true)"
+  if printf '%s\n' "$outside" | grep -Eq '^[[:space:]]*\[net\]'; then
+    if ! printf '%s\n' "$outside" | grep -Eq '^[[:space:]]*git-fetch-with-cli[[:space:]]*=[[:space:]]*true'; then
+      warn "$file has its own [net] section; add git-fetch-with-cli = true to it so Cargo git dependencies use Granary"
+    fi
+    return 0
+  fi
+  backup "$file"
+  strip_block "$file" "$GITNET_BEGIN" "$GITNET_END"
+  {
+    [ -s "$file" ] && printf '\n'
+    printf '%s\n' "$GITNET_BEGIN"
+    printf '[net]\ngit-fetch-with-cli = true\n'
+    printf '%s\n' "$GITNET_END"
+  } >>"$file"
+}
+
+git_drop_include() {
+  has git || return 0
+  if git_included; then
+    git_global --fixed-value --unset-all include.path "$GIT_CFG" 2>/dev/null \
+      || git_global --unset-all include.path "^$(printf '%s' "$GIT_CFG" | sed 's/[][\.*^$|/]/\\&/g')\$"
+  fi
+}
+
+git_use_public() {
+  has git || return 0
+  # The file (and token) stays, so use-granary switches straight back.
+  git_drop_include
+  ok "git  -> upstream hosts directly"
+}
+
+git_remove() {
+  git_drop_include
+  rm -f "$GIT_CFG"
+  if has cargo; then strip_block "$(cargo_file)" "$GITNET_BEGIN" "$GITNET_END"; fi
+  ok "git: Granary routing and token removed"
+}
+
+git_status() {
+  has git || { info "git    not installed"; return 0; }
+  if git_included && [ -f "$GIT_CFG" ]; then
+    local u
+    u="$(sed -n 's/^\[url "\(.*\)\/git\/.*$/\1/p' "$GIT_CFG" | head -n 1)"
+    info "git    ${u:-Granary}/git/ (for $(grep -c 'insteadOf' "$GIT_CFG") hosts)"
+  else
+    info "git    upstream hosts directly"
+  fi
+}
+
 # -------------------------------------------------------------- commands
 
 cmd_use_granary() {
@@ -524,7 +635,7 @@ cmd_status() {
 }
 
 for t in $TOOLS; do
-  case "$t" in npm | pip | cargo | maven) ;; *) die "unknown tool in TOOLS: $t (use npm, pip, cargo, maven)" ;; esac
+  case "$t" in npm | pip | cargo | maven | git) ;; *) die "unknown tool in TOOLS: $t (use npm, pip, cargo, maven, git)" ;; esac
 done
 
 case "${1:-}" in

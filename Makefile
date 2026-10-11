@@ -1,4 +1,4 @@
-# Client setup for this machine: send npm, pip, Cargo, Maven and Gradle
+# Client setup for this machine: send npm, pip, Cargo, Maven, Gradle and git
 # through Granary, or switch them back to the public registries (for example
 # while Granary is down). Works with the GNU Make 3.81 that ships with macOS.
 #
@@ -15,7 +15,8 @@
 #
 # Limit to some tools with TOOLS, e.g.  make use-public TOOLS=npm
 # TOOLS=maven covers both Maven (~/.m2/settings.xml) and Gradle
-# (~/.gradle/init.d/granary.gradle).
+# (~/.gradle/init.d/granary.gradle). TOOLS=git sends git clones of GitHub,
+# GitLab and Codeberg repos (and Cargo git dependencies) through Granary.
 
 CLIENT := ./scripts/granary-client.sh
 
@@ -27,13 +28,13 @@ export GRANARY_URL GRANARY_TOKEN TOOLS
 DIR ?= .
 
 help:
-	@echo "make use-granary GRANARY_URL=http://HOST:PORT   send npm, pip, cargo, maven and gradle through Granary"
+	@echo "make use-granary GRANARY_URL=http://HOST:PORT   send npm, pip, cargo, maven, gradle and git through Granary"
 	@echo "make use-public                                  use the public registries directly"
 	@echo "make status                                      show where each tool points"
 	@echo "make remove                                      remove all Granary settings and the saved token"
 	@echo "make fix-lockfile DIR=PATH                       make a project's package-lock.json work without Granary"
 	@echo ""
-	@echo "Optional: TOOLS=\"npm pip cargo maven\" to choose tools (maven includes gradle), GRANARY_TOKEN=... to skip the prompt."
+	@echo "Optional: TOOLS=\"npm pip cargo maven git\" to choose tools (maven includes gradle), GRANARY_TOKEN=... to skip the prompt."
 
 use-granary:
 	@bash $(CLIENT) use-granary

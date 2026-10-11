@@ -211,6 +211,7 @@ pub async fn open_db(data_dir: &Path) -> anyhow::Result<SqlitePool> {
     // Columns added after the first release.
     add_column(&pool, "tokens", "system", "INTEGER NOT NULL DEFAULT 0").await?;
     crate::templates::migrate(&pool).await?;
+    crate::jobs::migrate(&pool).await?;
     Ok(pool)
 }
 
@@ -800,8 +801,8 @@ pub async fn client_guard(
     let path = req.uri().path();
     let challenge = if path.starts_with("/cargo/") {
         format!("Cargo login_url=\"{base}/#/tokens\"")
-    } else if path.starts_with("/maven/") {
-        // Maven only sends its <server> credentials after this challenge.
+    } else if path.starts_with("/maven/") || path.starts_with("/git/") {
+        // Maven and git only send credentials after this challenge.
         "Basic realm=\"granary\"".to_string()
     } else {
         "Basic realm=\"Granary\", charset=\"UTF-8\"".to_string()

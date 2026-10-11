@@ -96,7 +96,19 @@ pub(crate) async fn usage(st: &AppState, inv: &[Asset]) -> Vec<RepoUsage> {
 
 async fn overview(State(st): State<AppState>) -> Json<Value> {
     let inv = st.admin.inventory(&st.store).await;
-    let repos = usage(&st, &inv).await;
+    let mut repos = usage(&st, &inv).await;
+    // Cached git repos get their own gauge and count toward the budget.
+    let root = crate::formats::git::git_root(&st);
+    let git = tokio::task::spawn_blocking(move || crate::formats::git::list(&root))
+        .await
+        .unwrap_or_default();
+    repos.push(RepoUsage {
+        repo: "git",
+        packages: git.len(),
+        files: git.len(),
+        size: git.iter().map(|r| r.size).sum(),
+        meta_size: 0,
+    });
     let mut recent: Vec<&Asset> = inv.iter().collect();
     recent.sort_by_key(|a| std::cmp::Reverse(a.cached_at));
     recent.truncate(8);

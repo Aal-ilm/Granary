@@ -2,6 +2,7 @@
 //! localhost and a throwaway data directory.
 
 mod cache_limit;
+mod git;
 mod jobs;
 mod maven;
 mod offline;
@@ -105,6 +106,8 @@ impl Mock {
 pub struct Harness {
     pub app: Router,
     pub state: AppState,
+    /// Granary's own URL when served over TCP (`Opts::serve`).
+    pub url: Option<String>,
     /// The mock upstream's base URL, e.g. http://127.0.0.1:1234.
     base: String,
     db: sqlx::SqlitePool,
@@ -128,6 +131,10 @@ pub struct Opts {
     pub warm_timeout: Duration,
     /// Also serve Granary on a real TCP port, so a warmer can reach it.
     pub serve: bool,
+    /// Where git repos are cloned from (a local test upstream).
+    pub git_upstream: Option<String>,
+    pub git_max_size: u64,
+    pub git_timeout: Duration,
 }
 
 /// The shared secret test warmers expect.
@@ -146,6 +153,9 @@ impl Default for Opts {
             warm_jobs: 2,
             warm_timeout: Duration::from_secs(1800),
             serve: false,
+            git_upstream: None,
+            git_max_size: 2 << 30,
+            git_timeout: Duration::from_secs(600),
         }
     }
 }
@@ -176,6 +186,9 @@ impl Harness {
             warm_jobs,
             warm_timeout,
             serve,
+            git_upstream,
+            git_max_size,
+            git_timeout,
         } = opts;
         // Bind first so the config can name Granary's own address.
         let own = if serve {
@@ -223,6 +236,10 @@ impl Harness {
             warm_jobs,
             warm_timeout,
             warm_python: "3.12".into(),
+            git_hosts: vec!["github.com".into(), "codeberg.org".into()],
+            git_max_size,
+            git_timeout,
+            git_upstream_override: git_upstream,
             admin_user: "admin".into(),
             admin_password: None,
             client_auth,
@@ -266,6 +283,7 @@ impl Harness {
         Self {
             base,
             state: state.clone(),
+            url: own_url,
             db: state.auth.db.clone(),
             app,
             mock,

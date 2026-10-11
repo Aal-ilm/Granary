@@ -240,7 +240,7 @@ impl Store {
 
     /// Run `f` while holding a per-key lock, so concurrent cache misses for the
     /// same item result in a single upstream fetch.
-    async fn with_lock<T>(&self, key: &str, f: impl Future<Output = T>) -> T {
+    pub async fn with_lock<T>(&self, key: &str, f: impl Future<Output = T>) -> T {
         /// Removes the map entry when the last user is done, even if the
         /// request is cancelled part-way through.
         struct Entry<'a> {

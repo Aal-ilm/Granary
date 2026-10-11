@@ -37,7 +37,10 @@ const offlineBanner = (health) =>
     ? '<div class="banner"><span class="dot warn"></span><span>Offline mode is on. Granary serves only what is cached and never contacts the public registries. Turn off <code>GRANARY_OFFLINE</code> to fetch new packages.</span></div>'
     : '';
 
-const chip = (repo) => `<span class="fmt ${esc(repo)}">${esc(REPOS[repo]?.label ?? repo)}</span>`;
+/** Display names for everything with a gauge: the package formats and Git. */
+const FORMAT_LABELS = { ...Object.fromEntries(REPO_IDS.map((id) => [id, REPOS[id].label])), git: 'Git' };
+
+const chip = (repo) => `<span class="fmt ${esc(repo)}">${esc(FORMAT_LABELS[repo] ?? repo)}</span>`;
 
 function bytes(n) {
   if (n == null) return '-';
@@ -352,6 +355,7 @@ function go(path, query, { replace = false } = {}) {
 const routes = [
   [/^\/$/, 'overview', renderOverview],
   [/^\/repos$/, 'repos', renderRepos],
+  [/^\/browse\/git$/, 'browse', renderGitRepos],
   [/^\/browse(?:\/(cargo|npm|pypi|maven))?$/, 'browse', renderBrowse],
   [/^\/c\/(cargo|npm|pypi|maven)\/(.+)$/, 'browse', renderComponent],
   [/^\/get(?:\/(npm|cargo|pypi|maven))?$/, 'get', renderGet, { admin: true }],
@@ -430,7 +434,8 @@ async function renderOverview({ isCurrent }) {
   const d = await api('/api/overview');
   if (!isCurrent()) return;
   const total = d.repos.reduce((s, r) => s + r.size, 0);
-  const packages = d.repos.reduce((s, r) => s + r.packages, 0);
+  const packages = d.repos.filter((r) => r.repo !== 'git').reduce((s, r) => s + r.packages, 0);
+  const gitRepos = d.repos.find((r) => r.repo === 'git')?.packages || 0;
   const hits = d.stats.file_hits;
   const served = hits + d.stats.file_downloads;
   const hitRate = served ? Math.round((hits / served) * 100) : null;
@@ -452,12 +457,12 @@ async function renderOverview({ isCurrent }) {
       const fill = r.size ? Math.min(100, Math.max(4, level)) : 0;
       const levelText = capacity ? `, ${level < 1 && r.size ? 'under 1' : Math.round(level)}% of the ${against}` : '';
       return `
-      <a class="silo-col ${esc(r.repo)}" href="#/browse/${esc(r.repo)}" aria-label="${esc(REPOS[r.repo].label)}: ${esc(bytes(r.size))}, ${esc(plural(r.packages, 'package'))}${esc(levelText)}" title="${esc(bytes(r.size))}${esc(levelText)}">
+      <a class="silo-col ${esc(r.repo)}" href="#/browse/${esc(r.repo)}" aria-label="${esc(FORMAT_LABELS[r.repo] ?? r.repo)}: ${esc(bytes(r.size))}, ${esc(plural(r.packages, r.repo === 'git' ? 'repo' : 'package'))}${esc(levelText)}" title="${esc(bytes(r.size))}${esc(levelText)}">
         <div class="silo"><div class="grain" data-fill="${fill.toFixed(1)}"></div></div>
         <div class="silo-label">
           ${chip(r.repo)}
           <span class="silo-size num">${esc(bytes(r.size))}</span>
-          <span class="silo-meta">${esc(plural(r.packages, 'package'))}</span>
+          <span class="silo-meta">${esc(plural(r.packages, r.repo === 'git' ? 'repo' : 'package'))}</span>
           ${total ? `<span class="silo-meta">${Math.round(share)}% of cache</span>` : ''}
         </div>
       </a>`;
@@ -489,7 +494,7 @@ async function renderOverview({ isCurrent }) {
 
   setView(`
     <div class="page-head">
-      <div><h1>Overview</h1><p>${esc(plural(packages, 'package'))} cached, using ${esc(bytes(total))}.</p></div>
+      <div><h1>Overview</h1><p>${esc(plural(packages, 'package'))}${gitRepos ? ` and ${esc(plural(gitRepos, 'git repo'))}` : ''} cached, using ${esc(bytes(total))}.</p></div>
     </div>
     ${offlineBanner(d.health)}
     <section class="granary">
@@ -613,14 +618,7 @@ async function renderBrowse({ params, query, isCurrent }) {
   const d = await api('/api/components?' + apiQuery);
   if (!isCurrent()) return;
 
-  const linkFor = (r) => {
-    const qs = new URLSearchParams();
-    if (q) qs.set('q', q);
-    return '#/browse' + (r ? '/' + r : '') + (q ? '?' + qs : '');
-  };
-  const tabs = [['', 'All'], ...REPO_IDS.map((id) => [id, REPOS[id].label])]
-    .map(([id, label]) => `<a href="${linkFor(id)}" aria-current="${id === repo}">${esc(label)}</a>`)
-    .join('');
+  const tabs = browseTabs(repo, q);
 
   const col = (key, label, cls = '') => {
     const active = sort === key;
@@ -1450,7 +1448,7 @@ const jobStatus = (s) => {
 const jobActive = (j) => j.status === 'queued' || j.status === 'running';
 const jobDuration = (j) => (j.started_at ? duration((j.finished_at || Date.now() / 1000) - j.started_at) : '-');
 const jobAdded = (j) =>
-  j.new_files == null ? '-' : `${plural(j.new_packages, 'package')}, ${bytes(j.new_bytes)}`;
+  j.new_files == null ? '-' : `${plural(j.new_packages, j.kind === 'git' ? 'new repo' : 'package')}, ${bytes(j.new_bytes)}`;
 
 /** Start a warm job and open its page. */
 async function startWarm(path, body) {
@@ -1481,7 +1479,7 @@ async function renderJobs({ isCurrent }) {
     .map(
       (j) => `<tr>
         <td class="num">#${esc(j.id)}</td>
-        <td><a href="#/jobs/${j.id}">${esc(j.title)}</a> <span class="muted">${j.kind === 'template' ? 'template' : 'package'}</span></td>
+        <td><a href="#/jobs/${j.id}">${esc(j.title)}</a> <span class="muted">${j.kind === 'git' ? 'repo' : j.kind}</span></td>
         <td>${jobStatus(j.status)}</td>
         <td>${timeTag(j.created_at)} <span class="muted">by ${esc(j.created_by)}</span></td>
         <td class="num hide-sm">${esc(jobDuration(j))}</td>
@@ -1539,8 +1537,8 @@ async function renderJob({ params, isCurrent }) {
     <dl class="panel panel-pad tpl-facts">
       <div><dt>Status</dt><dd>${esc(JOB_STATES[j.status]?.[1] || j.status)}</dd></div>
       <div><dt>Running time</dt><dd>${esc(jobDuration(j))}</dd></div>
-      <div><dt>New packages</dt><dd class="num">${j.new_packages == null ? '-' : esc(count(j.new_packages))}</dd></div>
-      <div><dt>New files</dt><dd class="num">${j.new_files == null ? '-' : esc(count(j.new_files))}</dd></div>
+      <div><dt>${j.kind === 'git' ? 'New repos' : 'New packages'}</dt><dd class="num">${j.new_packages == null ? '-' : esc(count(j.new_packages))}</dd></div>
+      ${j.kind === 'git' ? '' : `<div><dt>New files</dt><dd class="num">${j.new_files == null ? '-' : esc(count(j.new_files))}</dd></div>`}
       <div><dt>Newly cached</dt><dd class="num">${j.new_bytes == null ? '-' : esc(bytes(j.new_bytes))}</dd></div>
     </dl>`;
 
@@ -1583,6 +1581,103 @@ async function renderJob({ params, isCurrent }) {
   };
   onLeave(() => clearTimeout(timer));
   if (jobActive(d.job)) schedule();
+}
+
+// --------------------------------------------------------------- git repos
+
+/** The Browse tabs: every package format, then Git. */
+const browseTabs = (current, q = '') => {
+  const qs = q ? '?' + new URLSearchParams({ q }) : '';
+  return [['', 'All'], ...REPO_IDS.map((id) => [id, REPOS[id].label])]
+    .map(([id, label]) => `<a href="#/browse${id ? '/' + id : ''}${qs}" aria-current="${id === current}">${esc(label)}</a>`)
+    .concat(`<a href="#/browse/git" aria-current="${current === 'git'}">Git</a>`)
+    .join('');
+};
+
+async function renderGitRepos({ isCurrent }) {
+  const d = await api('/api/git/repos');
+  if (!isCurrent()) return;
+  const rows = d.repos
+    .map(
+      (r) => `<tr>
+        <td><span class="pkg mono">${esc(r.host)}/${esc(r.owner)}/${esc(r.name)}</span>
+          ${r.last_error ? `<div class="err" title="${esc(r.last_error)}">Last refresh failed; serving the cached copy</div>` : ''}</td>
+        <td class="mono">${esc(r.default_branch || '-')}</td>
+        <td class="r num">${esc(bytes(r.size))}</td>
+        <td>${timeTag(r.refreshed_at)}</td>
+        <td class="actions">
+          <button class="small" data-copy="${esc(r.clone_url)}" title="${esc(r.clone_url)}">Copy clone URL</button>
+          <button class="small admin-only" data-git-refresh="${esc(JSON.stringify({ host: r.host, owner: r.owner, name: r.name }))}" ${d.offline ? 'disabled' : ''}>Refresh</button>
+          <button class="small danger admin-only" data-git-delete="${esc(new URLSearchParams({ host: r.host, owner: r.owner, name: r.name }).toString())}" data-label="${esc(r.host + '/' + r.owner + '/' + r.name)}">Delete</button>
+        </td>
+      </tr>`
+    )
+    .join('');
+  setView(`
+    <div class="page-head">
+      <div><h1>Git</h1><p>${esc(plural(d.repos.length, 'repo'))} cached, from ${esc(d.hosts.join(', '))}.</p></div>
+    </div>
+    <div class="toolbar"><nav class="seg" aria-label="Repository">${browseTabs('git')}</nav></div>
+    <p class="page-note">Granary keeps a mirror of each repo and serves it read-only. Submodules and Git LFS objects are not cached, and only public repos can be added.</p>
+    ${d.offline ? '' : `<form class="panel panel-pad admin-only add-repo" id="add-repo">
+      <label for="repo-url">Add repo</label>
+      <div class="get-search">
+        <input id="repo-url" type="text" placeholder="https://github.com/owner/repo" autocomplete="off" spellcheck="false">
+        <button class="primary" type="submit">Add repo</button>
+      </div>
+      <p class="err hidden" id="repo-err"></p>
+    </form>`}
+    <div class="panel">${
+      d.repos.length
+        ? `<div class="table-wrap"><table>
+            <thead><tr><th>Repo</th><th>Default branch</th><th class="r">Size</th><th>Refreshed</th><th class="r"><span class="sr-only">Actions</span></th></tr></thead>
+            <tbody>${rows}</tbody></table></div>`
+        : `<div class="empty"><strong>No repos cached yet</strong>Clone through Granary (see the README's git setup), or add one above.</div>`
+    }</div>`);
+
+  $('#add-repo')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const url = $('#repo-url').value.trim();
+    if (!url) return showError($('#repo-err'), 'Paste a repo URL first.');
+    showError($('#repo-err'), '');
+    try {
+      const r = await act(() => api('/api/git/repos', { method: 'POST', body: { url } }));
+      toast('Caching the repo');
+      location.hash = `#/jobs/${r.id}`;
+    } catch (err) {
+      showError($('#repo-err'), err.message);
+    }
+  });
+  view().addEventListener('click', async (e) => {
+    const refresh = e.target.closest('[data-git-refresh]');
+    if (refresh) {
+      refresh.disabled = true;
+      try {
+        const r = await act(() => api('/api/git/repos/refresh', { method: 'POST', body: JSON.parse(refresh.dataset.gitRefresh) }));
+        location.hash = `#/jobs/${r.id}`;
+      } catch (err) {
+        toast(err.message, 'error');
+        refresh.disabled = false;
+      }
+      return;
+    }
+    const del = e.target.closest('[data-git-delete]');
+    if (del) {
+      const ok = await confirmAction({
+        title: `Delete ${del.dataset.label}?`,
+        body: 'Granary deletes its copy of the repo. It is cloned again the next time a client asks for it.',
+        ok: 'Delete repo',
+      });
+      if (!ok) return;
+      try {
+        const r = await act(() => api(`/api/git/repos?${del.dataset.gitDelete}`, { method: 'DELETE' }));
+        toast(`Deleted ${del.dataset.label}, freed ${bytes(r.bytes)}`);
+        route();
+      } catch (err) {
+        toast(err.message, 'error');
+      }
+    }
+  });
 }
 
 // ----------------------------------------------------------------- cleanup

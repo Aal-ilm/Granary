@@ -46,6 +46,7 @@
   --npm: #c12127;
   --pypi: #2f6da8;
   --maven: #7a3fa8;
+  --git: #0d7c70;
   --sans: ui-sans-serif, -apple-system, "Segoe UI Variable Text", "Segoe UI", system-ui,
     Roboto, "Helvetica Neue", Arial, sans-serif;
   --display: "Saira Condensed", "Arial Narrow", var(--sans);
@@ -87,6 +88,7 @@
     --npm: #f0646a;
     --pypi: #7fb0e0;
     --maven: #b88ae0;
+    --git: #4cc3b4;
     color-scheme: dark;
   }
 }
@@ -124,6 +126,7 @@
   --npm: #f0646a;
   --pypi: #7fb0e0;
   --maven: #b88ae0;
+  --git: #4cc3b4;
   color-scheme: dark;
 }
 
@@ -516,6 +519,7 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--primary)
 .fmt.npm, .silo-col.npm { --fmt-color: var(--npm); }
 .fmt.pypi, .silo-col.pypi { --fmt-color: var(--pypi); }
 .fmt.maven, .silo-col.maven { --fmt-color: var(--maven); }
+.fmt.git, .silo-col.git { --fmt-color: var(--git); }
 
 /* Sensor lights: green online, gold busy or warning, red fault, gray idle. */
 .dot {
@@ -1253,3 +1257,8 @@ dialog .line-errors { color: var(--muted); max-height: 160px; overflow: auto; }
 .job-line.step { color: var(--console-ink); font-weight: 700; margin-top: 10px; border-top: 1px solid color-mix(in srgb, var(--console-muted) 25%, transparent); padding-top: 8px; }
 .panel.log .job-line { color: var(--console-ink); }
 .panel.log .job-line.cmd { color: var(--gold); }
+
+/* ------------------------------------------------------------- git repos */
+
+.add-repo { margin-bottom: 16px; }
+.add-repo > label { display: block; font-weight: 650; margin-bottom: 6px; }

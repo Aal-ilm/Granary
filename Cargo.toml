@@ -1,6 +1,6 @@
 [package]
 name = "granary"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "A small, self-hostable caching proxy for Cargo, npm, PyPI and Maven"
 license = "MIT OR Apache-2.0"

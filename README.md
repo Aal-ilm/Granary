@@ -36,6 +36,7 @@ public registry once, then served from your own disk after that.
 | npm (registry.npmjs.org) | ✅ proxy | `/npm/` |
 | PyPI (Simple API, PEP 503/691) | ✅ proxy | `/pypi/simple/` |
 | Maven Central (Maven 2 layout, for Maven and Gradle) | ✅ proxy | `/maven` |
+| Git repos from GitHub, GitLab and Codeberg (smart HTTP, read-only) | ✅ cache | `/git/{host}/{owner}/{repo}.git` |
 | Docker / OCI | planned | |
 | Debian (apt) | planned | |
 | Publishing your own packages | planned | |
@@ -160,7 +161,7 @@ To let anyone on your network download without a token, set
 ### Setting up a machine with make
 
 `make use-granary GRANARY_URL=http://HOST` asks for a token once and points
-npm, pip, Cargo, Maven and Gradle at Granary. `make use-public` switches them
+npm, pip, Cargo, Maven, Gradle and git at Granary. `make use-public` switches them
 back to the public registries (for example while Granary is down), `make
 status` shows where each one points and `make remove` undoes everything.
 Every file is backed up before its first change. Choose tools with `TOOLS`,
@@ -172,7 +173,7 @@ comment blocks in `~/.m2/settings.xml` (creating the file if needed), using
 `scripts/m2-settings.py`, which edits the XML rather than raw lines and needs
 `python3`. It refuses to run if you already have your own mirror for Central.
 For Gradle it writes `~/.gradle/init.d/granary.gradle`; `use-public` and
-`remove` delete it again.
+`remove` delete it again. For git, see [Git repos](#git-repos).
 
 ## Web UI
 
@@ -180,7 +181,7 @@ For Gradle it writes `~/.gradle/init.d/granary.gradle`; `use-public` and
 |---|---|
 | Overview | Disk use per repository, cache hit rate, upstream status, recently cached packages |
 | Repositories | Each proxy's URL, upstream, size and status, client setup snippets, and **Invalidate cache** to force fresh metadata |
-| Browse | Every cached package, filterable and sortable by size, versions, cache date and last download; the sidebar search covers all repositories |
+| Browse | Every cached package, filterable and sortable by size, versions, cache date and last download; the sidebar search covers all repositories. The Git tab lists cached repos with Add repo, Refresh and Delete |
 | Package detail | Each cached version and file, with download and delete |
 | Get packages | Search a registry and cache a version before anyone needs it (admins only; see [Getting packages ahead of time](#getting-packages-ahead-of-time)) |
 | Templates | Named sets of packages for a kind of project: browse, create, edit, clone, delete, export, warm, schedule re-warms and download a starter project (see [Templates](#templates)) |
@@ -193,6 +194,60 @@ For Gradle it writes `~/.gradle/init.d/granary.gradle`; `use-public` and
 | Access tokens | Create and revoke tokens for package managers, with ready-made client configuration |
 | Users | Add people as admins or viewers, reset passwords, turn off two-factor, disable or delete accounts (admins only) |
 | Account | Change your password and set up two-factor authentication |
+
+## Git repos
+
+Granary can keep a cached mirror of public git repos, so clones keep working
+when GitHub is slow, down or out of reach. Clone through Granary with:
+
+```sh
+git clone http://HOST/git/github.com/serde-rs/serde.git
+```
+
+The first request for a repo clones it from `https://github.com/serde-rs/serde.git`
+(`git clone --mirror`) and serves it; later requests come from the cache.
+Repos are served read-only over git's smart HTTP protocol, so shallow clones
+(`--depth`) and partial clones (`--filter`) work; pushes are refused. A cached
+repo is refreshed (`git remote update --prune`) when a client fetches it and
+it is older than `GRANARY_META_TTL_SECS`; if upstream can't be reached, the
+cached copy is served. Concurrent first requests for a repo cause one clone.
+In offline mode, only repos already cached are served.
+
+Admins can also add a repo ahead of time on **Browse → Git**: paste its URL
+and Granary clones it as a job, with git's progress on the job page. The same
+tab shows each repo's size, default branch and last refresh, with Refresh and
+Delete. Cached repos have their own gauge on the Overview and count toward
+`GRANARY_CACHE_LIMIT`.
+
+**Allowed hosts.** Granary only clones from the hosts in `GRANARY_GIT_HOSTS`
+(default `github.com,gitlab.com,codeberg.org`), always over HTTPS. IP
+addresses and `localhost` can't be listed, owner and repo names may use only
+letters, digits, `.`, `-` and `_`, and git never follows redirects, so a
+repo can't send Granary somewhere else. Hooks are off and git never prompts
+for credentials. A clone or refresh that grows past `GRANARY_GIT_MAX_SIZE`
+(2GB) or runs longer than `GRANARY_GIT_TIMEOUT_MINS` (10) is stopped, the
+partial copy is deleted, and the log says why.
+
+**Client setup.** `make use-granary TOOLS=git` writes
+`~/.config/granary-client/gitconfig` (mode 600) with an `insteadOf` rule per
+allowed host and an `http.extraHeader` line carrying your token, and adds a
+single `include.path` line for it to your global git config, so the token
+never sits in `~/.gitconfig`. After that, plain URLs such as
+`git clone https://github.com/serde-rs/serde` go through Granary, and so do
+Cargo git dependencies and CMake `FetchContent`. Cargo's own git client
+can't send that header, so the script also sets `net.git-fetch-with-cli =
+true` in Cargo's config (in a marked block; it only warns if you already
+have a `[net]` section). `make use-public` removes the include line and
+`make remove` deletes the file as well. By hand, the equivalent is:
+
+```sh
+git config --global url."http://HOST/git/github.com/".insteadOf "https://github.com/"
+git config --global http."http://HOST/".extraHeader "Authorization: Basic $(printf 'token:%s' TOKEN | base64)"
+```
+
+**Limits.** Submodules and Git LFS objects are not fetched, only public
+repos can be cached (Granary sends no credentials upstream), and repos must
+live at `host/owner/repo` (GitLab subgroups aren't supported yet).
 
 ## Getting packages ahead of time
 
@@ -464,6 +519,9 @@ All settings are environment variables.
 | `GRANARY_WARM_JOBS` | `2` | Warm jobs that may run at once (1 to 8) |
 | `GRANARY_WARM_TIMEOUT_MINS` | `30` | Longest a warm job may run |
 | `GRANARY_WARM_PYTHON` | `3.12` | Python version pip picks wheels for when warming |
+| `GRANARY_GIT_HOSTS` | `github.com,gitlab.com,codeberg.org` | Hosts git repos may be cached from (HTTPS only; no IP addresses or localhost) |
+| `GRANARY_GIT_MAX_SIZE` | `2GB` | Largest a cached git repo may grow; bigger clones are stopped and deleted |
+| `GRANARY_GIT_TIMEOUT_MINS` | `10` | Longest a git clone or refresh may run |
 | `GRANARY_SEARCH` | `on` | `off`: **Get packages** never sends search text to a search host and looks packages up by exact name only |
 | `GRANARY_CARGO_API` | `https://crates.io/api/v1` | crates.io web API, used only for search |
 | `GRANARY_MAVEN_SEARCH` | `https://search.maven.org/solrsearch/select` | Maven Central search, used only for search |
@@ -519,6 +577,7 @@ place, so a crash never leaves a half-written package in the cache.
 /data
 ├── files/{cargo,npm,pypi,maven}/…   immutable package files
 ├── meta/{cargo,npm,pypi,maven}/…    cached metadata (*.body + *.json info)
+├── git/{host}/{owner}/{repo}.git     cached git mirrors (+ .granary.json info)
 ├── state/                     users, tokens, sessions and audit log (granary.db),
 │                              cleanup settings, last-download times
 └── tmp/                       in-progress downloads (cleared at startup)
@@ -533,7 +592,9 @@ cached.
 ## Current limitations
 
 - **Read-only.** There is no `cargo publish` / `npm publish` / `twine upload`
-  / `mvn deploy` yet; npm and Maven write requests are refused.
+  / `mvn deploy` yet; npm and Maven write requests are refused, and so are
+  git pushes.
+- **Git: public repos only, no submodules or LFS.** See [Git repos](#git-repos).
 - **No single sign-on yet.** Accounts live in Granary itself; LDAP and OpenID
   Connect aren't supported. Granary serves plain HTTP, so put it behind a
   reverse proxy with TLS if it's reachable from untrusted networks.

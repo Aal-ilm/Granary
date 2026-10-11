@@ -2,6 +2,7 @@
 //! policies, scheduled tasks, upstream health checks and inventory caching.
 
 pub mod api;
+pub mod git;
 
 use std::{
     path::{Path, PathBuf},

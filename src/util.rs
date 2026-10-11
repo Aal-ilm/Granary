@@ -47,7 +47,7 @@ pub fn safe_rel_path(rel: &str) -> Result<PathBuf, AppError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use axum::http::HeaderValue;
 
@@ -110,6 +110,10 @@ mod tests {
             warm_jobs: 2,
             warm_timeout: std::time::Duration::from_secs(1800),
             warm_python: "3.12".into(),
+            git_hosts: vec!["github.com".into()],
+            git_max_size: 2 << 30,
+            git_timeout: std::time::Duration::from_secs(600),
+            git_upstream_override: None,
             admin_user: "admin".into(),
             admin_password: None,
             client_auth: true,

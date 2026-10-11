@@ -44,6 +44,15 @@ pub struct Config {
     pub warm_timeout: Duration,
     /// Python version pip resolves wheels for.
     pub warm_python: String,
+    /// Git hosts Granary may clone from (HTTPS only).
+    pub git_hosts: Vec<String>,
+    /// Largest a cached git repo may grow.
+    pub git_max_size: u64,
+    /// Longest a git clone or refresh may run.
+    pub git_timeout: Duration,
+    /// Tests only: where to clone from instead of `https://{host}`. The
+    /// environment can't set it.
+    pub git_upstream_override: Option<String>,
     /// Username for the first admin account, created when no users exist.
     pub admin_user: String,
     /// Password for that account. When unset, one is generated and printed once.
@@ -122,6 +131,38 @@ fn var(key: &str, default: &str) -> String {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+/// The git host allowlist: lowercase DNS names with at least one dot. IP
+/// addresses, localhost and anything with a port or path are refused.
+pub fn parse_git_hosts(raw: &str) -> anyhow::Result<Vec<String>> {
+    let mut hosts = Vec::new();
+    for h in raw
+        .split([',', ' '])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let h = h.to_ascii_lowercase();
+        let is_ip =
+            h.parse::<IpAddr>().is_ok() || h.trim_matches(['[', ']']).parse::<IpAddr>().is_ok();
+        let labels_ok = h.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+        if is_ip || h == "localhost" || h.ends_with(".localhost") || !h.contains('.') || !labels_ok
+        {
+            anyhow::bail!(
+                "GRANARY_GIT_HOSTS: {h:?} is not allowed; give public host names such as github.com (no IP addresses, localhost, ports or paths)"
+            );
+        }
+        if !hosts.contains(&h) {
+            hosts.push(h);
+        }
+    }
+    Ok(hosts)
 }
 
 /// A size such as `20GB`, `1.5 TB`, `500MiB` or a plain number of bytes.
@@ -216,6 +257,20 @@ impl Config {
                     .clamp(1, 24 * 60)
                     * 60,
             ),
+            git_hosts: parse_git_hosts(&var(
+                "GRANARY_GIT_HOSTS",
+                "github.com,gitlab.com,codeberg.org",
+            ))?,
+            git_max_size: parse_size(&var("GRANARY_GIT_MAX_SIZE", "2GB"))
+                .context("GRANARY_GIT_MAX_SIZE must be a size like 500MB or 2GB")?,
+            git_timeout: Duration::from_secs(
+                var("GRANARY_GIT_TIMEOUT_MINS", "10")
+                    .parse::<u64>()
+                    .context("GRANARY_GIT_TIMEOUT_MINS must be a whole number of minutes")?
+                    .clamp(1, 24 * 60)
+                    * 60,
+            ),
+            git_upstream_override: None,
             warm_python: {
                 let v = var("GRANARY_WARM_PYTHON", "3.12");
                 let ok = v.split('.').count() == 2
@@ -271,6 +326,27 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_hosts() {
+        assert_eq!(
+            parse_git_hosts("GitHub.com, gitlab.com,github.com").unwrap(),
+            vec!["github.com", "gitlab.com"]
+        );
+        for bad in [
+            "127.0.0.1",
+            "localhost",
+            "git.localhost",
+            "[::1]",
+            "::1",
+            "intranet",
+            "github.com:8443",
+            "github.com/x",
+            "-x.com",
+        ] {
+            assert!(parse_git_hosts(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
 
     #[test]
     fn sizes() {

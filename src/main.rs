@@ -52,6 +52,7 @@ pub fn app(state: AppState, sessions: SqliteSessionStore) -> Router {
         .merge(formats::npm::router())
         .merge(formats::pypi::router())
         .merge(formats::maven::router())
+        .merge(formats::git::router())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::client_guard,
@@ -60,6 +61,7 @@ pub fn app(state: AppState, sessions: SqliteSessionStore) -> Router {
     // JSON API for the web UI: signed-in session for everything but sign-in.
     let api = Router::new()
         .merge(admin::api::router())
+        .merge(admin::git::router())
         .merge(auth::api::router())
         .merge(audit::router())
         .merge(search::router())

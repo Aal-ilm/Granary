@@ -18,7 +18,7 @@ use std::{
 
 use serde::Serialize;
 use sqlx::SqlitePool;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -32,7 +32,7 @@ use crate::{
 
 pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL CHECK (kind IN ('template', 'package')),
+    kind TEXT NOT NULL CHECK (kind IN ('template', 'package', 'git')),
     template_id INTEGER,
     title TEXT NOT NULL,
     spec TEXT NOT NULL,
@@ -323,7 +323,7 @@ async fn snapshot(st: &AppState) -> HashMap<String, (String, u64)> {
 pub async fn cache_used(st: &AppState) -> u64 {
     let root = st.store.root().to_path_buf();
     tokio::task::spawn_blocking(move || {
-        dir_size(&root.join("files")) + dir_size(&root.join("meta"))
+        dir_size(&root.join("files")) + dir_size(&root.join("meta")) + dir_size(&root.join("git"))
     })
     .await
     .unwrap_or(0)
@@ -352,6 +352,15 @@ impl Budget {
 async fn run(st: &AppState, id: i64, cancel: CancellationToken) {
     let db = &st.auth.db;
     let mut log = JobLog::resume(db, id).await;
+    let kind: Option<(String,)> = sqlx::query_as("SELECT kind FROM jobs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+    if kind.is_some_and(|(k,)| k == "git") {
+        return run_git(st, id, &mut log, &cancel).await;
+    }
     let before = snapshot(st).await;
     let outcome = run_inner(st, id, &mut log, &cancel).await;
     let after = snapshot(st).await;
@@ -577,6 +586,198 @@ async fn run_inner(
             lockfiles,
         }
     }
+}
+
+/// What a git job does.
+#[derive(Debug, serde::Deserialize, Serialize)]
+pub struct GitJob {
+    /// "clone" (cache it, or refresh it if already cached) or "refresh".
+    pub action: String,
+    pub repo: crate::formats::git::RepoId,
+}
+
+/// Queue a git job ("Add repo" or "Refresh").
+pub async fn enqueue_git(st: &AppState, job: &GitJob, created_by: &str) -> sqlx::Result<i64> {
+    let title = format!("Git {}", job.repo.display());
+    let r = sqlx::query(
+        "INSERT INTO jobs (kind, title, spec, status, created_by, created_at) VALUES ('git', ?, ?, 'queued', ?, ?)",
+    )
+    .bind(title)
+    .bind(serde_json::to_string(job).unwrap())
+    .bind(created_by)
+    .bind(now_secs() as i64)
+    .execute(&st.auth.db)
+    .await?;
+    st.admin.jobs.wake.notify_one();
+    Ok(r.last_insert_rowid())
+}
+
+/// Clone or refresh a git repo in Granary itself, streaming git's progress
+/// into the job log.
+async fn run_git(st: &AppState, id: i64, log: &mut JobLog, cancel: &CancellationToken) {
+    use crate::formats::git::{self, Refresh};
+    let db = &st.auth.db;
+    let spec: Option<(String,)> = sqlx::query_as("SELECT spec FROM jobs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+    let Some(job) = spec.and_then(|(s,)| serde_json::from_str::<GitJob>(&s).ok()) else {
+        finish_git(
+            st,
+            id,
+            Status::Failed,
+            Some("the job could not be read".into()),
+            0,
+            0,
+        )
+        .await;
+        return;
+    };
+    let dir = job.repo.dir(st);
+    let existed = tokio::fs::try_exists(&dir).await.unwrap_or(false);
+    let size = |dir: std::path::PathBuf| async move {
+        tokio::task::spawn_blocking(move || dir_size(&dir))
+            .await
+            .unwrap_or(0)
+    };
+    let before = if existed { size(dir.clone()).await } else { 0 };
+    log.push(
+        db,
+        &format!(
+            "{} {} from {}",
+            if existed { "Refreshing" } else { "Cloning" },
+            job.repo.display(),
+            job.repo.upstream(&st.cfg)
+        ),
+    )
+    .await;
+    log.push(db, "Submodules and Git LFS objects are not fetched.")
+        .await;
+
+    // git's progress arrives on a channel while the job log is written here.
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let work = git::ensure(st, &job.repo, Refresh::Now, Some(&tx));
+    tokio::pin!(work);
+    let result = loop {
+        tokio::select! {
+            r = &mut work => break Some(r),
+            Some(line) = rx.recv() => push_git_line(db, log, &line).await,
+            _ = cancel.cancelled() => break None,
+        }
+    };
+    // Lines sent just before git finished.
+    while let Ok(line) = rx.try_recv() {
+        push_git_line(db, log, &line).await;
+    }
+    let after = if tokio::fs::try_exists(&dir).await.unwrap_or(false) {
+        size(dir).await
+    } else {
+        0
+    };
+    let added = after.saturating_sub(before);
+    let (status, message) = match result {
+        None => (
+            Status::Cancelled,
+            Some("Cancelled while running".to_string()),
+        ),
+        Some(Ok(())) => (Status::Done, None),
+        Some(Err(e)) => (Status::Failed, Some(e.message)),
+    };
+    log.push(
+        db,
+        &format!(
+            "{}: {} newly cached, {} in total",
+            match status {
+                Status::Done => "Finished",
+                Status::Failed => "Failed",
+                Status::Cancelled => "Cancelled",
+            },
+            human_bytes(added),
+            human_bytes(after)
+        ),
+    )
+    .await;
+    finish_git(
+        st,
+        id,
+        status,
+        message,
+        i64::from(!existed && after > 0),
+        added,
+    )
+    .await;
+}
+
+/// git's "Cloning into '<server path>'" line only reveals where Granary
+/// keeps its data; the job's first line already says what's being cloned.
+async fn push_git_line(db: &SqlitePool, log: &mut JobLog, line: &str) {
+    if !line.starts_with("Cloning into") {
+        log.push(db, line).await;
+    }
+}
+
+async fn finish_git(
+    st: &AppState,
+    id: i64,
+    status: Status,
+    message: Option<String>,
+    repos: i64,
+    bytes: u64,
+) {
+    let _ = sqlx::query(
+        "UPDATE jobs SET status = ?, message = ?, finished_at = ?, new_packages = ?, new_files = 0, new_bytes = ? WHERE id = ?",
+    )
+    .bind(status.as_str())
+    .bind(message)
+    .bind(now_secs() as i64)
+    .bind(repos)
+    .bind(bytes as i64)
+    .bind(id)
+    .execute(&st.auth.db)
+    .await;
+}
+
+/// Databases from before git jobs only allow two kinds of job, and SQLite
+/// can't change a CHECK constraint in place, so the table is rebuilt with
+/// every job kept. Foreign keys are off meanwhile so job logs survive.
+pub async fn migrate(db: &SqlitePool) -> sqlx::Result<()> {
+    let sql: Option<(String,)> =
+        sqlx::query_as("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'jobs'")
+            .fetch_optional(db)
+            .await?;
+    if sql.is_none_or(|(s,)| s.contains("'git'")) {
+        return Ok(());
+    }
+    let mut conn = db.acquire().await?;
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *conn)
+        .await?;
+    let result = async {
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+        sqlx::query(sqlx::AssertSqlSafe(SCHEMA.replace(
+            "CREATE TABLE IF NOT EXISTS jobs",
+            "CREATE TABLE jobs_new",
+        )))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("INSERT INTO jobs_new SELECT * FROM jobs")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DROP TABLE jobs").execute(&mut *tx).await?;
+        sqlx::query("ALTER TABLE jobs_new RENAME TO jobs")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await
+    }
+    .await;
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *conn)
+        .await?;
+    result?;
+    tracing::info!("jobs table updated for git jobs");
+    Ok(())
 }
 
 /// Whether a template on a schedule is due: its interval has passed since
