@@ -137,3 +137,40 @@ async fn old_warmer_tokens_move_to_the_system_account() {
         .await;
     assert_eq!(status, StatusCode::OK);
 }
+
+/// A generated first admin password lives in a private file, which goes
+/// away after the first admin sign-in or password change.
+#[tokio::test]
+async fn initial_admin_password_file() {
+    let h = Harness::new(false, Duration::from_secs(300)).await;
+    let path = crate::auth::write_initial_password(&h.data, "admin", "generated secret").unwrap();
+    assert_eq!(path, h.data.join("initial-admin-password"));
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "Username: admin\nPassword: generated secret\n"
+    );
+
+    // A viewer signing in doesn't touch it; an admin signing in removes it.
+    h.viewer_login().await;
+    assert!(path.exists());
+    let cookie = h.login().await;
+    assert!(!path.exists());
+
+    // A password change removes it too.
+    crate::auth::write_initial_password(&h.data, "admin", "x").unwrap();
+    let (status, _, body) = h
+        .send(
+            "POST",
+            "/api/account/password",
+            Some(&cookie),
+            Some(json!({"current": "a long test password", "new": "another long test password"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(!path.exists());
+}

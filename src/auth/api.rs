@@ -195,6 +195,9 @@ async fn login(
         .map_err(db_err)?;
     tracing::info!("{} signed in from {ip}", user.username);
     audit(&st, &user.username, "auth.login", &user.username, ip, true).await;
+    if user.role == Role::Admin {
+        super::forget_initial_password(&st.cfg.data_dir).await;
+    }
     Ok(Json(json!({ "status": "ok", "user": user })))
 }
 
@@ -262,6 +265,7 @@ async fn change_password(
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     tracing::info!("{} changed their password", user.username);
+    super::forget_initial_password(&st.cfg.data_dir).await;
     audit(
         &st,
         &user.username,

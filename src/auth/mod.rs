@@ -376,6 +376,50 @@ pub async fn ensure_admin(
     Ok(generated.then_some(password))
 }
 
+/// Where a generated first admin password is kept until it's used.
+pub fn initial_password_path(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join("initial-admin-password")
+}
+
+/// Write a generated first admin password to a file only Granary's user can
+/// read, instead of printing it to a log that may be collected elsewhere.
+pub fn write_initial_password(
+    data_dir: &Path,
+    username: &str,
+    password: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    let path = initial_password_path(data_dir);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&path)?;
+    #[cfg(unix)]
+    {
+        // Also tighten a file that was already there.
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    writeln!(f, "Username: {username}\nPassword: {password}")?;
+    f.sync_all()?;
+    Ok(path)
+}
+
+/// Delete the first admin password file once it has served its purpose (an
+/// admin signed in, or a password was changed).
+pub async fn forget_initial_password(data_dir: &Path) {
+    let path = initial_password_path(data_dir);
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => tracing::info!("deleted {}, which is no longer needed", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("could not delete {}: {e}", path.display()),
+    }
+}
+
 /// `granary reset-password <user> [--disable-2fa]`, for when you're locked out.
 pub async fn reset_password_cli(
     data_dir: &Path,

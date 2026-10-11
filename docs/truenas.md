@@ -49,8 +49,11 @@ compose file.
    [`deploy/truenas/compose.yaml`](../deploy/truenas/compose.yaml).
 3. Replace `POOL` with your pool's name, and set `GRANARY_PUBLIC_URL` to the
    address your machines will use, such as `http://truenas.lan:8480`.
-4. Save. When the app is running, open its logs (**Apps → granary → Logs**)
-   to find the first admin password. It is printed once, on first start.
+4. Save. When the app is running, read the first admin password from the
+   data dataset, from **System → Shell**:
+   `sudo cat /mnt/POOL/apps/granary/data/initial-admin-password`.
+   Granary deletes that file after the first admin sign-in or password
+   change; the password is never written to the logs.
 
 Open `GRANARY_PUBLIC_URL` in a browser, sign in as `admin`, and choose a new
 password. Then:

@@ -45,12 +45,15 @@ public registry once, then served from your own disk after that.
 
 ```sh
 docker compose up -d --build
-docker compose logs granary            # shows the first admin password once
+docker compose exec granary cat /data/initial-admin-password   # the first admin password
 docker compose port granary 8080       # shows the port, e.g. 0.0.0.0:32768
 ```
 
-Open that address in a browser and sign in as `admin` with the password from
-the log. Granary asks you to choose your own password straight away.
+Open that address in a browser and sign in as `admin` with that password.
+Granary asks you to choose your own password straight away. The password is
+never written to the logs: it is kept in `initial-admin-password` in the data
+directory (readable only by Granary's user), and that file is deleted after
+the first admin sign-in or password change.
 
 The automatic port can change when the container is recreated or the host
 reboots, and every client config contains the URL. Once Granary is set up the

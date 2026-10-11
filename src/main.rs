@@ -161,13 +161,13 @@ async fn run() -> anyhow::Result<()> {
     if let Some(password) =
         auth::ensure_admin(&db, &cfg.admin_user, cfg.admin_password.as_deref()).await?
     {
-        // Printed straight to the container log, never to the in-app log view.
-        println!();
-        println!("  Granary created an admin account.");
-        println!("    Username: {}", cfg.admin_user);
-        println!("    Password: {password}");
-        println!("  Sign in and you'll be asked to choose a new password.");
-        println!();
+        // The password goes into a private file, never into a log.
+        let path = auth::write_initial_password(&cfg.data_dir, &cfg.admin_user, &password)?;
+        tracing::info!(
+            "created the admin account {:?}; its password is in {} (deleted after the first admin sign-in or password change)",
+            cfg.admin_user,
+            path.display()
+        );
     }
     templates::sync_builtins(&db).await?;
     let sessions = SqliteSessionStore::new(db.clone());
