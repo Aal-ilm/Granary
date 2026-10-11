@@ -33,10 +33,29 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  # A release tag must match the version in Cargo.toml, so the published
+  # images and the binary report the same version. Nothing is built or
+  # published for a tag that doesn't.
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag against Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          if [ "${TAG#v}" != "$version" ]; then
+            echo "::error::The tag $TAG doesn't match version $version in Cargo.toml. Bump Cargo.toml (and Cargo.lock) in the release commit, then tag it again."
+            exit 1
+          fi
+          echo "The tag $TAG matches version $version in Cargo.toml."
+
   # The optional warmer image: built, scanned with the same gate as the main
   # image, and published next to it on version tags with the same tags.
   warmer-image:
-    needs: [test, audit]
+    needs: [test, audit, version]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -79,7 +98,7 @@ jobs:
           cache-to: type=gha,scope=warmer,mode=max
 
   image:
-    needs: [test, audit]
+    needs: [test, audit, version]
     runs-on: ubuntu-latest
     permissions:
       contents: read
