@@ -352,8 +352,10 @@ Browse and in **Get packages**. There, people with private access also see
 search results from Gitea's package API, labelled as such; public results
 with a private namespace's name are left out, since they could never be
 installed. npm tarball URLs follow `GRANARY_NPM_REWRITE_TARBALLS`: with it
-off, private packuments keep Gitea's own URLs, so clients fetch those
-tarballs from Gitea directly. Checksums are checked as for the public
+off, private packuments keep Gitea's own URLs, so private tarballs come
+from Gitea directly, not through Granary: every client then needs its own
+Gitea access (a Gitea token for Gitea's npm registry in its `.npmrc`), and
+those tarballs aren't cached. Checksums are checked as for the public
 registries (npm `integrity`, PyPI `sha256`, Maven `.sha1`, Cargo `cksum`).
 
 **The private Cargo registry.** Cargo can't route single crate names to
@@ -854,6 +856,12 @@ offline mode or without internet access. That includes Yarn 1, npm with
 `GRANARY_NPM_UPSTREAM` is not registry.npmjs.org (the URLs then name that
 registry, which npm doesn't map). Leave it on unless portable lockfiles
 matter more than that.
+
+Private packages from [Gitea](#private-packages) follow the same setting.
+With it off, their packuments keep Gitea's own tarball URLs, which npm
+doesn't map either, so private tarballs come from Gitea directly: every
+client needs its own Gitea access (a Gitea token for Gitea's npm registry),
+and those tarballs never pass through Granary or its cache.
 
 ### Private addresses
 
