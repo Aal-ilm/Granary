@@ -455,7 +455,8 @@ too, under the same URLs as the public ones: npm, pip and Maven need no
 change at all, since Granary decides where each name comes from. Tell it
 which names belong to Gitea under **System → Gitea → Private namespaces**,
 one list per format, each pattern mapped to the Gitea user or org that owns
-the packages:
+the packages. Go modules from Gitea are set up separately, as
+[private Go modules](#private-go-modules).
 
 | Format | Pattern | Fetched from |
 |---|---|---|
@@ -978,12 +979,12 @@ outbound requests, and reads extra trusted CAs from `SSL_CERT_FILE` (or use
 
 Set `GRANARY_OFFLINE=on` when Granary has no route to the internet, or must
 not use one. It then never contacts an upstream registry, for Cargo, npm,
-PyPI and Maven alike:
+PyPI, Maven and Go alike:
 
 - Cached files are served as usual.
 - Cached metadata is served however old it is, without revalidation.
 - Anything not in the cache gets a 404 whose message says Granary is offline.
-  A 404 rather than a 5xx lets Maven, Gradle, pip and npm carry on as they do
+  A 404 rather than a 5xx lets Maven, Gradle, pip, npm and Go carry on as they do
   for any missing file (for example, pip tries another version).
 - npm's audit, search and ping calls get a 503.
 - Upstream health checks are skipped, and the web UI shows offline mode.
