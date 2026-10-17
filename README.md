@@ -1041,11 +1041,13 @@ and the connection. Every redirect is checked the same way.
 Every format comes down to two kinds of data:
 
 - **Files** (`.crate` archives, npm tarballs, wheels and sdists, Maven jars,
-  POMs, Gradle `.module` files, signatures and checksums) never change once
+  POMs, Gradle `.module` files, signatures and checksums, Go module zips,
+  `go.mod` and `.info` files, checksum database tiles) never change once
   published. Granary downloads each one once, streams it to disk, and
   serves it forever with `Cache-Control: immutable`.
 - **Metadata** (Cargo index entries, npm packuments, PyPI project pages,
-  Maven `maven-metadata.xml` and its checksums) lists
+  Maven `maven-metadata.xml` and its checksums, Go's `@v/list` and
+  `@latest`, the Go vulnerability database) lists
   the available versions and changes as new ones are published. It is cached
   for `GRANARY_META_TTL_SECS`, then revalidated with `If-None-Match` /
   `If-Modified-Since`. Download links inside it are rewritten to point back at
@@ -1066,11 +1068,12 @@ place, so a crash never leaves a half-written package in the cache.
 
 ```text
 /data
-├── files/{cargo,npm,pypi,maven}/…   immutable package files
-├── meta/{cargo,npm,pypi,maven}/…    cached metadata (*.body + *.json info)
+├── files/{format}/…           immutable package files: cargo, npm, pypi,
+│                              maven, go, go-private, go-sumdb, gitea-*
+├── meta/{format}/…            cached metadata (*.body + *.json info)
 ├── git/{host}/{owner}/{repo}.git     cached git mirrors (+ .granary.json info)
-├── state/                     users, tokens, sessions and audit log (granary.db),
-│                              cleanup settings, last-download times
+├── state/                     users, tokens, sessions, audit log and Go module
+│                              pins (granary.db), cleanup settings, last-download times
 └── tmp/                       in-progress downloads (cleared at startup)
 ```
 

@@ -62,7 +62,7 @@ password. Then:
 - Create named accounts for people under **Users** instead of sharing
   `admin`.
 - Create one access token per machine under **Access tokens**. The page
-  shows the client configuration for Cargo, npm and pip.
+  shows the client configuration for each format.
 
 ## 4. HTTPS (recommended)
 

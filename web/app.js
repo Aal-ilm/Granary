@@ -495,7 +495,7 @@ async function renderOverview({ isCurrent }) {
           )
           .join('')}</tbody></table></div>`
     : `<div class="panel empty"><strong>Nothing cached yet</strong>
-        Point Cargo, npm, pip, Maven or Gradle at Granary and packages will appear here as they are downloaded.
+        Point Cargo, npm, pip, Maven, Gradle or Go at Granary and packages will appear here as they are downloaded.
         <p><a class="btn" href="#/repos">Show client setup</a></p></div>`;
 
   setView(`
@@ -2661,7 +2661,7 @@ async function renderTokens({ query, isCurrent }) {
   setView(`
     <div class="page-head">
       <div><h1>Access tokens</h1>
-      <p>Cargo, npm, pip, Maven and Gradle use a token to download through Granary. Make one per machine so you can revoke it on its own.</p></div>
+      <p>Cargo, npm, pip, Maven, Gradle and Go use a token to download through Granary. Make one per machine so you can revoke it on its own.</p></div>
       ${isAdmin() ? `<div class="page-actions"><nav class="seg" aria-label="Whose tokens">
         <a href="#/tokens" aria-current="${!all}">Mine</a><a href="#/tokens?all=1" aria-current="${all}">Everyone's</a></nav></div>` : ''}
     </div>
