@@ -21,6 +21,12 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      # The Go tests compare Granary's module zips with the go command's and
+      # skip without it. Pinned so the go 1.24 vendor rule is covered.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
