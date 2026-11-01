@@ -1,0 +1,9 @@
+go 1.22
+
+use (
+	.
+	./svc
+	./tools/gen
+)
+
+replace example.com/x => ../x

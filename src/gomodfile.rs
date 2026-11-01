@@ -652,11 +652,156 @@ pub fn check_line(line: &str) -> Result<String, String> {
     Ok(path.to_string())
 }
 
+/// The fuzz targets' bodies (in `fuzz/`), shared with the in-tree replay
+/// test so the same checks run in CI. Each panics on a broken promise.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod fuzz {
+    use super::*;
+
+    /// go.mod: no panic; bounded output; every line produced is a valid
+    /// Go template line.
+    pub fn go_mod_requires(data: &[u8]) {
+        let Ok(text) = std::str::from_utf8(data) else {
+            return;
+        };
+        let Ok(m) = parse_mod(text) else {
+            return;
+        };
+        assert!(m.requires.len() <= MAX_REQUIRES);
+        assert!(m.replaces.len() <= MAX_REQUIRES);
+        let (lines, _) = m.lines();
+        assert!(lines.len() <= m.requires.len());
+        for l in &lines {
+            assert!(l.len() <= MAX_GO_LINE);
+            assert!(check_line(l).is_ok(), "{l:?}");
+        }
+    }
+
+    /// go.sum: bounded; the valid lines written out read back the same.
+    pub fn go_sum(data: &[u8]) {
+        let Ok(text) = std::str::from_utf8(data) else {
+            return;
+        };
+        let Ok(s) = parse_sum(text) else {
+            return;
+        };
+        assert!(s.lines.len() + s.invalid.len() <= MAX_SUM_LINES);
+        let again = parse_sum(&s.text()).expect("written go.sum reads back");
+        assert!(again.invalid.is_empty());
+        assert_eq!(again.lines, s.lines);
+    }
+
+    /// go.work: bounded; every member stays inside the repo.
+    pub fn go_work(data: &[u8]) {
+        let Ok(text) = std::str::from_utf8(data) else {
+            return;
+        };
+        for dir in ["", "a/b"] {
+            let Ok(w) = parse_work(text, dir) else {
+                continue;
+            };
+            assert!(w.uses.len() <= MAX_USES);
+            for u in &w.uses {
+                assert!(!u.starts_with('/') && !u.contains('\\'), "{u:?}");
+                // "" is the repo root.
+                assert!(
+                    u.is_empty() || u.split('/').all(|s| !s.is_empty() && s != "." && s != ".."),
+                    "{u:?}"
+                );
+            }
+        }
+    }
+
+    /// One template line: a valid one names a valid module path.
+    pub fn go_line(data: &[u8]) {
+        let Ok(line) = std::str::from_utf8(data) else {
+            return;
+        };
+        if let Ok(module) = check_line(line) {
+            assert!(line.len() <= MAX_GO_LINE);
+            assert!(gomod::check_path(&module).is_ok());
+            assert!(!line.bytes().any(|b| b.is_ascii_control()));
+        }
+    }
+
+    /// A target's name and body.
+    pub type FuzzTarget = (&'static str, fn(&[u8]));
+
+    pub const TARGETS: [FuzzTarget; 4] = [
+        ("go_mod_requires", go_mod_requires),
+        ("go_sum", go_sum),
+        ("go_work", go_work),
+        ("go_line", go_line),
+    ];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const H: &str = "h1:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+
+    /// The fuzz corpus seeds, and 10,000 fixed-seed mutations of them,
+    /// through every target: the fuzz checks run in CI without a fuzzer.
+    #[test]
+    fn fuzz_seeds_and_mutations() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus");
+        let mut seeds: Vec<Vec<u8>> = Vec::new();
+        for (target, run) in fuzz::TARGETS {
+            let dir = root.join(target);
+            let mut files: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+                .map(|e| e.unwrap().path())
+                .collect();
+            files.sort();
+            assert!(!files.is_empty(), "{target} has seeds");
+            for f in files {
+                let data = std::fs::read(&f).unwrap();
+                run(&data);
+                seeds.push(data);
+            }
+        }
+        // xorshift64, fixed seed: the same inputs on every run.
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        const BYTES: &[u8] = b"()\"`\\/ \t\n\r\x00@=>.-+_~!:;[]{},vh1abcXYZ0123456789";
+        for i in 0..10_000 {
+            let mut data = seeds[i % seeds.len()].clone();
+            for _ in 0..(1 + next() % 4) {
+                let len = data.len();
+                match next() % 4 {
+                    0 if len > 0 => {
+                        let at = (next() as usize) % len;
+                        data[at] = BYTES[(next() as usize) % BYTES.len()];
+                    }
+                    1 => {
+                        let at = (next() as usize) % (len + 1);
+                        data.insert(at, BYTES[(next() as usize) % BYTES.len()]);
+                    }
+                    2 if len > 0 => {
+                        let at = (next() as usize) % len;
+                        data.remove(at);
+                    }
+                    _ if len > 0 && len < 8192 => {
+                        let a = (next() as usize) % len;
+                        let b = a + (next() as usize) % (len - a).min(64);
+                        let chunk = data[a..b].to_vec();
+                        let at = (next() as usize) % (len + 1);
+                        data.splice(at..at, chunk);
+                    }
+                    _ => data.push(BYTES[(next() as usize) % BYTES.len()]),
+                }
+            }
+            for (_, run) in fuzz::TARGETS {
+                run(&data);
+            }
+        }
+    }
 
     #[test]
     fn reads_requires_blocks_comments_and_quotes() {

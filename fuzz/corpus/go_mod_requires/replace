@@ -1,0 +1,10 @@
+module m
+require (
+	a.example/x v1.0.0
+	b.example/y v1.0.0
+)
+replace a.example/x => fork.example/x v1.0.1
+replace b.example/y v1.0.0 => ../y
+replace (
+	c.example/z => ./z
+)
