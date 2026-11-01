@@ -765,8 +765,21 @@ async fn cache_go(
     // nothing of it stays cached.
     let info_rel = format!("{base}/@v/{escver}.info");
     let had_info = st.store.has_file(ns, &info_rel).await;
+    // Offline, a version whose go.mod and zip are cached is complete
+    // without its .info (clients never needed one for it).
+    let cached = st.store.offline()
+        && st
+            .store
+            .has_file(ns, &format!("{base}/@v/{escver}.mod"))
+            .await
+        && st.store.has_file(ns, &format!("{base}/@v/{escver}")).await;
+    let steps: &[&str] = if cached {
+        &["mod", "zip"]
+    } else {
+        &["info", "mod", "zip"]
+    };
     let mut result = Ok(());
-    for ext in ["info", "mod", "zip"] {
+    for ext in steps {
         match go_file(st, who, module, &format!("{escver}.{ext}"), false).await {
             Ok(Some(_)) => {}
             Ok(None) => {

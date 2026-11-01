@@ -748,7 +748,10 @@ async fn get_packages_looks_up_and_caches_modules() {
         .api(&cookie, "/api/packages/search?eco=go&q=example.com%2FHello")
         .await;
     assert_eq!(d["results"][0]["cached_versions"], 1);
-    let (status, _, _) = offline
+    // A version cached by a client (go.mod and zip, no .info) is complete
+    // offline too.
+    std::fs::remove_file(files.join("v1.0.0.info")).unwrap();
+    let (status, _, body) = offline
         .send(
             "POST",
             "/api/packages/cache",
@@ -756,7 +759,8 @@ async fn get_packages_looks_up_and_caches_modules() {
             Some(cache("v1.0.0")),
         )
         .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(!files.join("v1.0.0.info").exists());
     let (status, _, _) = offline
         .send(
             "POST",

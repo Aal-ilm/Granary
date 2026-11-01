@@ -68,9 +68,6 @@ fn checked_go_sum(text: &str) -> Option<String> {
     crate::gomodfile::parse_sum(text).ok().map(|s| s.text())
 }
 
-/// A go.mod, go.work or go.sum (by file name) that the parsers refuse as a
-/// whole. Such a file from a repo is left out of the starter; README.txt
-/// names it.
 /// The `replace` directives of a valid go.mod or go.work that point at a
 /// directory outside the repo: (old module, target).
 fn escaping_replaces(path: &str, text: &str) -> Vec<(String, String)> {
@@ -94,6 +91,9 @@ fn escaping_replaces(path: &str, text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A go.mod, go.work or go.sum (by file name) that the parsers refuse as a
+/// whole. Such a file from a repo is left out of the starter; README.txt
+/// names it.
 fn refused_go_file(path: &str, text: &str) -> bool {
     let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
     match name {
