@@ -358,6 +358,7 @@ async fn starter(
             warmer_granary_url: &st.cfg.warmer_granary_url,
             client_auth: st.cfg.client_auth,
             from_repo: Some((&source.url, &source.commit)),
+            go_nosumdb: t.input.private_go_prefixes(&st.goprivate),
         }
         .zip()
         .map_err(|e| {
@@ -421,6 +422,8 @@ async fn starter(
         warmer_granary_url: &st.cfg.warmer_granary_url,
         client_auth: st.cfg.client_auth,
         from_repo: None,
+        // `load` let `who` see the template, so they may read these.
+        go_nosumdb: t.input.private_go_prefixes(&st.goprivate),
     }
     .zip()
     .map_err(|e| {

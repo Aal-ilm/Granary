@@ -87,9 +87,11 @@ async fn handle(
         return Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response());
     }
     let (escmod, file) = match rest.strip_suffix("/@latest") {
-        Some(escmod) => (escmod, "@latest"),
-        None => rest
+        // `/@v/@latest` is not a proxy path: only `{module}/@latest` is.
+        Some(escmod) if !escmod.ends_with("/@v") => (escmod, "@latest"),
+        _ => rest
             .rsplit_once("/@v/")
+            .filter(|(_, file)| *file != "@latest")
             .ok_or_else(|| missing("not a Go module proxy path"))?,
     };
     let module = module_path(escmod)?;

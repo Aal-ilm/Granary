@@ -104,6 +104,10 @@ impl Status {
     }
 }
 
+/// The warning for a template whose Go lines were skipped.
+const GO_SKIPPED: &str =
+    "Go modules are not warmed yet; they are cached when a client first asks for them";
+
 /// How a job ended.
 struct Outcome {
     status: Status,
@@ -610,6 +614,15 @@ async fn run_inner(
     if st.cfg.offline {
         return Outcome::failed("offline mode is on, so nothing new can be fetched");
     }
+    // Only Go lines: nothing to ask the warmer, and no token is made.
+    if skipped_go && repo.is_none() && Eco::ALL.iter().all(|e| spec.deps(*e).is_empty()) {
+        return Outcome {
+            status: Status::Done,
+            message: None,
+            lockfiles: HashMap::new(),
+            warnings: vec![GO_SKIPPED.into()],
+        };
+    }
     let budget = match st.cfg.cache_limit {
         Some(limit) => {
             let used = cache_used(st).await;
@@ -699,10 +712,7 @@ async fn run_inner(
     let mut failures = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     if skipped_go {
-        warnings.push(
-            "Go modules are not warmed yet; they are cached when a client first asks for them"
-                .into(),
-        );
+        warnings.push(GO_SKIPPED.into());
     }
     for step in steps {
         let eco = step.eco();

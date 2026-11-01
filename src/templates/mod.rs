@@ -385,6 +385,12 @@ impl Template {
     /// The private content this template comes from, if any: a Gitea repo,
     /// a private template it was cloned from, or a private Go module among
     /// its lines (decided by the prefixes as they are now).
+    ///
+    /// With several private Go lines only the first is reported. That is
+    /// enough only while `Policy::can_read_private` decides by who is
+    /// asking and ignores what is read; a per-resource policy must check
+    /// every one ([`TemplateInput::private_go`]). The test
+    /// `policy::tests::decides_by_who_not_what` fails if that changes.
     pub fn resource(
         &self,
         cfg: &crate::config::Config,
@@ -398,6 +404,18 @@ impl Template {
 }
 
 impl TemplateInput {
+    /// The private Go prefixes the Go lines fall under, for GONOSUMDB.
+    pub fn private_go_prefixes(&self, gp: &crate::goprivate::GoPrivate) -> Vec<String> {
+        let deps = self.deps(Eco::Go);
+        gp.patterns()
+            .into_iter()
+            .filter(|p| {
+                deps.iter()
+                    .any(|d| crate::goprivate::matches_prefix(p, &d.name).is_some())
+            })
+            .collect()
+    }
+
     /// The private Go modules among the lines, as the policy sees them.
     pub fn private_go(&self, gp: &crate::goprivate::GoPrivate) -> Vec<Resource> {
         self.deps(Eco::Go)

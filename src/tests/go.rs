@@ -227,6 +227,7 @@ async fn refuses_bad_paths_and_maps_gone_to_not_found() {
         "/go/example.com/!hello/@v/v1.0.0.tar",
         "/go/example.com/!hello/@v/../list",
         "/go/example.com/!hello",
+        "/go/example.com/!hello/@v/@latest", // @latest isn't under @v/
     ] {
         let (status, headers, _) = h.get(bad).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{bad}");

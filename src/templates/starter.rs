@@ -34,6 +34,9 @@ pub struct Starter<'a> {
     /// For a template made from a repo: its URL and the pinned commit. The
     /// manifests are then the repo's own files at that commit.
     pub from_repo: Option<(&'a str, &'a str)>,
+    /// The private Go prefixes the template's Go lines fall under, for
+    /// GONOSUMDB (only set for someone who may read them).
+    pub go_nosumdb: Vec<String>,
 }
 
 /// Tool settings never copied from a repo, so they can't send installs
@@ -63,6 +66,19 @@ fn is_go_sum(path: &str) -> bool {
 /// isn't one (too large, a NUL or CR, too many lines).
 fn checked_go_sum(text: &str) -> Option<String> {
     crate::gomodfile::parse_sum(text).ok().map(|s| s.text())
+}
+
+/// A go.mod, go.work or go.sum (by file name) that the parsers refuse as a
+/// whole. Such a file from a repo is left out of the starter; README.txt
+/// names it.
+fn refused_go_file(path: &str, text: &str) -> bool {
+    let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+    match name {
+        "go.mod" => crate::gomodfile::parse_mod(text).is_err(),
+        "go.work" => crate::gomodfile::parse_work(text, dir).is_err(),
+        "go.sum" => crate::gomodfile::parse_sum(text).is_err(),
+        _ => false,
+    }
 }
 
 /// A repo template's own manifests and lockfiles, one entry per ecosystem.
@@ -100,6 +116,9 @@ impl Starter<'_> {
         for m in &self.manifests {
             let locks = self.lockfiles.get(m.eco.as_str());
             for (path, text) in &m.files {
+                if m.eco == Eco::Go && refused_go_file(path, text) {
+                    continue;
+                }
                 // Maven has no lockfile; the pom.xml that was warmed, with
                 // every version filled in, takes the generated one's place.
                 let warmed = locks
@@ -269,10 +288,26 @@ impl Starter<'_> {
         }
         s.push_str("FILES\n\n");
         if self.from_repo.is_some() {
+            let mut refused: Vec<String> = Vec::new();
             for m in &self.manifests {
                 // Each path on its own, so a repo's file name can't add lines.
-                let paths: Vec<String> = m.files.iter().map(|(p, _)| plain(p)).collect();
-                s.push_str(&format!("  {}: {}\n", m.eco.label(), paths.join(", ")));
+                let mut paths: Vec<String> = Vec::new();
+                for (p, text) in &m.files {
+                    if m.eco == Eco::Go && refused_go_file(p, text) {
+                        refused.push(plain(p));
+                    } else {
+                        paths.push(plain(p));
+                    }
+                }
+                if !paths.is_empty() {
+                    s.push_str(&format!("  {}: {}\n", m.eco.label(), paths.join(", ")));
+                }
+            }
+            if !refused.is_empty() {
+                s.push_str(&format!(
+                    "\nLeft out because Granary could not read them as valid Go files:\n  {}\n",
+                    refused.join(", ")
+                ));
             }
             return s;
         }
@@ -304,6 +339,14 @@ impl Starter<'_> {
         let mut s = format!(
             "GO\n\nGo takes its proxy from the environment. Point it at Granary once:\n\n  go env -w GOPROXY={base}/go GONOPROXY=\n  go env -u GOPRIVATE\n\nGOPROXY lists Granary alone, so a module Granary can't serve is never\nfetched from anywhere else. The checksum database is reached through\nGranary too.\n\n"
         );
+        if !self.go_nosumdb.is_empty() {
+            // Each prefix on its own, then joined.
+            let list: Vec<String> = self.go_nosumdb.iter().map(|p| plain(p)).collect();
+            s.push_str(&format!(
+                "Some modules are private, so the public checksum database must not be\nasked about them:\n\n  go env -w GONOSUMDB={}\n\n",
+                list.join(",")
+            ));
+        }
         if self.client_auth {
             s.push_str(&format!(
                 "Go sends a token only over HTTPS, and reads it from ~/.netrc:\n\n  machine {} login token password YOUR_TOKEN\n\n",
@@ -378,6 +421,12 @@ mod tests {
                 "[toolchain]\nchannel = \"nightly\"\n",
             ),
             ("requirements.txt", "httpx\n"),
+            (
+                "go.mod",
+                "module example.com/mono\n\nrequire github.com/acme/lib v1.0.0\n",
+            ),
+            ("go.work", "use ../outside\n"),
+            ("svc/go.mod", "require (\n"),
         ]
         .into_iter()
         .map(|(p, t)| (p.to_string(), t.to_string()))
@@ -394,6 +443,7 @@ mod tests {
                 "https://github.com/acme/mono",
                 "0123456789abcdef0123456789abcdef01234567",
             )),
+            go_nosumdb: vec!["github.com/acme".into()],
         };
         let out = unzip(&s.zip().unwrap());
         let mut names: Vec<&str> = out.keys().map(String::as_str).collect();
@@ -407,6 +457,7 @@ mod tests {
                 "team-service/Cargo.toml",
                 "team-service/README.txt",
                 "team-service/crates/core/Cargo.toml",
+                "team-service/go.mod",
                 "team-service/pip.conf",
                 "team-service/requirements.txt",
                 "team-service/web/package-lock.json",
@@ -432,6 +483,13 @@ mod tests {
             readme.contains("web/package-lock.json, web/package.json"),
             "{readme}"
         );
+        // Go files the parsers refuse are left out, and named.
+        assert!(readme.contains("  Go: go.mod\n"), "{readme}");
+        assert!(
+            readme.contains("valid Go files:\n  go.work, svc/go.mod\n"),
+            "{readme}"
+        );
+        assert!(readme.contains("go env -w GONOSUMDB=github.com/acme\n"));
     }
 
     fn starter<'a>(t: &'a TemplateInput, auth: bool, locks: bool) -> Starter<'a> {
@@ -469,6 +527,7 @@ mod tests {
             warmer_granary_url: "http://granary:8080",
             client_auth: auth,
             from_repo: None,
+            go_nosumdb: Vec::new(),
         }
     }
 
@@ -560,6 +619,7 @@ mod tests {
             warmer_granary_url: "http://granary:8080",
             client_auth: true,
             from_repo: None,
+            go_nosumdb: Vec::new(),
         };
         let out = unzip(&s.zip().unwrap());
         let mut names: Vec<&str> = out.keys().map(String::as_str).collect();
