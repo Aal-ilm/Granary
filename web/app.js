@@ -1391,9 +1391,9 @@ async function renderTemplateEditor({ params, isCurrent }) {
   });
 }
 
-const MANIFESTS = { cargo: 'Cargo.toml', npm: 'package.json', pypi: 'requirements.txt', maven: 'pom.xml' };
+const MANIFESTS = { cargo: 'Cargo.toml', npm: 'package.json', pypi: 'requirements.txt', maven: 'pom.xml', go: 'go.mod' };
 
-/** Fill a section from a Cargo.toml, package.json, requirements.txt or pom.xml. */
+/** Fill a section from a Cargo.toml, package.json, requirements.txt, pom.xml or go.mod. */
 function openImportDialog(eco, changed) {
   const dlg = $('#import-dialog');
   dlg.innerHTML = `

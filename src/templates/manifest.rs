@@ -1,5 +1,5 @@
 //! "Import from manifest": read the dependency sections of a Cargo.toml,
-//! package.json, requirements.txt or pom.xml and turn them into template
+//! package.json, requirements.txt, pom.xml or go.mod and turn them into template
 //! lines. Every line produced is checked like a typed one; anything that
 //! can't be warmed (path, git, URL dependencies...) is reported as skipped.
 
@@ -39,8 +39,12 @@ pub fn import(filename: Option<&str>, content: &str) -> Result<Imported, String>
         Eco::Npm
     } else if name == "pom.xml" || name.ends_with(".pom") {
         Eco::Maven
+    } else if name == "go.mod" {
+        Eco::Go
     } else if name.ends_with(".txt") || name.ends_with(".in") {
         Eco::Pypi
+    } else if name.is_empty() && looks_like_go_mod(content) {
+        Eco::Go
     } else if trimmed.starts_with('<') {
         Eco::Maven
     } else if trimmed.starts_with('{') {
@@ -59,7 +63,7 @@ pub fn import(filename: Option<&str>, content: &str) -> Result<Imported, String>
         Eco::Npm => npm(content)?,
         Eco::Pypi => pypi(content),
         Eco::Maven => maven(content)?,
-        Eco::Go => return Err("go.mod files can't be imported yet".into()),
+        Eco::Go => go(content)?,
     };
     // Check every produced line the same way a typed line is checked, and
     // drop repeats (the same package in dependencies and dev-dependencies).
@@ -83,6 +87,23 @@ pub fn import(filename: Option<&str>, content: &str) -> Result<Imported, String>
 }
 
 pub(super) type Lines = (Vec<String>, Vec<String>);
+
+/// Pasted text whose first line that isn't blank or a comment is a
+/// `module` directive.
+fn looks_like_go_mod(content: &str) -> bool {
+    content
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("//"))
+        .is_some_and(|l| l.starts_with("module ") || l.starts_with("module\t"))
+}
+
+/// A go.mod's requirements as Go lines. Replacements by another module
+/// version are followed; ones by a directory are left out.
+pub(super) fn go(content: &str) -> Result<Lines, String> {
+    let m = crate::gomodfile::parse_mod(content).map_err(|e| format!("not a valid go.mod: {e}"))?;
+    Ok(m.lines())
+}
 
 /// A TOML basic string. JSON string escaping is valid TOML.
 pub(super) fn toml_str(s: &str) -> String {
@@ -402,6 +423,46 @@ libc = "0.2"
             ]
         );
         assert_eq!(r.skipped.len(), 2);
+    }
+
+    #[test]
+    fn imports_go_mod() {
+        let gomod = r#"// The app.
+module example.com/app
+
+go 1.22
+
+require golang.org/x/text v0.21.0 // pinned
+
+require (
+	"github.com/google/uuid" v1.6.0
+	golang.org/x/mod v0.22.0 // indirect
+	example.com/local v1.0.0
+	example.com/forked v1.0.0
+	example.com/bad v1
+	// a comment line
+)
+
+replace example.com/local => ../local
+replace example.com/forked => github.com/me/forked v1.0.1
+"#;
+        let r = import(Some("go.mod"), gomod).unwrap();
+        assert_eq!(r.ecosystem, Eco::Go);
+        assert_eq!(
+            r.lines,
+            vec![
+                "golang.org/x/text@v0.21.0",
+                "github.com/google/uuid@v1.6.0",
+                "golang.org/x/mod@v0.22.0",
+                "github.com/me/forked@v1.0.1",
+            ]
+        );
+        assert_eq!(r.skipped.len(), 2, "{:?}", r.skipped);
+        assert!(r.skipped.iter().any(|s| s.contains("example.com/local")));
+        assert!(r.skipped.iter().any(|s| s.contains("example.com/bad")));
+        // Pasted, and broken.
+        assert_eq!(import(None, gomod).unwrap().ecosystem, Eco::Go);
+        assert!(import(Some("go.mod"), "require (\n").is_err());
     }
 
     #[test]
