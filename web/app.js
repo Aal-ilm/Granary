@@ -1039,12 +1039,13 @@ async function openCacheDialog(eco, name, latest, warmer) {
 
 // --------------------------------------------------------------- templates
 
-const TEMPLATE_ECOS = ['cargo', 'npm', 'pypi', 'maven'];
+const TEMPLATE_ECOS = ['cargo', 'npm', 'pypi', 'maven', 'go'];
 const LINE_EXAMPLES = {
   cargo: 'serde = { version = "1", features = ["derive"] }\nanyhow = "*"',
   npm: '"react": "^19"\n"vite": "latest"',
   pypi: 'fastapi>=0.115\nuvicorn[standard]',
   maven: 'org.springframework.boot:spring-boot-starter-web:3.4.0\ncom.google.guava:guava',
+  go: 'golang.org/x/text@v0.21.0\ngithub.com/google/uuid@latest',
 };
 
 const packageCounts = (counts) =>
@@ -1283,7 +1284,7 @@ async function renderTemplateEditor({ params, isCurrent }) {
     view().addEventListener('click', (e) => templateAction(e));
     return;
   }
-  const v = t || { name: '', description: '', tags: [], platforms: list.default_platforms, allow_sdist: false, cargo: '', npm: '', pypi: '', maven: '' };
+  const v = t || { name: '', description: '', tags: [], platforms: list.default_platforms, allow_sdist: false, cargo: '', npm: '', pypi: '', maven: '', go: '' };
 
   const ecoBlock = (e) => `
     <div class="tpl-eco" data-eco="${e}">

@@ -197,6 +197,8 @@ impl Starter<'_> {
                     (".mvn/maven.config".into(), "-s\n.mvn/settings.xml\n".into()),
                 ]
             }
+            // Go reads its settings from the environment; see README.txt.
+            Eco::Go => Vec::new(),
         }
     }
 
@@ -252,6 +254,7 @@ impl Starter<'_> {
                 Eco::Maven => {
                     "pom.xml, .mvn/settings.xml and .mvn/maven.config (Granary as Central's mirror)"
                 }
+                Eco::Go => "go.mod",
             };
             s.push_str(&format!("  {}: {line}\n", m.eco.label()));
         }

@@ -303,6 +303,7 @@ async fn create(
         npm: scan.npm.clone(),
         pypi: scan.pypi.clone(),
         maven: scan.maven.clone(),
+        go: String::new(),
     };
     input.normalize();
     check(&input, &scan)?;

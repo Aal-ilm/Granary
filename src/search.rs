@@ -308,7 +308,7 @@ fn package_key(eco: Eco, name: &str) -> String {
     match eco {
         Eco::Cargo => name.to_ascii_lowercase(),
         Eco::Pypi => pypi::normalize(name),
-        Eco::Npm | Eco::Maven => name.to_string(),
+        Eco::Npm | Eco::Maven | Eco::Go => name.to_string(),
     }
 }
 
@@ -417,7 +417,8 @@ async fn search_upstream(st: &AppState, user: i64, eco: Eco, q: &str) -> AppResu
                 })
                 .collect()
         }
-        Eco::Pypi => Vec::new(),
+        // No search API: exact lookups only, and no search text is sent.
+        Eco::Pypi | Eco::Go => Vec::new(),
     };
 
     let mut cache = st.admin.search.results.lock().unwrap();
@@ -565,6 +566,7 @@ pub async fn lookup(st: &AppState, eco: Eco, name: &str) -> AppResult<Option<Ver
                 finish(format!("{group}:{artifact}"), versions, release)
             })
         }
+        Eco::Go => return Ok(None),
     };
     match found {
         Ok(v) => Ok(Some(v)),
@@ -836,6 +838,7 @@ pub async fn cache_one(
                 rels.push(maven::cached_at(st, &main));
             }
         }
+        Eco::Go => return Err(AppError::bad_request("Go modules can't be cached here yet")),
     }
     let mut out = Vec::new();
     for (ns, rel) in rels {

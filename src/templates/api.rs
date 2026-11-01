@@ -98,7 +98,7 @@ async fn one(
 ) -> AppResult<Json<Value>> {
     let t = load(&st, &who, id).await?;
     let mut v = summary(&t, &st.cfg);
-    for eco in lines::Eco::ALL {
+    for eco in lines::Eco::LINES {
         v[eco.as_str()] = json!(t.input.section(eco));
     }
     v["created_at"] = json!(t.created_at);

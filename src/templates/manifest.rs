@@ -59,6 +59,7 @@ pub fn import(filename: Option<&str>, content: &str) -> Result<Imported, String>
         Eco::Npm => npm(content)?,
         Eco::Pypi => pypi(content),
         Eco::Maven => maven(content)?,
+        Eco::Go => return Err("go.mod files can't be imported yet".into()),
     };
     // Check every produced line the same way a typed line is checked, and
     // drop repeats (the same package in dependencies and dev-dependencies).

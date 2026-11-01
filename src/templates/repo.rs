@@ -672,6 +672,7 @@ pub fn scan(files: &BTreeMap<String, String>, allowed_hosts: &[String]) -> Scan 
             Eco::Npm => out.npm = text,
             Eco::Pypi => out.pypi = text,
             Eco::Maven => out.maven = text,
+            Eco::Go => {}
         }
     }
     let mut seen = HashSet::new();

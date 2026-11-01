@@ -585,11 +585,24 @@ async fn run_inner(
     let Some((title, spec)) = row else {
         return Outcome::failed("the job disappeared");
     };
-    let WarmSpec { input: spec, repo } = match serde_json::from_str(&spec) {
+    let WarmSpec {
+        input: mut spec,
+        repo,
+    } = match serde_json::from_str(&spec) {
         Ok(s) => s,
         Err(e) => return Outcome::failed(format!("the job's template could not be read: {e}")),
     };
     log.push(db, &format!("Warming {title}")).await;
+    // The warmer has no Go step yet: say so, and leave the Go lines out.
+    let skipped_go = !spec.deps(Eco::Go).is_empty();
+    if skipped_go {
+        log.push(
+            db,
+            "Go: warming Go modules is not supported yet, so the Go lines were skipped",
+        )
+        .await;
+        spec.go.clear();
+    }
 
     if st.cfg.warmer_url.is_none() {
         return Outcome::failed("warming needs the warmer service (GRANARY_WARMER_URL is not set)");
@@ -685,6 +698,12 @@ async fn run_inner(
     let mut lockfiles = HashMap::new();
     let mut failures = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    if skipped_go {
+        warnings.push(
+            "Go modules are not warmed yet; they are cached when a client first asks for them"
+                .into(),
+        );
+    }
     for step in steps {
         let eco = step.eco();
         let label = step.label();
