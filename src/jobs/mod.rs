@@ -116,6 +116,9 @@ struct Outcome {
     /// What went differently than asked without failing the job, such as a
     /// lockfile that had to be installed without being used as it was.
     warnings: Vec<String>,
+    /// Something was warmed. A job that had nothing it could warm (only
+    /// Go lines, for now) leaves the template's last warm time alone.
+    warmed: bool,
 }
 
 impl Outcome {
@@ -125,6 +128,7 @@ impl Outcome {
             message: Some(message.into()),
             lockfiles: HashMap::new(),
             warnings: Vec::new(),
+            warmed: true,
         }
     }
 }
@@ -548,9 +552,11 @@ async fn run(st: &AppState, id: i64, cancel: CancellationToken) {
     if outcome.status == Status::Done {
         // The template card shows the latest warm's warnings, or none.
         let _ = sqlx::query(
-            "UPDATE templates SET last_warmed_at = ?, last_warm_warnings = ?
+            "UPDATE templates SET last_warmed_at = CASE WHEN ? THEN ? ELSE last_warmed_at END,
+                last_warm_warnings = ?
              WHERE id = (SELECT template_id FROM jobs WHERE id = ? AND kind = 'template')",
         )
+        .bind(outcome.warmed)
         .bind(now_secs() as i64)
         .bind(&warnings)
         .bind(id)
@@ -621,6 +627,7 @@ async fn run_inner(
             message: None,
             lockfiles: HashMap::new(),
             warnings: vec![GO_SKIPPED.into()],
+            warmed: false,
         };
     }
     let budget = match st.cfg.cache_limit {
@@ -762,6 +769,7 @@ async fn run_inner(
                     message: Some("Cancelled while running".into()),
                     lockfiles: HashMap::new(),
                     warnings,
+                    warmed: true,
                 };
             }
             Err(warmer::Stop::Timeout) => {
@@ -788,6 +796,7 @@ async fn run_inner(
             message: None,
             lockfiles,
             warnings,
+            warmed: true,
         }
     } else {
         Outcome {
@@ -795,6 +804,7 @@ async fn run_inner(
             message: Some(failures.join("; ")),
             lockfiles,
             warnings,
+            warmed: true,
         }
     }
 }

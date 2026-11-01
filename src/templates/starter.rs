@@ -343,7 +343,7 @@ impl Starter<'_> {
             // Each prefix on its own, then joined.
             let list: Vec<String> = self.go_nosumdb.iter().map(|p| plain(p)).collect();
             s.push_str(&format!(
-                "Some modules are private, so the public checksum database must not be\nasked about them:\n\n  go env -w GONOSUMDB={}\n\n",
+                "Some modules are private, so the public checksum database must not be\nasked about them:\n\n  go env -w 'GONOSUMDB={}'\n\n",
                 list.join(",")
             ));
         }
@@ -489,7 +489,9 @@ mod tests {
             readme.contains("valid Go files:\n  go.work, svc/go.mod\n"),
             "{readme}"
         );
-        assert!(readme.contains("go env -w GONOSUMDB=github.com/acme\n"));
+        // Quoted against shell globbing; a prefix can't hold a quote.
+        assert!(readme.contains("go env -w 'GONOSUMDB=github.com/acme'\n"));
+        assert!(crate::goprivate::check_pattern("example.com/a'b").is_err());
     }
 
     fn starter<'a>(t: &'a TemplateInput, auth: bool, locks: bool) -> Starter<'a> {

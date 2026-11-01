@@ -286,7 +286,7 @@ public checksum database about them, and keep `GOPRIVATE` unset so they
 still come through Granary:
 
 ```sh
-go env -w GONOSUMDB=gitea.example.lan,go.example.com
+go env -w 'GONOSUMDB=gitea.example.lan,go.example.com'
 ```
 
 `make use-granary TOOLS=go` does this from Granary's own list

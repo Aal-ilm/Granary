@@ -757,4 +757,8 @@ async fn go_lines_are_skipped_until_the_warmer_has_a_go_step() {
     assert_eq!(d["job"]["status"], "done", "{d}");
     assert_eq!(d["job"]["warnings"], json!([warning]));
     assert_eq!(fake.runs.lock().unwrap().len(), 1, "no new run");
+    // Nothing was warmed, so the template doesn't count as warmed.
+    let t = h.api(&cookie, &format!("/api/templates/{go_only}")).await;
+    assert!(t["last_warmed_at"].is_null(), "{t}");
+    assert_eq!(t["last_warm_warnings"], json!([warning]));
 }

@@ -712,11 +712,20 @@ fn flag(skipped: &mut Vec<Skipped>, path: &str, item: &str, reason: String) {
 
 /// Flag `replace` directives that point at a directory outside the repo:
 /// the warm step of that module fails on them.
+/// At most [`gomodfile::MAX_SKIPPED`] per file, plus one line counting the
+/// rest.
 fn flag_escaping(skipped: &mut Vec<Skipped>, path: &str, replaces: &[gomodfile::Replace]) {
+    let mut more = 0usize;
+    let mut kept = 0usize;
     for r in replaces {
         if let gomodfile::Target::Dir(d) = &r.new
             && gomodfile::resolve_in_repo(dir_of(path), d).is_none()
         {
+            if kept >= gomodfile::MAX_SKIPPED {
+                more += 1;
+                continue;
+            }
+            kept += 1;
             flag(
                 skipped,
                 path,
@@ -726,6 +735,14 @@ fn flag_escaping(skipped: &mut Vec<Skipped>, path: &str, replaces: &[gomodfile::
                 ),
             );
         }
+    }
+    if more > 0 {
+        flag(
+            skipped,
+            path,
+            "replace",
+            format!("and {more} more replace directives point outside the repo"),
+        );
     }
 }
 
@@ -1420,6 +1437,25 @@ dependencies {
         let s = scan(&files(&[("go.work", "use ../elsewhere\n")]), &hosts());
         assert!(s.skipped[0].reason.contains("outside the repo"));
         assert!(s.manifests.is_empty());
+    }
+
+    #[test]
+    fn escaping_replaces_are_flagged_up_to_the_cap() {
+        let max = gomodfile::MAX_REQUIRES;
+        let mut text = String::from("module example.com/m\n");
+        for i in 0..max {
+            text.push_str(&format!("replace example.com/r{i} => ../../out{i}\n"));
+        }
+        let s = scan(&files(&[("go.mod", &text)]), &hosts());
+        let flagged: Vec<&Skipped> = s.skipped.iter().filter(|k| k.path == "go.mod").collect();
+        assert_eq!(flagged.len(), gomodfile::MAX_SKIPPED + 1);
+        assert_eq!(
+            flagged[gomodfile::MAX_SKIPPED].reason,
+            format!(
+                "and {} more replace directives point outside the repo",
+                max - gomodfile::MAX_SKIPPED
+            )
+        );
     }
 
     #[test]
