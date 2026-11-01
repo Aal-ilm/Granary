@@ -419,7 +419,7 @@ impl RepoSource {
         self.files
             .keys()
             .map(String::as_str)
-            .filter(|p| p.ends_with("Cargo.lock") || p.ends_with("package-lock.json"))
+            .filter(|p| repo::is_lockfile(p))
             .collect()
     }
 

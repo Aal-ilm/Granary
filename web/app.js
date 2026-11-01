@@ -1815,7 +1815,7 @@ async function renderFromRepo({ query, isCurrent }) {
       })
       .join('');
     const manifests = p.manifests
-      .map((m) => `<tr><td class="mono">${esc(m.path)}</td><td>${m.ecosystem ? chip(m.ecosystem) : ''}</td><td class="r num">${esc(count(m.packages))}</td></tr>`)
+      .map((m) => `<tr><td class="mono">${esc(m.path)}</td><td>${m.ecosystem ? chip(m.ecosystem) : ''}</td><td class="r num">${esc(count(m.packages))}${m.requirements != null ? ` <span class="muted">(${esc(plural(m.requirements, m.path.endsWith('go.work') ? 'member' : 'requirement'))})</span>` : ''}</td></tr>`)
       .join('');
     const gitDeps = p.git_deps.length
       ? `<section><h2>Git dependencies</h2><p class="page-note">${p.git_deps.some((d) => d.allowed && !d.cached) ? 'Allowed repos that aren\'t cached yet are cached when you save.' : ''}</p>

@@ -129,7 +129,7 @@ async fn read_repo(
             if files.len() >= MAX_FILES {
                 break;
             }
-            let max = if path.ends_with(".lock") || path.ends_with("-lock.json") {
+            let max = if repo::is_lockfile(&path) {
                 MAX_LOCKFILE
             } else {
                 MAX_MANIFEST
@@ -182,7 +182,7 @@ fn preview_json(
         "counts": scan.counts,
         "skipped": scan.skipped,
         "git_deps": git_deps,
-        "lines": {"cargo": scan.cargo, "npm": scan.npm, "pypi": scan.pypi, "maven": scan.maven},
+        "lines": {"cargo": scan.cargo, "npm": scan.npm, "pypi": scan.pypi, "maven": scan.maven, "go": scan.go},
     })
 }
 
@@ -303,7 +303,7 @@ async fn create(
         npm: scan.npm.clone(),
         pypi: scan.pypi.clone(),
         maven: scan.maven.clone(),
-        go: String::new(),
+        go: scan.go.clone(),
     };
     input.normalize();
     check(&input, &scan)?;
@@ -382,6 +382,7 @@ async fn resync(
     input.npm = scan.npm.clone();
     input.pypi = scan.pypi.clone();
     input.maven = scan.maven.clone();
+    input.go = scan.go.clone();
     input.normalize();
     check(&input, &scan)?;
     let source = RepoSource {

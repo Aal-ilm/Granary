@@ -150,7 +150,7 @@ async fn previews_and_saves_a_workspace_repo() {
     );
     assert_eq!(
         p["counts"],
-        json!({"cargo": 3, "npm": 3, "pypi": 1, "maven": 0})
+        json!({"cargo": 3, "npm": 3, "pypi": 1, "maven": 0, "go": 0})
     );
     let cargo = p["lines"]["cargo"].as_str().unwrap();
     assert!(

@@ -541,6 +541,7 @@ pub fn parse_sum(text: &str) -> Result<GoSum, String> {
 
 impl GoSum {
     /// The valid lines as a go.sum file.
+    #[allow(dead_code)] // used by starters in the next change
     pub fn text(&self) -> String {
         let mut out = String::new();
         for l in &self.lines {
