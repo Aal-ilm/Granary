@@ -615,3 +615,151 @@ async fn real_go_builds_through_granary() {
     let vuln = h.get("/go/vuln/index/db.json.gz").await;
     assert_eq!(vuln.0, StatusCode::OK);
 }
+
+/// Get packages for Go: exact module paths through the proxy path, never
+/// a search host or Gitea; Cache verifies like any client; only canonical
+/// versions; offline, only what is cached.
+#[tokio::test]
+async fn get_packages_looks_up_and_caches_modules() {
+    let mut w = World::new(Opts {
+        search: true,
+        ..Opts::default()
+    })
+    .await;
+    w.publish(HELLO, "v1.0.0", HELLO_FILES, true);
+    let h = &w.h;
+    let cookie = h.login().await;
+
+    let d = h
+        .api(&cookie, "/api/packages/search?eco=go&q=example.com%2FHello")
+        .await;
+    assert_eq!(d["mode"], "lookup");
+    assert_eq!(d["results"][0]["name"], HELLO);
+    assert_eq!(d["results"][0]["latest"], "v1.0.0");
+    assert_eq!(d["results"][0]["private"], false);
+    let v = h
+        .api(
+            &cookie,
+            "/api/packages/versions?eco=go&name=example.com%2FHello",
+        )
+        .await;
+    assert_eq!(v["versions"], serde_json::json!(["v1.0.0"]));
+    // Unknown and invalid paths find nothing.
+    for q in ["example.com%2Fnope", "not-a-module", "Example.com%2Fx"] {
+        let d = h
+            .api(&cookie, &format!("/api/packages/search?eco=go&q={q}"))
+            .await;
+        assert!(d["results"].as_array().unwrap().is_empty(), "{q}");
+    }
+    // Only the mock proxy was asked: no search host, no Gitea.
+    let seen: Vec<String> = h
+        .mock
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(p, _)| p.clone())
+        .collect();
+    assert!(seen.iter().all(|p| p.starts_with("/goproxy/")), "{seen:?}");
+
+    let cache = |version: &str| serde_json::json!({"eco": "go", "name": HELLO, "version": version});
+    let (status, _, body) = h
+        .send(
+            "POST",
+            "/api/packages/cache",
+            Some(&cookie),
+            Some(cache("v1.0.0")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let r: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(r["files"].as_array().unwrap().len(), 2);
+    assert!(r["bytes"].as_u64().unwrap() > 0);
+    let files = h.data.join("files/go/example.com/!hello/@v");
+    assert!(files.join("v1.0.0").exists() && files.join("v1.0.0.mod").exists());
+
+    // A query, a short version or a bare .info: refused.
+    for bad in ["master", "v1", "v1.0.0.info", "latest"] {
+        let (status, _, _) = h
+            .send(
+                "POST",
+                "/api/packages/cache",
+                Some(&cookie),
+                Some(cache(bad)),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+
+    // A go.mod and zip that don't match the checksum database: 502,
+    // nothing cached.
+    w.publish(HELLO, "v1.1.0", HELLO_FILES, true);
+    let h = &w.h;
+    h.mock.set(
+        "/goproxy/example.com/!hello/@v/v1.1.0.mod",
+        Upstream::ok("module example.com/Hello\n\nrequire evil.example v1.0.0\n"),
+    );
+    h.mock.set(
+        "/goproxy/example.com/!hello/@v/v1.1.0.zip",
+        Upstream::ok(module_zip(
+            HELLO,
+            "v1.1.0",
+            &[("evil.go", "package evil\n")],
+        )),
+    );
+    let (status, _, _) = h
+        .send(
+            "POST",
+            "/api/packages/cache",
+            Some(&cookie),
+            Some(cache("v1.1.0")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(!files.join("v1.1.0").exists() && !files.join("v1.1.0.mod").exists());
+    // @latest is resolved to a canonical version first (here the cached
+    // @latest answer, v1.0.0).
+    let (status, _, body) = h
+        .send(
+            "POST",
+            "/api/packages/cache",
+            Some(&cookie),
+            Some(cache("@latest")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8_lossy(&body).contains("v1.0.0.mod"));
+
+    // Offline, on the same data: only what is cached.
+    let offline = Harness::with(Opts {
+        offline: true,
+        data: Some(h.data.clone()),
+        go_sumdb_key: Some(w.log.vkey.clone()),
+        ..Opts::default()
+    })
+    .await;
+    let cookie = offline.login().await;
+    let d = offline
+        .api(&cookie, "/api/packages/search?eco=go&q=example.com%2FHello")
+        .await;
+    assert_eq!(d["results"][0]["cached_versions"], 1);
+    let (status, _, _) = offline
+        .send(
+            "POST",
+            "/api/packages/cache",
+            Some(&cookie),
+            Some(cache("v1.0.0")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = offline
+        .send(
+            "POST",
+            "/api/packages/cache",
+            Some(&cookie),
+            Some(cache("v1.1.0")),
+        )
+        .await;
+    assert!(!status.is_success());
+    assert_eq!(offline.mock.total(), 0);
+}

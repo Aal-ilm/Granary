@@ -398,7 +398,7 @@ async fn starter(
     }
     // Go lines asking for @latest: the latest version now.
     for module in build::latest_go(&t.input) {
-        let Some(version) = crate::search::lookup(&st, lines::Eco::Go, &module)
+        let Some(version) = crate::search::lookup_go(&st, &who, &module)
             .await
             .ok()
             .flatten()
