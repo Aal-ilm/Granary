@@ -854,12 +854,15 @@ async function renderComponent({ params, query, isCurrent }) {
 
 // ------------------------------------------------------------ get packages
 
-const GET_ECOS = ['npm', 'cargo', 'pypi', 'maven'];
+const GET_ECOS = ['npm', 'cargo', 'pypi', 'maven', 'go'];
+/** No search API: exact names only, and no search text leaves Granary. */
+const LOOKUP_ONLY = ['pypi', 'go'];
 const SEARCH_HINTS = {
   npm: { placeholder: 'Search npm, e.g. react', lookup: 'Exact package name, e.g. react' },
   cargo: { placeholder: 'Search crates.io, e.g. serde', lookup: 'Exact crate name, e.g. serde' },
   pypi: { placeholder: 'Exact project name, e.g. requests', lookup: 'Exact project name, e.g. requests' },
   maven: { placeholder: 'Search Maven Central, e.g. guava', lookup: 'group:artifact, e.g. com.google.guava:guava' },
+  go: { placeholder: 'Exact module path, e.g. golang.org/x/text', lookup: 'Exact module path, e.g. golang.org/x/text' },
 };
 
 async function renderGet({ params, query, isCurrent }) {
@@ -877,7 +880,7 @@ async function renderGet({ params, query, isCurrent }) {
   }
   if (!isCurrent()) return;
 
-  const searching = status.search && eco !== 'pypi';
+  const searching = status.search && !LOOKUP_ONLY.includes(eco);
   const hint = SEARCH_HINTS[eco];
   const tabs = GET_ECOS.map((id) => {
     const qs = q ? '?q=' + encodeURIComponent(q) : '';
@@ -886,6 +889,7 @@ async function renderGet({ params, query, isCurrent }) {
   const notes = [];
   if (status.note) notes.push(status.note);
   else if (eco === 'pypi') notes.push('PyPI has no search API, so type the exact project name.');
+  else if (eco === 'go') notes.push('The Go module proxy has no search API, so type the exact module path. Nothing you type is sent to a search host.');
   if (searching) notes.push(`Search text is sent to ${new URL(status.hosts[eco]).host}.`);
 
   let body = '';
@@ -952,7 +956,7 @@ async function openCacheDialog(eco, name, latest, warmer) {
       <div class="stack">
         <div class="field"><label for="cache-version">Version</label>
           <select id="cache-version" disabled><option>Loading versions…</option></select></div>
-        ${warmer ? '<label class="check"><input type="checkbox" id="cache-deps" checked> With dependencies</label>' : ''}
+        ${warmer && eco !== 'go' ? '<label class="check"><input type="checkbox" id="cache-deps" checked> With dependencies</label>' : ''}
         ${eco === 'pypi' ? '<div class="field" id="cache-file-row"><label for="cache-file">File</label><select id="cache-file" disabled><option>Choose a version first</option></select><p class="help">Wheels are built for one platform; a file ending in -none-any.whl works everywhere.</p></div>' : ''}
       </div>
       <p class="err hidden" id="cache-err"></p>
@@ -967,7 +971,7 @@ async function openCacheDialog(eco, name, latest, warmer) {
   const fileSel = $('#cache-file');
   const ok = $('#cache-ok');
   const deps = $('#cache-deps');
-  const single = `Caches this one version${eco === 'maven' ? ' (its POM and artifact)' : ''}. Its dependencies are fetched when a client first asks for them.`;
+  const single = `Caches this one version${eco === 'maven' ? ' (its POM and artifact)' : eco === 'go' ? ' (its go.mod and zip, checked against the checksum database)' : ''}. Its dependencies are fetched when a client first asks for them.`;
   const withDeps = 'Starts a warm job that installs this version with the real package tool, so every dependency is cached too, for each default platform.';
   const describe = () => {
     $('#cache-what').textContent = deps?.checked ? withDeps : single;
@@ -1039,12 +1043,13 @@ async function openCacheDialog(eco, name, latest, warmer) {
 
 // --------------------------------------------------------------- templates
 
-const TEMPLATE_ECOS = ['cargo', 'npm', 'pypi', 'maven'];
+const TEMPLATE_ECOS = ['cargo', 'npm', 'pypi', 'maven', 'go'];
 const LINE_EXAMPLES = {
   cargo: 'serde = { version = "1", features = ["derive"] }\nanyhow = "*"',
   npm: '"react": "^19"\n"vite": "latest"',
   pypi: 'fastapi>=0.115\nuvicorn[standard]',
   maven: 'org.springframework.boot:spring-boot-starter-web:3.4.0\ncom.google.guava:guava',
+  go: 'golang.org/x/text@v0.21.0\ngithub.com/google/uuid@latest',
 };
 
 const packageCounts = (counts) =>
@@ -1283,7 +1288,7 @@ async function renderTemplateEditor({ params, isCurrent }) {
     view().addEventListener('click', (e) => templateAction(e));
     return;
   }
-  const v = t || { name: '', description: '', tags: [], platforms: list.default_platforms, allow_sdist: false, cargo: '', npm: '', pypi: '', maven: '' };
+  const v = t || { name: '', description: '', tags: [], platforms: list.default_platforms, allow_sdist: false, cargo: '', npm: '', pypi: '', maven: '', go: '' };
 
   const ecoBlock = (e) => `
     <div class="tpl-eco" data-eco="${e}">
@@ -1390,9 +1395,9 @@ async function renderTemplateEditor({ params, isCurrent }) {
   });
 }
 
-const MANIFESTS = { cargo: 'Cargo.toml', npm: 'package.json', pypi: 'requirements.txt', maven: 'pom.xml' };
+const MANIFESTS = { cargo: 'Cargo.toml', npm: 'package.json', pypi: 'requirements.txt', maven: 'pom.xml', go: 'go.mod' };
 
-/** Fill a section from a Cargo.toml, package.json, requirements.txt or pom.xml. */
+/** Fill a section from a Cargo.toml, package.json, requirements.txt, pom.xml or go.mod. */
 function openImportDialog(eco, changed) {
   const dlg = $('#import-dialog');
   dlg.innerHTML = `
@@ -1814,7 +1819,7 @@ async function renderFromRepo({ query, isCurrent }) {
       })
       .join('');
     const manifests = p.manifests
-      .map((m) => `<tr><td class="mono">${esc(m.path)}</td><td>${m.ecosystem ? chip(m.ecosystem) : ''}</td><td class="r num">${esc(count(m.packages))}</td></tr>`)
+      .map((m) => `<tr><td class="mono">${esc(m.path)}</td><td>${m.ecosystem ? chip(m.ecosystem) : ''}</td><td class="r num">${esc(count(m.packages))}${m.requirements != null ? ` <span class="muted">(${esc(plural(m.requirements, m.path.endsWith('go.work') ? 'member' : 'requirement'))})</span>` : ''}</td></tr>`)
       .join('');
     const gitDeps = p.git_deps.length
       ? `<section><h2>Git dependencies</h2><p class="page-note">${p.git_deps.some((d) => d.allowed && !d.cached) ? 'Allowed repos that aren\'t cached yet are cached when you save.' : ''}</p>

@@ -1,0 +1,10 @@
+module example.com/app
+
+require (
+	"github.com/BurntSushi/toml" v1.4.0 // indirect
+	`gopkg.in/yaml.v3` v3.0.1
+	github.com/a/b v2.0.0+incompatible
+)
+
+exclude example.com/x v1.0.0
+retract v1.0.1

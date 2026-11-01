@@ -7,6 +7,7 @@
 //! | Cargo | crates.io's API (`GRANARY_CARGO_API`) |
 //! | PyPI | no search API: exact name lookup only |
 //! | Maven | search.maven.org (`GRANARY_MAVEN_SEARCH`) |
+//! | Go | no search API: exact module path lookup only, through the proxy |
 //!
 //! Exact lookups read the registry metadata through Granary's own cache
 //! (the same path clients use), so cached packages can be looked up offline.
@@ -39,7 +40,8 @@ use crate::{
     admin::api::version_cmp,
     auth::{AuthSession, require_admin},
     error::{AppError, AppResult},
-    formats::{cargo, maven, npm, pypi},
+    formats::{cargo, go, go_private, maven, npm, pypi},
+    gomod,
     inventory::{self, meta_key},
     net::ClientIp,
     policy::{Principal, Resource},
@@ -104,7 +106,7 @@ fn search_mode(st: &AppState) -> (bool, Option<&'static str>) {
 }
 
 fn eco_param(s: &str) -> AppResult<Eco> {
-    Eco::parse(s).ok_or_else(|| AppError::bad_request(format!("unknown ecosystem {s:?}")))
+    Eco::parse_line(s).ok_or_else(|| AppError::bad_request(format!("unknown ecosystem {s:?}")))
 }
 
 async fn status(State(st): State<AppState>, auth: AuthSession) -> AppResult<Json<Value>> {
@@ -120,6 +122,7 @@ async fn status(State(st): State<AppState>, auth: AuthSession) -> AppResult<Json
             "cargo": st.cfg.cargo_api,
             "npm": st.cfg.npm_upstream,
             "maven": st.cfg.maven_search,
+            "go": st.cfg.go_upstream,
         },
     })))
 }
@@ -143,8 +146,8 @@ async fn search(
         return Err(AppError::bad_request("type between 1 and 200 characters"));
     }
     let (search_on, note) = search_mode(&st);
-    // PyPI has no search API at all.
-    let lookup_only = !search_on || eco == Eco::Pypi;
+    // PyPI and the Go module proxy have no search API at all.
+    let lookup_only = !search_on || matches!(eco, Eco::Pypi | Eco::Go);
     crate::audit::record(
         &st.auth.db,
         &user.username,
@@ -161,7 +164,20 @@ async fn search(
 
     let who = Principal::from_session(&auth);
     let private = |name: &str| private_name(&st, eco, name);
-    let mut hits = if lookup_only {
+    let mut hits = if eco == Eco::Go {
+        // An exact module path, through the proxy path clients use; a
+        // private path someone may not read finds nothing, before
+        // anything is fetched. Nothing goes to Gitea or a search host.
+        match lookup_go(&st, &who, text).await? {
+            Some(v) => vec![Hit {
+                private: st.goprivate.route(&v.name).is_some(),
+                name: v.name,
+                latest: v.latest,
+                description: None,
+            }],
+            None => Vec::new(),
+        }
+    } else if lookup_only {
         match lookup(&st, eco, text).await? {
             Some(v) => vec![Hit {
                 private: private(&v.name),
@@ -177,12 +193,13 @@ async fn search(
         hits.retain(|h| !private(&h.name));
         hits
     };
-    // Private packages, for those who may see them.
-    if search_on && st.policy.has_private_access(&who) {
+    // Private packages, for those who may see them. Go's private modules
+    // were checked by lookup_go.
+    if search_on && eco != Eco::Go && st.policy.has_private_access(&who) {
         hits.extend(search_gitea(&st, eco, text).await);
     }
     hits.retain(|h| {
-        !h.private || {
+        eco == Eco::Go || !h.private || {
             let owner = owner_of(&st, eco, &h.name).unwrap_or_default();
             st.policy.can_read_private(
                 &who,
@@ -196,18 +213,25 @@ async fn search(
         .into_iter()
         .map(|h| {
             let cached = cached_versions(&inv, eco, &h.name);
+            let source = match (h.private, eco) {
+                (false, _) => "public",
+                (true, Eco::Go) => "private module source",
+                (true, _) => "Gitea",
+            };
             json!({
                 "name": h.name,
                 "latest": h.latest,
                 "description": h.description,
                 "cached_versions": cached,
                 "private": h.private,
-                "source": if h.private { "Gitea" } else { "public" },
+                "source": source,
             })
         })
         .collect();
     let note = if eco == Eco::Pypi && search_on {
         Some("PyPI has no search API, so type the exact project name.")
+    } else if eco == Eco::Go && search_on {
+        Some("The Go module proxy has no search API, so type the exact module path.")
     } else {
         note
     };
@@ -308,7 +332,7 @@ fn package_key(eco: Eco, name: &str) -> String {
     match eco {
         Eco::Cargo => name.to_ascii_lowercase(),
         Eco::Pypi => pypi::normalize(name),
-        Eco::Npm | Eco::Maven => name.to_string(),
+        Eco::Npm | Eco::Maven | Eco::Go => name.to_string(),
     }
 }
 
@@ -417,7 +441,8 @@ async fn search_upstream(st: &AppState, user: i64, eco: Eco, q: &str) -> AppResu
                 })
                 .collect()
         }
-        Eco::Pypi => Vec::new(),
+        // No search API: exact lookups only, and no search text is sent.
+        Eco::Pypi | Eco::Go => Vec::new(),
     };
 
     let mut cache = st.admin.search.results.lock().unwrap();
@@ -565,12 +590,218 @@ pub async fn lookup(st: &AppState, eco: Eco, name: &str) -> AppResult<Option<Ver
                 finish(format!("{group}:{artifact}"), versions, release)
             })
         }
+        // Without someone asking, no private module is read.
+        Eco::Go => return lookup_go(st, &Principal::Anonymous, name).await,
     };
     match found {
         Ok(v) => Ok(Some(v)),
         Err(e) if e.status == StatusCode::NOT_FOUND => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Largest `@v/list` or `@latest` answer read for a lookup.
+// Without data: revisit once Go lookups see real use (go-spec phase 3).
+const MAX_GO_ANSWER: usize = 4 << 20;
+/// Most versions listed for one module.
+// Without data: revisit once Go lookups see real use (go-spec phase 3).
+const MAX_GO_VERSIONS: usize = 10_000;
+
+/// A private module path `who` may not read, as the policy describes it.
+fn go_refused(st: &AppState, who: &Principal, module: &str) -> bool {
+    st.goprivate.route(module).is_some_and(|route| {
+        let what = go_private::resource(module, &route.source);
+        !st.policy.can_read_private(who, &what)
+    })
+}
+
+/// One module file through the proxy's own path. `None` when there is no
+/// such file (or `who` may not read it).
+async fn go_file(
+    st: &AppState,
+    who: &Principal,
+    module: &str,
+    file: &str,
+    keep_body: bool,
+) -> AppResult<Option<bytes::Bytes>> {
+    let escmod = gomod::escape(module);
+    let path = if file == "@latest" {
+        format!("/go/{escmod}/@latest")
+    } else {
+        format!("/go/{escmod}/@v/{file}")
+    };
+    let headers = axum::http::HeaderMap::new();
+    let asker = go_private::Asker {
+        who,
+        headers: &headers,
+        path: &path,
+    };
+    let resp = match go::module_file(st, asker, module, &escmod, file).await {
+        Ok(r) => r,
+        Err(e) if e.status == StatusCode::NOT_FOUND => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let status = resp.status();
+    if matches!(
+        status,
+        StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ) {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(AppError::new(status, format!("{module}: {file} failed")));
+    }
+    if !keep_body {
+        return Ok(Some(bytes::Bytes::new()));
+    }
+    axum::body::to_bytes(resp.into_body(), MAX_GO_ANSWER)
+        .await
+        .map(Some)
+        .map_err(|_| AppError::bad_gateway(format!("{module}: the {file} answer is too large")))
+}
+
+fn semver_of(v: &str) -> Option<semver::Version> {
+    semver::Version::parse(v.strip_prefix('v')?).ok()
+}
+
+/// A Go module's versions, newest first, by exact module path, through
+/// the same path Go clients use (cache, private routing, policy). A
+/// private path `who` may not read finds nothing, and nothing about it is
+/// fetched.
+pub async fn lookup_go(st: &AppState, who: &Principal, name: &str) -> AppResult<Option<Versions>> {
+    let module = name.trim();
+    if module.len() > crate::gomodfile::MAX_GO_LINE || gomod::check_path(module).is_err() {
+        return Ok(None);
+    }
+    if go_refused(st, who, module) {
+        return Ok(None);
+    }
+    let mut versions: Vec<String> = match go_file(st, who, module, "list", true).await? {
+        Some(body) => String::from_utf8_lossy(&body)
+            .lines()
+            .map(str::trim)
+            .filter(|v| gomod::check(module, v).is_ok())
+            .take(MAX_GO_VERSIONS)
+            .map(String::from)
+            .collect(),
+        None => Vec::new(),
+    };
+    let latest = go_file(st, who, module, "@latest", true)
+        .await?
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v["Version"].as_str().map(String::from))
+        .filter(|v| gomod::check(module, v).is_ok());
+    if let Some(l) = &latest
+        && !versions.contains(l)
+    {
+        versions.push(l.clone());
+    }
+    if versions.is_empty() {
+        return Ok(None);
+    }
+    versions.sort_by_key(|v| std::cmp::Reverse(semver_of(v)));
+    let latest = latest
+        .filter(|l| semver_of(l).is_some_and(|s| s.pre.is_empty()))
+        .or_else(|| {
+            versions
+                .iter()
+                .find(|v| semver_of(v).is_some_and(|s| s.pre.is_empty()))
+                .cloned()
+        })
+        .or_else(|| versions.first().cloned());
+    Ok(Some(Versions {
+        name: module.to_string(),
+        latest,
+        versions,
+    }))
+}
+
+/// Cache one Go module version: its `.mod`, then its `.zip`, through the
+/// proxy's path, so both are verified as for any client. `@latest` is
+/// resolved first; anything else must be a canonical version.
+async fn cache_go(
+    st: &AppState,
+    who: &Principal,
+    module: &str,
+    version: &str,
+) -> AppResult<Vec<(&'static str, String)>> {
+    gomod::check_path(module).map_err(|e| AppError::bad_request(format!("{module:?}: {e}")))?;
+    // Which prefixes are private is itself private: every answer below is
+    // the same for a path someone may not read as for one that doesn't
+    // exist. lookup_go finds nothing for such a path, without fetching.
+    let version = if version == "@latest" {
+        lookup_go(st, who, module)
+            .await?
+            .and_then(|v| v.latest)
+            .ok_or_else(AppError::not_found)?
+    } else {
+        version.to_string()
+    };
+    if !gomod::is_canonical(&version) {
+        return Err(AppError::bad_request(format!(
+            "{version:?} is not a released version; choose one like v1.2.3"
+        )));
+    }
+    gomod::check(module, &version).map_err(AppError::bad_request)?;
+    let no_version = || {
+        AppError::new(
+            StatusCode::NOT_FOUND,
+            format!("{module} has no version {version}"),
+        )
+    };
+    // Asked before anything is fetched.
+    if go_refused(st, who, module) {
+        return Err(no_version());
+    }
+    let escver = gomod::escape(&version);
+    let escmod = gomod::escape(module);
+    let (ns, base) = match st.goprivate.route(module) {
+        Some(r) => ("go-private", format!("{}/{escmod}", r.source.cache_key())),
+        None => ("go", escmod),
+    };
+    // .info first: a version that doesn't exist is a plain "no version"
+    // then, before the checksum database is asked about it. If the
+    // version then fails, an .info this call added is removed again, so
+    // nothing of it stays cached.
+    let info_rel = format!("{base}/@v/{escver}.info");
+    let had_info = st.store.has_file(ns, &info_rel).await;
+    // Offline, a version whose go.mod and zip are cached is complete
+    // without its .info (clients never needed one for it).
+    let cached = st.store.offline()
+        && st
+            .store
+            .has_file(ns, &format!("{base}/@v/{escver}.mod"))
+            .await
+        && st.store.has_file(ns, &format!("{base}/@v/{escver}")).await;
+    let steps: &[&str] = if cached {
+        &["mod", "zip"]
+    } else {
+        &["info", "mod", "zip"]
+    };
+    let mut result = Ok(());
+    for ext in steps {
+        match go_file(st, who, module, &format!("{escver}.{ext}"), false).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                result = Err(no_version());
+                break;
+            }
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        }
+    }
+    if let Err(e) = result {
+        if !had_info {
+            let _ = st.store.delete_file(ns, &info_rel).await;
+        }
+        return Err(e);
+    }
+    Ok(vec![
+        (ns, format!("{base}/@v/{escver}.mod")),
+        (ns, format!("{base}/@v/{escver}")),
+    ])
 }
 
 /// Versions and the release version from a maven-metadata.xml.
@@ -608,7 +839,12 @@ async fn versions(
 ) -> AppResult<Json<Value>> {
     require_admin(&auth)?;
     let eco = eco_param(&q.eco)?;
-    let v = lookup(&st, eco, q.name.trim()).await?.ok_or_else(|| {
+    let found = if eco == Eco::Go {
+        lookup_go(&st, &Principal::from_session(&auth), &q.name).await?
+    } else {
+        lookup(&st, eco, q.name.trim()).await?
+    };
+    let v = found.ok_or_else(|| {
         AppError::new(
             StatusCode::NOT_FOUND,
             format!("no package named {}", q.name.trim()),
@@ -713,7 +949,8 @@ async fn cache(
     if version.is_empty() || version.len() > 128 {
         return Err(AppError::bad_request("choose a version"));
     }
-    let result = cache_one(&st, eco, name, version, body.file.as_deref()).await;
+    let who = Principal::from_session(&auth);
+    let result = cache_one(&st, &who, eco, name, version, body.file.as_deref()).await;
     crate::audit::record(
         &st.auth.db,
         &admin,
@@ -740,6 +977,7 @@ async fn cache(
 /// Returns (relative path, size) of every file now cached.
 pub async fn cache_one(
     st: &AppState,
+    who: &Principal,
     eco: Eco,
     name: &str,
     version: &str,
@@ -836,6 +1074,7 @@ pub async fn cache_one(
                 rels.push(maven::cached_at(st, &main));
             }
         }
+        Eco::Go => rels.extend(cache_go(st, who, name, version).await?),
     }
     let mut out = Vec::new();
     for (ns, rel) in rels {

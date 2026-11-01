@@ -691,3 +691,74 @@ async fn real_warmer_caches_a_template_through_granary() {
     assert!(log.iter().all(|l| !l.contains("gran_")), "{log:#?}");
     let _ = child.kill().await;
 }
+
+/// The warmer has no Go step yet: a template's Go lines are left out of
+/// what the warmer gets, the log says so and the job warns. With only Go
+/// lines, the warmer isn't asked at all.
+#[tokio::test]
+async fn go_lines_are_skipped_until_the_warmer_has_a_go_step() {
+    let (h, fake, cookie) = with_fake(Plan::default(), Opts::default()).await;
+    let create = |name: &str, body: Value| {
+        let mut body = body;
+        body["name"] = json!(name);
+        body
+    };
+    let (_, _, out) = h
+        .send(
+            "POST",
+            "/api/templates",
+            Some(&cookie),
+            Some(create(
+                "Mixed",
+                json!({"cargo": "serde = \"1\"", "go": "golang.org/x/text@v0.21.0"}),
+            )),
+        )
+        .await;
+    let mixed = serde_json::from_slice::<Value>(&out).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let d = warm_and_wait(&h, &cookie, mixed).await;
+    assert_eq!(d["job"]["status"], "done", "{d}");
+    let warning =
+        "Go modules are not warmed yet; they are cached when a client first asks for them";
+    assert_eq!(d["job"]["warnings"], json!([warning]));
+    let log: Vec<&str> = d["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["line"].as_str().unwrap())
+        .collect();
+    assert!(
+        log.iter().any(|l| l.contains("Go lines were skipped")),
+        "{log:?}"
+    );
+    {
+        let runs = fake.runs.lock().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["ecosystem"], "cargo");
+        assert!(runs[0]["files"].get("go.mod").is_none(), "{}", runs[0]);
+    }
+    let t = h.api(&cookie, &format!("/api/templates/{mixed}")).await;
+    assert_eq!(t["last_warm_warnings"], json!([warning]));
+
+    // Only Go lines: done with the warning, and the warmer never asked.
+    let (_, _, out) = h
+        .send(
+            "POST",
+            "/api/templates",
+            Some(&cookie),
+            Some(create("Go only", json!({"go": "golang.org/x/text@latest"}))),
+        )
+        .await;
+    let go_only = serde_json::from_slice::<Value>(&out).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let d = warm_and_wait(&h, &cookie, go_only).await;
+    assert_eq!(d["job"]["status"], "done", "{d}");
+    assert_eq!(d["job"]["warnings"], json!([warning]));
+    assert_eq!(fake.runs.lock().unwrap().len(), 1, "no new run");
+    // Nothing was warmed, so the template doesn't count as warmed.
+    let t = h.api(&cookie, &format!("/api/templates/{go_only}")).await;
+    assert!(t["last_warmed_at"].is_null(), "{t}");
+    assert_eq!(t["last_warm_warnings"], json!([warning]));
+}

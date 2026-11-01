@@ -27,15 +27,17 @@ pub fn project_name(template: &str) -> String {
     }
 }
 
-/// Manifests for every ecosystem the template uses. `maven_versions` gives
-/// a version for each `group:artifact` listed without one.
+/// Manifests for every ecosystem the template uses. `versions` gives a
+/// version for each Maven `group:artifact` listed without one, and for
+/// each Go module listed as `@latest` (keyed by module path; Go paths
+/// never contain a colon, so the keys can't clash).
 pub fn manifests(
     t: &TemplateInput,
-    maven_versions: &HashMap<String, String>,
+    versions: &HashMap<String, String>,
 ) -> Result<Vec<Manifest>, String> {
     let name = project_name(&t.name);
     let mut out = Vec::new();
-    for eco in Eco::ALL {
+    for eco in Eco::LINES {
         let deps = t.deps(eco);
         if deps.is_empty() {
             continue;
@@ -45,7 +47,8 @@ pub fn manifests(
             Eco::Cargo => cargo(&name, &lines),
             Eco::Npm => npm(&name, &lines)?,
             Eco::Pypi => vec![("requirements.txt".into(), format!("{}\n", lines.join("\n")))],
-            Eco::Maven => maven(&name, &lines, maven_versions)?,
+            Eco::Maven => maven(&name, &lines, versions)?,
+            Eco::Go => vec![("go.mod".into(), go_mod(&name, &lines, versions)?)],
         };
         out.push(Manifest { eco, files });
     }
@@ -132,6 +135,41 @@ fn maven(
     Ok(vec![("pom.xml".into(), pom)])
 }
 
+/// The go.mod for Go lines: one `require` each, from checked values only
+/// (an `@latest` line takes its version from `versions`). No `replace`,
+/// `toolchain` or anything else.
+pub fn go_mod(
+    name: &str,
+    lines: &[&str],
+    versions: &HashMap<String, String>,
+) -> Result<String, String> {
+    let mut requires = String::new();
+    for line in lines {
+        crate::gomodfile::check_line(line)?;
+        let (path, version) = line.split_once('@').ok_or("not a Go line")?;
+        let version = if version == "latest" {
+            versions
+                .get(path)
+                .ok_or_else(|| format!("no version found for {path}"))?
+        } else {
+            version
+        };
+        crate::gomod::check(path, version)?;
+        requires.push_str(&format!("\t{path} {version}\n"));
+    }
+    Ok(format!(
+        "module {name}\n\ngo 1.22\n\nrequire (\n{requires})\n"
+    ))
+}
+
+/// The module path of every Go line listed as `@latest`.
+pub fn latest_go(t: &TemplateInput) -> Vec<String> {
+    t.deps(Eco::Go)
+        .into_iter()
+        .filter_map(|d| d.line.strip_suffix("@latest").map(String::from))
+        .collect()
+}
+
 /// The `group:artifact` of every Maven line without a version.
 pub fn unversioned_maven(t: &TemplateInput) -> Vec<String> {
     t.deps(Eco::Maven)
@@ -159,6 +197,12 @@ pub fn single(
         ),
         Eco::Pypi => format!("{name}=={version}"),
         Eco::Maven => format!("{name}:{version}"),
+        Eco::Go => {
+            return Err(
+                "warming a Go module with its dependencies is not supported yet; use Cache instead"
+                    .into(),
+            );
+        }
     };
     lines::check_line(eco, &line)?;
     let mut t = TemplateInput {
@@ -166,12 +210,7 @@ pub fn single(
         platforms,
         ..Default::default()
     };
-    match eco {
-        Eco::Cargo => t.cargo = line,
-        Eco::Npm => t.npm = line,
-        Eco::Pypi => t.pypi = line,
-        Eco::Maven => t.maven = line,
-    }
+    *t.section_mut(eco) = line;
     Ok(t)
 }
 

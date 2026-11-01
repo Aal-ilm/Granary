@@ -6,6 +6,7 @@
 //! | npm | `"react": "^19"` |
 //! | PyPI | `fastapi>=0.115` |
 //! | Maven | `org.springframework.boot:spring-boot-starter-web:3.4.0` |
+//! | Go | `golang.org/x/text@v0.21.0` (or `@latest`) |
 //!
 //! Blank lines and lines starting with `#` or `//` are ignored. Only
 //! dependencies that come from the registry can be warmed, so git, path,
@@ -22,10 +23,16 @@ pub enum Eco {
     Npm,
     Pypi,
     Maven,
+    Go,
 }
 
 impl Eco {
+    /// The ecosystems with Gitea namespaces, warm steps and package
+    /// searches. Go is left out: its private modules have their own
+    /// prefixes, and the warmer has no Go step yet.
     pub const ALL: [Eco; 4] = [Eco::Cargo, Eco::Npm, Eco::Pypi, Eco::Maven];
+    /// Every ecosystem a template can list lines for.
+    pub const LINES: [Eco; 5] = [Eco::Cargo, Eco::Npm, Eco::Pypi, Eco::Maven, Eco::Go];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -33,11 +40,17 @@ impl Eco {
             Eco::Npm => "npm",
             Eco::Pypi => "pypi",
             Eco::Maven => "maven",
+            Eco::Go => "go",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|e| e.as_str() == s)
+    }
+
+    /// Like [`Eco::parse`], Go included.
+    pub fn parse_line(s: &str) -> Option<Self> {
+        Self::LINES.into_iter().find(|e| e.as_str() == s)
     }
 
     pub fn label(self) -> &'static str {
@@ -46,6 +59,7 @@ impl Eco {
             Eco::Npm => "npm",
             Eco::Pypi => "PyPI",
             Eco::Maven => "Maven",
+            Eco::Go => "Go",
         }
     }
 }
@@ -114,6 +128,7 @@ pub fn check_line(eco: Eco, line: &str) -> Result<String, String> {
         Eco::Npm => npm(line),
         Eco::Pypi => pypi(line),
         Eco::Maven => maven(line).map(|(g, a, _)| format!("{g}:{a}")),
+        Eco::Go => crate::gomodfile::check_line(line),
     }
 }
 
@@ -474,6 +489,30 @@ mod tests {
         assert!(bad(Eco::Maven, "org.x:y z").contains("artifactId"));
         assert!(bad(Eco::Maven, "org.x:y:1.0-SNAPSHOT").contains("snapshots"));
         assert!(bad(Eco::Maven, "org.x:y:1.0/../../").contains("version"));
+    }
+
+    #[test]
+    fn go_lines() {
+        assert_eq!(
+            ok(Eco::Go, "golang.org/x/text@v0.21.0"),
+            "golang.org/x/text"
+        );
+        assert_eq!(ok(Eco::Go, "golang.org/x/text@latest"), "golang.org/x/text");
+        assert!(bad(Eco::Go, "Golang.org/x/text@v0.21.0").contains("module path"));
+        assert!(bad(Eco::Go, "golang.org/x/../text@v0.21.0").contains("module path"));
+        assert!(bad(Eco::Go, "golang.org/x/text@v0.21").contains("canonical"));
+        assert!(bad(Eco::Go, "golang.org/x/text@v0.21.0+incompatible").contains("incompatible"));
+        assert!(bad(Eco::Go, "a.example/x@v1.0.0\nb.example/y@v1.0.0").contains("expected"));
+        // A section: comments skipped, duplicates and long lines caught.
+        let long = format!("example.com/{}@v1.0.0", "a".repeat(500));
+        let text =
+            format!("// tools\ngolang.org/x/text@v0.21.0\ngolang.org/x/text@latest\n{long}\n");
+        let (deps, errors) = check(Eco::Go, &text);
+        assert_eq!(deps.len(), 1);
+        assert!(errors[0].message.contains("already listed"));
+        assert!(errors[1].message.contains("too long"));
+        assert_eq!(Eco::parse("go"), None);
+        assert_eq!(Eco::parse_line("go"), Some(Eco::Go));
     }
 
     #[test]

@@ -47,10 +47,10 @@ async fn audit(st: &AppState, actor: &str, action: &str, target: &str, ip: Clien
     crate::audit::record(&st.auth.db, actor, action, target, Some(ip.0), true).await;
 }
 
-fn summary(t: &Template, cfg: &crate::config::Config) -> Value {
+fn summary(t: &Template, st: &AppState) -> Value {
     json!({
         "id": t.id,
-        "private": t.resource(cfg).is_some(),
+        "private": t.resource(&st.cfg, &st.goprivate).is_some(),
         "builtin": t.builtin,
         "name": t.input.name,
         "description": t.input.description,
@@ -74,7 +74,10 @@ pub async fn load(st: &AppState, who: &Principal, id: i64) -> AppResult<Template
     super::get(&st.auth.db, id)
         .await
         .map_err(db_error)?
-        .filter(|t| st.policy.can_read(who, t.resource(&st.cfg).as_ref()))
+        .filter(|t| {
+            st.policy
+                .can_read(who, t.resource(&st.cfg, &st.goprivate).as_ref())
+        })
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "no such template"))
 }
 
@@ -83,8 +86,8 @@ async fn list(State(st): State<AppState>, who: Principal) -> AppResult<Json<Valu
     Ok(Json(json!({
         "templates": all
             .iter()
-            .filter(|t| st.policy.can_read(&who, t.resource(&st.cfg).as_ref()))
-            .map(|t| summary(t, &st.cfg))
+            .filter(|t| st.policy.can_read(&who, t.resource(&st.cfg, &st.goprivate).as_ref()))
+            .map(|t| summary(t, &st))
             .collect::<Vec<_>>(),
         "platforms": PLATFORMS.iter().map(|(id, label)| json!({"id": id, "label": label})).collect::<Vec<_>>(),
         "default_platforms": default_platforms(),
@@ -97,22 +100,63 @@ async fn one(
     Path(id): Path<i64>,
 ) -> AppResult<Json<Value>> {
     let t = load(&st, &who, id).await?;
-    let mut v = summary(&t, &st.cfg);
-    for eco in lines::Eco::ALL {
+    let mut v = summary(&t, &st);
+    for eco in lines::Eco::LINES {
         v[eco.as_str()] = json!(t.input.section(eco));
     }
     v["created_at"] = json!(t.created_at);
     Ok(Json(v))
 }
 
+/// Go lines naming a private module `who` may not read. They are refused
+/// with the words a lookup that finds nothing uses, so the line doesn't
+/// tell whether the path is private.
+pub fn go_access(st: &AppState, who: &Principal, input: &TemplateInput) -> Vec<lines::LineError> {
+    let mut out = Vec::new();
+    for (i, raw) in input.go.lines().enumerate() {
+        let line = raw.trim();
+        let Ok(module) = lines::check_line(lines::Eco::Go, line) else {
+            continue;
+        };
+        if let Some(route) = st.goprivate.route(&module) {
+            let what = crate::formats::go_private::resource(&module, &route.source);
+            if !st.policy.can_read_private(who, &what) {
+                out.push(lines::LineError {
+                    line: i + 1,
+                    text: line.to_string(),
+                    message: format!("nothing found for {module}"),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// [`TemplateInput::validate`], plus [`go_access`].
+pub fn problems(st: &AppState, who: &Principal, input: &TemplateInput) -> Option<super::Problems> {
+    let mut p = input.validate().unwrap_or_default();
+    let denied = go_access(st, who, input);
+    if !denied.is_empty() {
+        match p.lines.iter_mut().find(|(e, _)| *e == lines::Eco::Go) {
+            Some((_, errs)) => {
+                errs.extend(denied);
+                errs.sort_by_key(|e| e.line);
+            }
+            None => p.lines.push((lines::Eco::Go, denied)),
+        }
+    }
+    (!p.fields.is_empty() || !p.lines.is_empty()).then_some(p)
+}
+
 /// Validate and tidy a template from the editor, or explain what's wrong.
 async fn prepare(
     st: &AppState,
+    who: &Principal,
     mut input: TemplateInput,
     id: Option<i64>,
 ) -> AppResult<TemplateInput> {
     input.normalize();
-    if let Some(p) = input.validate() {
+    if let Some(p) = problems(st, who, &input) {
         return Err(AppError::bad_request(p.summary()));
     }
     if super::name_taken(&st.auth.db, &input.name, id)
@@ -143,7 +187,8 @@ async fn check(
 ) -> AppResult<Json<Value>> {
     require_admin(&auth)?;
     input.normalize();
-    let mut problems = input.validate().unwrap_or_default();
+    let who = Principal::from_session(&auth);
+    let mut problems = problems(&st, &who, &input).unwrap_or_default();
     if !input.name.is_empty()
         && super::name_taken(&st.auth.db, &input.name, q.id)
             .await
@@ -167,7 +212,8 @@ async fn create(
     Json(input): Json<TemplateInput>,
 ) -> AppResult<Response> {
     let admin = require_admin(&auth)?.username.clone();
-    let input = prepare(&st, input, None).await?;
+    let who = Principal::from_session(&auth);
+    let input = prepare(&st, &who, input, None).await?;
     let id = super::insert(&st.auth.db, &input).await.map_err(db_error)?;
     audit(&st, &admin, "template.create", &input.name, ip).await;
     Ok((StatusCode::CREATED, Json(json!({ "id": id }))).into_response())
@@ -189,7 +235,7 @@ async fn update(
             "built-in templates are read-only; clone it to make your own version",
         ));
     }
-    let input = prepare(&st, input, Some(id)).await?;
+    let input = prepare(&st, &who, input, Some(id)).await?;
     super::update(&st.auth.db, id, &input)
         .await
         .map_err(db_error)?;
@@ -232,7 +278,7 @@ async fn clone(
         .map_err(db_error)?;
     let new_id = super::insert(&st.auth.db, &copy).await.map_err(db_error)?;
     // A copy of private content is just as private.
-    if let Some(r) = source.resource(&st.cfg) {
+    if let Some(r) = source.resource(&st.cfg, &st.goprivate) {
         super::set_private(&st.auth.db, new_id, &r)
             .await
             .map_err(db_error)?;
@@ -312,6 +358,7 @@ async fn starter(
             warmer_granary_url: &st.cfg.warmer_granary_url,
             client_auth: st.cfg.client_auth,
             from_repo: Some((&source.url, &source.commit)),
+            go_nosumdb: t.input.private_go_prefixes(&st.goprivate),
         }
         .zip()
         .map_err(|e| {
@@ -350,6 +397,21 @@ async fn starter(
         };
         versions.insert(ga, version);
     }
+    // Go lines asking for @latest: the latest version now.
+    for module in build::latest_go(&t.input) {
+        let Some(version) = crate::search::lookup_go(&st, &who, &module)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.latest)
+        else {
+            return Err(AppError::new(
+                StatusCode::CONFLICT,
+                format!("no version of {module} is known yet; give {module} a version"),
+            ));
+        };
+        versions.insert(module, version);
+    }
     let manifests = build::manifests(&t.input, &versions).map_err(AppError::bad_request)?;
     let zip = Starter {
         template: &t.input,
@@ -360,6 +422,8 @@ async fn starter(
         warmer_granary_url: &st.cfg.warmer_granary_url,
         client_auth: st.cfg.client_auth,
         from_repo: None,
+        // `load` let `who` see the template, so they may read these.
+        go_nosumdb: t.input.private_go_prefixes(&st.goprivate),
     }
     .zip()
     .map_err(|e| {

@@ -9,6 +9,7 @@ mod error;
 mod formats;
 mod gitea;
 mod gomod;
+mod gomodfile;
 mod goprivate;
 mod gozip;
 mod inventory;

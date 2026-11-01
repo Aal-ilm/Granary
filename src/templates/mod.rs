@@ -31,6 +31,7 @@ pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS templates (
     npm TEXT NOT NULL DEFAULT '',
     pypi TEXT NOT NULL DEFAULT '',
     maven TEXT NOT NULL DEFAULT '',
+    go TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     last_warmed_at INTEGER
@@ -107,6 +108,8 @@ pub struct TemplateInput {
     pub pypi: String,
     #[serde(default)]
     pub maven: String,
+    #[serde(default)]
+    pub go: String,
 }
 
 impl TemplateInput {
@@ -116,15 +119,17 @@ impl TemplateInput {
             Eco::Npm => &self.npm,
             Eco::Pypi => &self.pypi,
             Eco::Maven => &self.maven,
+            Eco::Go => &self.go,
         }
     }
 
-    fn section_mut(&mut self, eco: Eco) -> &mut String {
+    pub fn section_mut(&mut self, eco: Eco) -> &mut String {
         match eco {
             Eco::Cargo => &mut self.cargo,
             Eco::Npm => &mut self.npm,
             Eco::Pypi => &mut self.pypi,
             Eco::Maven => &mut self.maven,
+            Eco::Go => &mut self.go,
         }
     }
 
@@ -135,7 +140,7 @@ impl TemplateInput {
 
     pub fn counts(&self) -> serde_json::Value {
         let mut m = serde_json::Map::new();
-        for eco in Eco::ALL {
+        for eco in Eco::LINES {
             m.insert(eco.as_str().into(), self.deps(eco).len().into());
         }
         m.into()
@@ -166,7 +171,7 @@ impl TemplateInput {
             }
         }
         self.platforms = platforms;
-        for eco in Eco::ALL {
+        for eco in Eco::LINES {
             let s = self.section_mut(eco);
             *s = s.trim_end().to_string();
         }
@@ -214,7 +219,7 @@ impl TemplateInput {
             }
         }
         let mut total = 0;
-        for eco in Eco::ALL {
+        for eco in Eco::LINES {
             let (deps, errors) = lines::check(eco, self.section(eco));
             total += deps.len();
             if deps.len() > 500 {
@@ -250,6 +255,7 @@ impl TemplateInput {
             (Eco::Npm, file.npm),
             (Eco::Pypi, file.pypi),
             (Eco::Maven, file.maven),
+            (Eco::Go, file.go),
         ] {
             *t.section_mut(eco) = section.dependencies.join("\n");
         }
@@ -273,6 +279,7 @@ impl TemplateInput {
             npm: section(Eco::Npm),
             pypi: section(Eco::Pypi),
             maven: section(Eco::Maven),
+            go: section(Eco::Go),
         };
         toml::to_string_pretty(&file).unwrap_or_default()
     }
@@ -333,6 +340,8 @@ struct TemplateFile {
     pypi: Section,
     #[serde(default, skip_serializing_if = "Section::is_empty")]
     maven: Section,
+    #[serde(default, skip_serializing_if = "Section::is_empty")]
+    go: Section,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -373,11 +382,49 @@ pub struct Template {
 }
 
 impl Template {
-    /// The private content this template comes from, if any.
-    pub fn resource(&self, cfg: &crate::config::Config) -> Option<Resource> {
+    /// The private content this template comes from, if any: a Gitea repo,
+    /// a private template it was cloned from, or a private Go module among
+    /// its lines (decided by the prefixes as they are now).
+    ///
+    /// With several private Go lines only the first is reported. That is
+    /// enough only while `Policy::can_read_private` decides by who is
+    /// asking and ignores what is read; a per-resource policy must check
+    /// every one ([`TemplateInput::private_go`]). The test
+    /// `policy::tests::decides_by_who_not_what` fails if that changes.
+    pub fn resource(
+        &self,
+        cfg: &crate::config::Config,
+        gp: &crate::goprivate::GoPrivate,
+    ) -> Option<Resource> {
         self.private
             .clone()
             .or_else(|| self.source.as_ref().and_then(|s| s.resource(cfg)))
+            .or_else(|| self.input.private_go(gp).into_iter().next())
+    }
+}
+
+impl TemplateInput {
+    /// The private Go prefixes the Go lines fall under, for GONOSUMDB.
+    pub fn private_go_prefixes(&self, gp: &crate::goprivate::GoPrivate) -> Vec<String> {
+        let deps = self.deps(Eco::Go);
+        gp.patterns()
+            .into_iter()
+            .filter(|p| {
+                deps.iter()
+                    .any(|d| crate::goprivate::matches_prefix(p, &d.name).is_some())
+            })
+            .collect()
+    }
+
+    /// The private Go modules among the lines, as the policy sees them.
+    pub fn private_go(&self, gp: &crate::goprivate::GoPrivate) -> Vec<Resource> {
+        self.deps(Eco::Go)
+            .into_iter()
+            .filter_map(|d| {
+                gp.route(&d.name)
+                    .map(|r| crate::formats::go_private::resource(&d.name, &r.source))
+            })
+            .collect()
     }
 }
 
@@ -410,7 +457,7 @@ impl RepoSource {
         self.files
             .keys()
             .map(String::as_str)
-            .filter(|p| p.ends_with("Cargo.lock") || p.ends_with("package-lock.json"))
+            .filter(|p| repo::is_lockfile(p))
             .collect()
     }
 
@@ -440,6 +487,7 @@ struct Row {
     npm: String,
     pypi: String,
     maven: String,
+    go: String,
     created_at: i64,
     updated_at: i64,
     last_warmed_at: Option<i64>,
@@ -465,6 +513,7 @@ impl From<Row> for Template {
                 npm: r.npm,
                 pypi: r.pypi,
                 maven: r.maven,
+                go: r.go,
             },
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -477,7 +526,7 @@ impl From<Row> for Template {
     }
 }
 
-const COLUMNS: &str = "id, builtin_key, name, description, tags, platforms, allow_sdist, cargo, npm, pypi, maven, created_at, updated_at, last_warmed_at, schedule, source, last_warm_warnings, private";
+const COLUMNS: &str = "id, builtin_key, name, description, tags, platforms, allow_sdist, cargo, npm, pypi, maven, go, created_at, updated_at, last_warmed_at, schedule, source, last_warm_warnings, private";
 
 /// Columns added after templates first shipped.
 pub async fn migrate(db: &SqlitePool) -> sqlx::Result<()> {
@@ -486,6 +535,7 @@ pub async fn migrate(db: &SqlitePool) -> sqlx::Result<()> {
     crate::auth::add_column(db, "templates", "source", "TEXT").await?;
     crate::auth::add_column(db, "templates", "last_warm_warnings", "TEXT").await?;
     crate::auth::add_column(db, "templates", "private", "TEXT").await?;
+    crate::auth::add_column(db, "templates", "go", "TEXT NOT NULL DEFAULT ''").await?;
     // Who set the schedule: scheduled warms act for them.
     crate::auth::add_column(
         db,
@@ -535,13 +585,14 @@ pub async fn resync(
     source: &RepoSource,
 ) -> sqlx::Result<bool> {
     let r = sqlx::query(
-        "UPDATE templates SET cargo = ?, npm = ?, pypi = ?, maven = ?, source = ?, updated_at = ?
+        "UPDATE templates SET cargo = ?, npm = ?, pypi = ?, maven = ?, go = ?, source = ?, updated_at = ?
          WHERE id = ? AND builtin_key IS NULL AND source IS NOT NULL",
     )
     .bind(&t.cargo)
     .bind(&t.npm)
     .bind(&t.pypi)
     .bind(&t.maven)
+    .bind(&t.go)
     .bind(serde_json::to_string(source).unwrap())
     .bind(now_secs() as i64)
     .bind(id)
@@ -593,8 +644,8 @@ pub async fn name_taken(db: &SqlitePool, name: &str, except: Option<i64>) -> sql
 pub async fn insert(db: &SqlitePool, t: &TemplateInput) -> sqlx::Result<i64> {
     let now = now_secs() as i64;
     let r = sqlx::query(
-        "INSERT INTO templates (name, description, tags, platforms, allow_sdist, cargo, npm, pypi, maven, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO templates (name, description, tags, platforms, allow_sdist, cargo, npm, pypi, maven, go, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&t.name)
     .bind(&t.description)
@@ -605,6 +656,7 @@ pub async fn insert(db: &SqlitePool, t: &TemplateInput) -> sqlx::Result<i64> {
     .bind(&t.npm)
     .bind(&t.pypi)
     .bind(&t.maven)
+    .bind(&t.go)
     .bind(now)
     .bind(now)
     .execute(db)
@@ -616,7 +668,7 @@ pub async fn insert(db: &SqlitePool, t: &TemplateInput) -> sqlx::Result<i64> {
 pub async fn update(db: &SqlitePool, id: i64, t: &TemplateInput) -> sqlx::Result<bool> {
     let r = sqlx::query(
         "UPDATE templates SET name = ?, description = ?, tags = ?, platforms = ?, allow_sdist = ?,
-            cargo = ?, npm = ?, pypi = ?, maven = ?, updated_at = ?
+            cargo = ?, npm = ?, pypi = ?, maven = ?, go = ?, updated_at = ?
          WHERE id = ? AND builtin_key IS NULL",
     )
     .bind(&t.name)
@@ -628,6 +680,7 @@ pub async fn update(db: &SqlitePool, id: i64, t: &TemplateInput) -> sqlx::Result
     .bind(&t.npm)
     .bind(&t.pypi)
     .bind(&t.maven)
+    .bind(&t.go)
     .bind(now_secs() as i64)
     .bind(id)
     .execute(db)
@@ -773,6 +826,57 @@ dependencies = ["fastapi>=0.115"]
         assert_eq!(again.pypi, t.pypi);
         assert!(again.npm.is_empty());
         assert!(again.allow_sdist);
+    }
+
+    #[test]
+    fn go_sections() {
+        let text = r#"
+name = "Go tools"
+[go]
+dependencies = ["golang.org/x/text@v0.21.0", "golang.org/x/mod@latest"]
+"#;
+        let t = TemplateInput::from_toml(text).unwrap();
+        assert!(t.validate().is_none());
+        assert_eq!(t.counts()["go"], 2);
+        assert!(t.to_toml().contains("[go]"));
+        let again = TemplateInput::from_toml(&t.to_toml()).unwrap();
+        assert_eq!(again.go, t.go);
+        let bad = TemplateInput {
+            go: "golang.org/x/text@main".into(),
+            ..t
+        };
+        assert_eq!(bad.validate().unwrap().lines[0].0, Eco::Go);
+    }
+
+    /// A database from before Go lines opens, gains the column and keeps
+    /// its templates.
+    #[tokio::test]
+    async fn old_databases_gain_the_go_column() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let old = SCHEMA.replace("    go TEXT NOT NULL DEFAULT '',\n", "");
+        assert!(!old.contains(" go "));
+        sqlx::query(sqlx::AssertSqlSafe(old))
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO templates (name, cargo, created_at, updated_at) VALUES ('Old', 'serde = \"1\"', 1, 1)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        migrate(&db).await.unwrap();
+        migrate(&db).await.unwrap();
+        let t = list(&db).await.unwrap().remove(0);
+        assert_eq!((t.input.name.as_str(), t.input.go.as_str()), ("Old", ""));
+        let mut input = t.input.clone();
+        input.go = "golang.org/x/text@v0.21.0".into();
+        assert!(update(&db, t.id, &input).await.unwrap());
+        assert_eq!(get(&db, t.id).await.unwrap().unwrap().input.go, input.go);
     }
 
     #[test]

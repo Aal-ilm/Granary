@@ -1018,3 +1018,88 @@ async fn real_go_builds_a_private_module_over_https_with_a_netrc_token() {
         "nothing private reached the public proxy"
     );
 }
+
+/// Get packages on a private path: someone who may not read it finds
+/// nothing, and nothing is fetched from git, Gitea or the public proxy;
+/// with access it is found and cached from its own source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_packages_keeps_private_modules_private() {
+    if !have_git() {
+        return eprintln!("skipping: git is not installed");
+    }
+    let up = Upstream::start().await;
+    fixtures(&up);
+    let h = granary(&up, Opts::default()).await;
+    h.mock.set(
+        "/goproxy/github.com/acme/tool/@v/list",
+        MockFile::ok("v9.9.9\n"),
+    );
+    let st = &h.state;
+    let viewer = crate::policy::Principal::User {
+        user: crate::auth::User::for_tests(crate::auth::Role::Viewer, false),
+        token: None,
+    };
+    for who in [&crate::policy::Principal::Anonymous, &viewer] {
+        assert!(
+            crate::search::lookup_go(st, who, "github.com/acme/tool")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(!h.data.join("git/github.com/acme").exists(), "no clone");
+    assert_eq!(h.mock.total(), 0);
+
+    let admin = h.login().await;
+    let d = h
+        .api(
+            &admin,
+            "/api/packages/search?eco=go&q=github.com%2Facme%2Ftool",
+        )
+        .await;
+    assert_eq!(d["results"][0]["name"], "github.com/acme/tool");
+    assert_eq!(d["results"][0]["private"], true);
+    assert_eq!(d["results"][0]["latest"], "v1.0.0");
+    let (status, _, body) = h
+        .send(
+            "POST",
+            "/api/packages/cache",
+            Some(&admin),
+            Some(json!({"eco": "go", "name": "github.com/acme/tool", "version": "v1.0.0"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        h.data
+            .join("files/go-private/git/github.com/acme/tool/@v/v1.0.0")
+            .exists()
+    );
+    // The public proxy's look-alike was never asked.
+    assert_eq!(h.mock.total(), 0);
+
+    // Cache on a private path someone may not read answers exactly like
+    // an unknown public path, so the prefixes stay hidden.
+    let answer = |module: &'static str| {
+        let viewer = viewer.clone();
+        async move {
+            let e = crate::search::cache_one(
+                st,
+                &viewer,
+                crate::templates::lines::Eco::Go,
+                module,
+                "v1.0.0",
+                None,
+            )
+            .await
+            .unwrap_err();
+            (e.status, e.message.replace(module, "MODULE"))
+        }
+    };
+    let private = answer("github.com/acme/tool").await;
+    let public = answer("github.com/other/nope").await;
+    assert_eq!(private, public);
+    assert_eq!(
+        private,
+        (StatusCode::NOT_FOUND, "MODULE has no version v1.0.0".into())
+    );
+}

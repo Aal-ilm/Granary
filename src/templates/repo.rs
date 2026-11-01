@@ -4,9 +4,11 @@
 //! Granary reads these files from the repo's cached mirror at one commit,
 //! from the root and up to two levels down: Cargo.toml, Cargo.lock,
 //! package.json, package-lock.json, requirements*.txt, pyproject.toml,
-//! pom.xml and build.gradle(.kts). Cargo and npm workspace members are
-//! included wherever they are. Dependencies that are part of the repo
-//! itself (workspace members, path dependencies, Maven modules) are left
+//! pom.xml, build.gradle(.kts), go.mod, go.sum and go.work. Cargo and npm
+//! workspace members are included wherever they are; go.work members only
+//! within those folders. Dependencies that are part of the repo itself
+//! (workspace members, path dependencies, Maven modules, the repo's own Go
+//! modules) are left
 //! out, and git dependencies are listed so they can be cached through the
 //! git cache. Everything left out is reported with the reason.
 
@@ -18,6 +20,7 @@ use super::{
     lines::{Eco, check_line},
     manifest::{self, cargo_line},
 };
+use crate::gomodfile;
 
 /// Largest manifest read.
 pub const MAX_MANIFEST: u64 = 2 * 1024 * 1024;
@@ -45,8 +48,11 @@ fn dir_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(d, _)| d)
 }
 
-fn is_lockfile(path: &str) -> bool {
-    matches!(file_name(path), "Cargo.lock" | "package-lock.json")
+pub fn is_lockfile(path: &str) -> bool {
+    matches!(
+        file_name(path),
+        "Cargo.lock" | "package-lock.json" | "go.sum"
+    )
 }
 
 fn is_manifest(path: &str) -> bool {
@@ -59,8 +65,13 @@ fn is_manifest(path: &str) -> bool {
             | "pom.xml"
             | "build.gradle"
             | "build.gradle.kts"
+            | "go.mod"
+            | "go.work"
     ) || (n.starts_with("requirements") && n.ends_with(".txt"))
 }
+
+/// Deepest file read: the root and two levels down.
+const MAX_DEPTH: usize = 2;
 
 fn skipped_dir(path: &str) -> bool {
     path.split('/').any(|seg| SKIP_DIRS.contains(&seg))
@@ -70,7 +81,7 @@ fn skipped_dir(path: &str) -> bool {
 pub fn candidates(paths: &[String]) -> Vec<String> {
     let mut out: Vec<String> = paths
         .iter()
-        .filter(|p| p.matches('/').count() <= 2)
+        .filter(|p| p.matches('/').count() <= MAX_DEPTH)
         .filter(|p| !skipped_dir(p))
         .filter(|p| is_manifest(p) || is_lockfile(p))
         .cloned()
@@ -168,6 +179,9 @@ pub struct Found {
     pub ecosystem: Option<Eco>,
     /// Packages it added (after removing repeats).
     pub packages: usize,
+    /// go.mod: its valid requirements; go.work: its members.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requirements: Option<usize>,
 }
 
 /// Something left out, and why.
@@ -200,6 +214,7 @@ pub struct Scan {
     pub npm: String,
     pub pypi: String,
     pub maven: String,
+    pub go: String,
     pub counts: BTreeMap<String, usize>,
     pub skipped: Vec<Skipped>,
     pub git_deps: Vec<GitDep>,
@@ -499,6 +514,7 @@ pub fn scan(files: &BTreeMap<String, String>, allowed_hosts: &[String]) -> Scan 
             path: (*path).clone(),
             ecosystem: Some(Eco::Cargo),
             packages: n,
+            requirements: None,
         });
     }
 
@@ -565,6 +581,7 @@ pub fn scan(files: &BTreeMap<String, String>, allowed_hosts: &[String]) -> Scan 
             path: (*path).clone(),
             ecosystem: Some(Eco::Npm),
             packages: n,
+            requirements: None,
         });
     }
 
@@ -652,6 +669,7 @@ pub fn scan(files: &BTreeMap<String, String>, allowed_hosts: &[String]) -> Scan 
                     path: path.clone(),
                     ecosystem: Some(eco),
                     packages: n,
+                    requirements: None,
                 });
             }
             Err(reason) => skipped.push(Skipped {
@@ -662,8 +680,10 @@ pub fn scan(files: &BTreeMap<String, String>, allowed_hosts: &[String]) -> Scan 
         }
     }
 
+    go_section(files, &mut out, &mut sections, &mut skipped);
+
     out.manifests.sort_by(|a, b| a.path.cmp(&b.path));
-    for eco in Eco::ALL {
+    for eco in Eco::LINES {
         let s = sections.remove(&eco).unwrap_or_default();
         out.counts.insert(eco.as_str().into(), s.count);
         let text = s.text.join("\n");
@@ -672,6 +692,7 @@ pub fn scan(files: &BTreeMap<String, String>, allowed_hosts: &[String]) -> Scan 
             Eco::Npm => out.npm = text,
             Eco::Pypi => out.pypi = text,
             Eco::Maven => out.maven = text,
+            Eco::Go => out.go = text,
         }
     }
     let mut seen = HashSet::new();
@@ -679,6 +700,177 @@ pub fn scan(files: &BTreeMap<String, String>, allowed_hosts: &[String]) -> Scan 
     out.skipped = skipped;
     out.git_deps = git_deps;
     out
+}
+
+fn flag(skipped: &mut Vec<Skipped>, path: &str, item: &str, reason: String) {
+    skipped.push(Skipped {
+        path: path.into(),
+        item: item.into(),
+        reason,
+    });
+}
+
+/// Flag `replace` directives that point at a directory outside the repo:
+/// the warm step of that module fails on them.
+/// At most [`gomodfile::MAX_SKIPPED`] per file, plus one line counting the
+/// rest.
+fn flag_escaping(skipped: &mut Vec<Skipped>, path: &str, replaces: &[gomodfile::Replace]) {
+    let mut more = 0usize;
+    let mut kept = 0usize;
+    for r in replaces {
+        if let gomodfile::Target::Dir(d) = &r.new
+            && gomodfile::resolve_in_repo(dir_of(path), d).is_none()
+        {
+            if kept >= gomodfile::MAX_SKIPPED {
+                more += 1;
+                continue;
+            }
+            kept += 1;
+            flag(
+                skipped,
+                path,
+                &r.old,
+                format!(
+                    "replaced by {d:?}, which is outside the repo, so warming this module will fail"
+                ),
+            );
+        }
+    }
+    if more > 0 {
+        flag(
+            skipped,
+            path,
+            "replace",
+            format!("and {more} more replace directives point outside the repo"),
+        );
+    }
+}
+
+/// go.mod files (the repo's own modules are not dependencies), go.work
+/// workspaces and go.sum lockfiles.
+fn go_section(
+    files: &BTreeMap<String, String>,
+    out: &mut Scan,
+    sections: &mut HashMap<Eco, Section>,
+    skipped: &mut Vec<Skipped>,
+) {
+    let mut mods: Vec<(&String, gomodfile::GoMod)> = Vec::new();
+    for (path, text) in files.iter().filter(|(p, _)| file_name(p) == "go.mod") {
+        if mods.len() >= gomodfile::MAX_MODULES {
+            flag(
+                skipped,
+                path,
+                "go.mod",
+                format!(
+                    "the repo has more than {} Go modules, so this one was not read",
+                    gomodfile::MAX_MODULES
+                ),
+            );
+            continue;
+        }
+        match gomodfile::parse_mod(text) {
+            Ok(m) => mods.push((path, m)),
+            Err(e) => flag(skipped, path, "go.mod", format!("not a valid go.mod: {e}")),
+        }
+    }
+    let own: HashSet<String> = mods.iter().filter_map(|(_, m)| m.module.clone()).collect();
+    let is_own = |s: &str| {
+        let path = s.split(['@', ':']).next().unwrap_or(s);
+        own.contains(path)
+    };
+    for (path, m) in &mods {
+        flag_escaping(skipped, path, &m.replaces);
+        let (lines, skip) = m.lines();
+        let lines: Vec<String> = lines.into_iter().filter(|l| !is_own(l)).collect();
+        for reason in skip.into_iter().filter(|r| !is_own(r)) {
+            let item = reason.split(':').next().unwrap_or("").trim().to_string();
+            flag(skipped, path, &item, reason);
+        }
+        let n = sections
+            .entry(Eco::Go)
+            .or_default()
+            .add(Eco::Go, path, lines, skipped);
+        out.manifests.push(Found {
+            path: (*path).clone(),
+            ecosystem: Some(Eco::Go),
+            packages: n,
+            requirements: Some(m.requires.len()),
+        });
+    }
+
+    for (path, text) in files.iter().filter(|(p, _)| file_name(p) == "go.work") {
+        let w = match gomodfile::parse_work(text, dir_of(path)) {
+            Ok(w) => w,
+            Err(e) => {
+                flag(
+                    skipped,
+                    path,
+                    "go.work",
+                    format!("the workspace was not read: {e}"),
+                );
+                continue;
+            }
+        };
+        let mut members = 0;
+        for u in &w.uses {
+            let gm = if u.is_empty() {
+                "go.mod".to_string()
+            } else {
+                format!("{u}/go.mod")
+            };
+            let item = if u.is_empty() { "." } else { u.as_str() };
+            if gm.matches('/').count() > MAX_DEPTH {
+                flag(
+                    skipped,
+                    path,
+                    item,
+                    "this workspace member is deeper than the folders Granary reads, so it was not read".into(),
+                );
+            } else if !files.contains_key(&gm) {
+                flag(
+                    skipped,
+                    path,
+                    item,
+                    "this workspace member has no go.mod".into(),
+                );
+            } else {
+                members += 1;
+            }
+        }
+        flag_escaping(skipped, path, &w.replaces);
+        for reason in w.skipped {
+            flag(skipped, path, "go.work", reason);
+        }
+        out.manifests.push(Found {
+            path: path.clone(),
+            ecosystem: Some(Eco::Go),
+            packages: 0,
+            requirements: Some(members),
+        });
+    }
+
+    for (path, text) in files.iter().filter(|(p, _)| file_name(p) == "go.sum") {
+        match gomodfile::parse_sum(text) {
+            Ok(s) => {
+                if let Some((first, _)) = s.invalid.first() {
+                    flag(
+                        skipped,
+                        path,
+                        "go.sum",
+                        format!(
+                            "{} lines are not valid go.sum lines and are ignored (the first is line {first})",
+                            s.invalid_count
+                        ),
+                    );
+                }
+            }
+            Err(e) => {
+                // Not used at all.
+                out.lockfiles.retain(|p| p != path);
+                flag(skipped, path, "go.sum", format!("not a valid go.sum: {e}"));
+            }
+        }
+    }
 }
 
 /// Poetry's caret and tilde ranges, in the form pip understands.
@@ -1167,6 +1359,129 @@ dependencies {
         );
         assert_eq!(skip.len(), 3, "{skip:?}");
         assert!(skip[2].contains("map notation"));
+    }
+
+    #[test]
+    fn go_modules_sums_and_workspaces() {
+        let h = "h1:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+        let paths: Vec<String> = ["go.mod", "go.sum", "go.work", "svc/go.mod", "a/b/c/go.mod"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            candidates(&paths),
+            vec!["go.mod", "go.sum", "go.work", "svc/go.mod"]
+        );
+        let s = scan(
+            &files(&[
+                (
+                    "go.mod",
+                    "module example.com/mono\n\ngo 1.22\n\nrequire (\n\tgolang.org/x/text v0.21.0\n\texample.com/mono/svc v0.0.0-00010101000000-000000000000\n\texample.com/vendored v1.0.0\n\texample.com/outside v1.0.0\n)\n\nreplace example.com/mono/svc => ./svc\nreplace example.com/vendored => ./third_party/v\nreplace example.com/outside => ../../etc\n",
+                ),
+                (
+                    "go.sum",
+                    &format!("golang.org/x/text v0.21.0 {h}\ngolang.org/x/text v0.21.0 h1:short\n"),
+                ),
+                (
+                    "go.work",
+                    "go 1.22\n\nuse (\n\t.\n\t./svc\n\t./a/b/c\n\t./missing\n)\n",
+                ),
+                (
+                    "svc/go.mod",
+                    "module example.com/mono/svc\n\nrequire (\n\tgolang.org/x/text v0.21.0\n\tgithub.com/google/uuid v1.6.0\n)\n",
+                ),
+            ]),
+            &hosts(),
+        );
+        assert_eq!(s.lockfiles, vec!["go.sum"]);
+        assert_eq!(s.counts["go"], 2, "{}", s.go);
+        assert_eq!(
+            s.go,
+            "# go.mod\ngolang.org/x/text@v0.21.0\n\n# svc/go.mod\ngithub.com/google/uuid@v1.6.0"
+        );
+        let found: Vec<(&str, usize, Option<usize>)> = s
+            .manifests
+            .iter()
+            .map(|f| (f.path.as_str(), f.packages, f.requirements))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("go.mod", 1, Some(4)),
+                ("go.work", 0, Some(2)),
+                ("svc/go.mod", 1, Some(2)),
+            ]
+        );
+        let reason = |item: &str| {
+            s.skipped
+                .iter()
+                .filter(|k| k.item == item)
+                .map(|k| k.reason.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        assert!(
+            reason("example.com/outside").contains("outside the repo"),
+            "{:?}",
+            s.skipped
+        );
+        assert!(reason("example.com/vendored").contains("directory"));
+        assert!(reason("a/b/c").contains("deeper"));
+        assert!(reason("missing").contains("no go.mod"));
+        assert!(reason("go.sum").contains("1 lines"));
+        assert!(
+            reason("example.com/mono/svc").is_empty(),
+            "the repo's own module"
+        );
+
+        // A workspace that leaves the repo is refused and flagged.
+        let s = scan(&files(&[("go.work", "use ../elsewhere\n")]), &hosts());
+        assert!(s.skipped[0].reason.contains("outside the repo"));
+        assert!(s.manifests.is_empty());
+    }
+
+    #[test]
+    fn escaping_replaces_are_flagged_up_to_the_cap() {
+        let max = gomodfile::MAX_REQUIRES;
+        let mut text = String::from("module example.com/m\n");
+        for i in 0..max {
+            text.push_str(&format!("replace example.com/r{i} => ../../out{i}\n"));
+        }
+        let s = scan(&files(&[("go.mod", &text)]), &hosts());
+        let flagged: Vec<&Skipped> = s.skipped.iter().filter(|k| k.path == "go.mod").collect();
+        assert_eq!(flagged.len(), gomodfile::MAX_SKIPPED + 1);
+        assert_eq!(
+            flagged[gomodfile::MAX_SKIPPED].reason,
+            format!(
+                "and {} more replace directives point outside the repo",
+                max - gomodfile::MAX_SKIPPED
+            )
+        );
+    }
+
+    #[test]
+    fn go_modules_per_repo_are_capped() {
+        let mods = |n: usize| -> BTreeMap<String, String> {
+            (0..n)
+                .map(|i| {
+                    (
+                        format!("m{i:03}/go.mod"),
+                        format!("module example.com/m{i}\nrequire golang.org/x/text v0.21.0\n"),
+                    )
+                })
+                .collect()
+        };
+        let capped = |s: &Scan| {
+            s.skipped
+                .iter()
+                .filter(|k| k.reason.contains("more than"))
+                .count()
+        };
+        let s = scan(&mods(gomodfile::MAX_MODULES), &hosts());
+        assert_eq!(capped(&s), 0);
+        assert_eq!(s.manifests.len(), gomodfile::MAX_MODULES);
+        let s = scan(&mods(gomodfile::MAX_MODULES + 1), &hosts());
+        assert_eq!(capped(&s), 1);
+        assert_eq!(s.manifests.len(), gomodfile::MAX_MODULES);
     }
 
     #[test]

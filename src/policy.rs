@@ -308,6 +308,36 @@ mod tests {
         }
     }
 
+    /// `Template::resource` reports only one private Go module of a
+    /// template, which is safe only while the answer doesn't depend on
+    /// what is read. If this fails, make templates check every resource.
+    #[test]
+    fn decides_by_who_not_what() {
+        let what = [
+            Resource::gitea_repo("acme", "secret"),
+            Resource::gitea_package("npm", "other", "@other/x"),
+            Resource::private_module(Source::Git, "acme", "github.com/acme/tool"),
+            Resource::private_module(Source::Gitea, "corp", "go.corp.example/lib"),
+        ];
+        let who = [
+            Principal::Anonymous,
+            Principal::Warmer,
+            user(Role::Admin, false),
+            user(Role::Viewer, false),
+            user(Role::Viewer, true),
+            token(Role::Viewer, true, false),
+        ];
+        for mode in Mode::ALL {
+            let p = policy(mode);
+            for w in &who {
+                let first = p.can_read_private(w, &what[0]);
+                for r in &what[1..] {
+                    assert_eq!(p.can_read_private(w, r), first, "{mode:?} {w:?} {r:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn modes() {
         let repo = Resource::gitea_repo("acme", "secret");

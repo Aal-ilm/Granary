@@ -129,7 +129,7 @@ async fn read_repo(
             if files.len() >= MAX_FILES {
                 break;
             }
-            let max = if path.ends_with(".lock") || path.ends_with("-lock.json") {
+            let max = if repo::is_lockfile(&path) {
                 MAX_LOCKFILE
             } else {
                 MAX_MANIFEST
@@ -182,7 +182,7 @@ fn preview_json(
         "counts": scan.counts,
         "skipped": scan.skipped,
         "git_deps": git_deps,
-        "lines": {"cargo": scan.cargo, "npm": scan.npm, "pypi": scan.pypi, "maven": scan.maven},
+        "lines": {"cargo": scan.cargo, "npm": scan.npm, "pypi": scan.pypi, "maven": scan.maven, "go": scan.go},
     })
 }
 
@@ -255,8 +255,13 @@ async fn queue_git_deps(st: &AppState, scan: &repo::Scan, by: &JobBy) -> usize {
 
 /// Validate a repo template. With lockfiles to warm from, it may have no
 /// package lines at all (say, a repo whose only dependency is a git one).
-fn check(input: &TemplateInput, scan: &repo::Scan) -> AppResult<()> {
-    if let Some(mut p) = input.validate() {
+fn check(
+    st: &AppState,
+    who: &Principal,
+    input: &TemplateInput,
+    scan: &repo::Scan,
+) -> AppResult<()> {
+    if let Some(mut p) = super::api::problems(st, who, input) {
         if !scan.lockfiles.is_empty() {
             p.fields.retain(|(field, _)| *field != "packages");
         }
@@ -303,9 +308,10 @@ async fn create(
         npm: scan.npm.clone(),
         pypi: scan.pypi.clone(),
         maven: scan.maven.clone(),
+        go: scan.go.clone(),
     };
     input.normalize();
-    check(&input, &scan)?;
+    check(&st, &who, &input, &scan)?;
     if super::name_taken(&st.auth.db, &input.name, None)
         .await
         .map_err(db_error)?
@@ -381,8 +387,9 @@ async fn resync(
     input.npm = scan.npm.clone();
     input.pypi = scan.pypi.clone();
     input.maven = scan.maven.clone();
+    input.go = scan.go.clone();
     input.normalize();
-    check(&input, &scan)?;
+    check(&st, &who, &input, &scan)?;
     let source = RepoSource {
         commit: body.commit.clone(),
         synced_at: now_secs() as i64,

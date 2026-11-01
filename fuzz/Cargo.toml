@@ -1,0 +1,55 @@
+# Fuzz targets for Granary's Go file parsers. Run from this folder with
+# `cargo +nightly fuzz run <target>`; see README.md ("Fuzzing").
+#
+# A separate workspace with its own lockfile: none of this is part of the
+# granary build. The parser sources are included by path, so these
+# dependencies are the ones they use, pinned to the versions in the root
+# Cargo.lock, plus libfuzzer-sys.
+
+[package]
+name = "granary-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+base64 = "=0.22.1"
+hex = "=0.4.3"
+sha2 = "=0.10.9"
+zip = { version = "=9.0.1", default-features = false, features = ["deflate"] }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "go_mod_requires"
+path = "fuzz_targets/go_mod_requires.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "go_sum"
+path = "fuzz_targets/go_sum.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "go_work"
+path = "fuzz_targets/go_work.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "go_line"
+path = "fuzz_targets/go_line.rs"
+test = false
+doc = false
+bench = false

@@ -34,6 +34,9 @@ pub struct Starter<'a> {
     /// For a template made from a repo: its URL and the pinned commit. The
     /// manifests are then the repo's own files at that commit.
     pub from_repo: Option<(&'a str, &'a str)>,
+    /// The private Go prefixes the template's Go lines fall under, for
+    /// GONOSUMDB (only set for someone who may read them).
+    pub go_nosumdb: Vec<String>,
 }
 
 /// Tool settings never copied from a repo, so they can't send installs
@@ -45,6 +48,60 @@ fn is_tool_config(path: &str) -> bool {
         name,
         ".npmrc" | ".yarnrc" | ".yarnrc.yml" | "rust-toolchain" | "rust-toolchain.toml"
     ) || (in_cargo_dir && matches!(name, "config" | "config.toml"))
+}
+
+/// Text for README.txt with control characters (newlines included)
+/// replaced, so one item stays on its line.
+fn plain(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+fn is_go_sum(path: &str) -> bool {
+    path.rsplit('/').next() == Some("go.sum")
+}
+
+/// A go.sum with only its valid lines, or `None` when the file as a whole
+/// isn't one (too large, a NUL or CR, too many lines).
+fn checked_go_sum(text: &str) -> Option<String> {
+    crate::gomodfile::parse_sum(text).ok().map(|s| s.text())
+}
+
+/// The `replace` directives of a valid go.mod or go.work that point at a
+/// directory outside the repo: (old module, target).
+fn escaping_replaces(path: &str, text: &str) -> Vec<(String, String)> {
+    let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let replaces = match name {
+        "go.mod" => crate::gomodfile::parse_mod(text).map(|m| m.replaces),
+        "go.work" => crate::gomodfile::parse_work(text, dir).map(|w| w.replaces),
+        _ => return Vec::new(),
+    }
+    .unwrap_or_default();
+    replaces
+        .into_iter()
+        .filter_map(|r| match r.new {
+            crate::gomodfile::Target::Dir(d)
+                if crate::gomodfile::resolve_in_repo(dir, &d).is_none() =>
+            {
+                Some((r.old, d))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A go.mod, go.work or go.sum (by file name) that the parsers refuse as a
+/// whole. Such a file from a repo is left out of the starter; README.txt
+/// names it.
+fn refused_go_file(path: &str, text: &str) -> bool {
+    let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+    match name {
+        "go.mod" => crate::gomodfile::parse_mod(text).is_err(),
+        "go.work" => crate::gomodfile::parse_work(text, dir).is_err(),
+        "go.sum" => crate::gomodfile::parse_sum(text).is_err(),
+        _ => false,
+    }
 }
 
 /// A repo template's own manifests and lockfiles, one entry per ecosystem.
@@ -61,6 +118,7 @@ pub fn repo_manifests(files: &std::collections::BTreeMap<String, String>) -> Vec
             "pyproject.toml" => Eco::Pypi,
             n if n.starts_with("requirements") && n.ends_with(".txt") => Eco::Pypi,
             "pom.xml" | "build.gradle" | "build.gradle.kts" => Eco::Maven,
+            "go.mod" | "go.sum" | "go.work" => Eco::Go,
             _ => continue,
         };
         match by_eco.iter_mut().find(|m| m.eco == eco) {
@@ -81,6 +139,9 @@ impl Starter<'_> {
         for m in &self.manifests {
             let locks = self.lockfiles.get(m.eco.as_str());
             for (path, text) in &m.files {
+                if m.eco == Eco::Go && refused_go_file(path, text) {
+                    continue;
+                }
                 // Maven has no lockfile; the pom.xml that was warmed, with
                 // every version filled in, takes the generated one's place.
                 let warmed = locks
@@ -89,6 +150,11 @@ impl Starter<'_> {
                 let text = warmed.unwrap_or(text);
                 let text = if path.ends_with("package-lock.json") {
                     self.portable_npm_lock(text)
+                } else if is_go_sum(path) {
+                    match checked_go_sum(text) {
+                        Some(t) => t,
+                        None => continue,
+                    }
                 } else {
                     text.clone()
                 };
@@ -101,6 +167,12 @@ impl Starter<'_> {
                     }
                     let text = if path == "package-lock.json" {
                         self.portable_npm_lock(text)
+                    } else if m.eco == Eco::Go {
+                        // Only a go.sum, and only its valid lines.
+                        match checked_go_sum(text).filter(|_| path == "go.sum") {
+                            Some(t) => t,
+                            None => continue,
+                        }
                     } else {
                         text.clone()
                     };
@@ -197,6 +269,8 @@ impl Starter<'_> {
                     (".mvn/maven.config".into(), "-s\n.mvn/settings.xml\n".into()),
                 ]
             }
+            // Go reads its settings from the environment; see README.txt.
+            Eco::Go => Vec::new(),
         }
     }
 
@@ -232,11 +306,57 @@ impl Starter<'_> {
         } else {
             s.push_str("This Granary doesn't need an access token for downloads.\n\n");
         }
+        if self.manifests.iter().any(|m| m.eco == Eco::Go) {
+            s.push_str(&self.go_readme());
+        }
         s.push_str("FILES\n\n");
         if self.from_repo.is_some() {
+            let mut refused: Vec<String> = Vec::new();
+            // Kept Go files whose replaces point outside the repo.
+            let mut outside: Vec<String> = Vec::new();
+            let mut outside_more = 0usize;
             for m in &self.manifests {
-                let paths: Vec<&str> = m.files.iter().map(|(p, _)| p.as_str()).collect();
-                s.push_str(&format!("  {}: {}\n", m.eco.label(), paths.join(", ")));
+                // Each path on its own, so a repo's file name can't add lines.
+                let mut paths: Vec<String> = Vec::new();
+                for (p, text) in &m.files {
+                    if m.eco == Eco::Go && refused_go_file(p, text) {
+                        refused.push(plain(p));
+                        continue;
+                    }
+                    paths.push(plain(p));
+                    if m.eco == Eco::Go {
+                        for (old, target) in escaping_replaces(p, text) {
+                            if outside.len() < crate::gomodfile::MAX_SKIPPED {
+                                outside.push(format!(
+                                    "{}: replace {} => {}",
+                                    plain(p),
+                                    plain(&old),
+                                    plain(&target)
+                                ));
+                            } else {
+                                outside_more += 1;
+                            }
+                        }
+                    }
+                }
+                if !paths.is_empty() {
+                    s.push_str(&format!("  {}: {}\n", m.eco.label(), paths.join(", ")));
+                }
+            }
+            if !refused.is_empty() {
+                s.push_str(&format!(
+                    "\nLeft out because Granary could not read them as valid Go files:\n  {}\n",
+                    refused.join(", ")
+                ));
+            }
+            if !outside.is_empty() {
+                if outside_more > 0 {
+                    outside.push(format!("and {outside_more} more"));
+                }
+                s.push_str(&format!(
+                    "\nCheck before use: these replace directives point outside the repo, so\nthose modules won't build from this folder:\n  {}\n",
+                    outside.join("\n  ")
+                ));
             }
             return s;
         }
@@ -252,8 +372,35 @@ impl Starter<'_> {
                 Eco::Maven => {
                     "pom.xml, .mvn/settings.xml and .mvn/maven.config (Granary as Central's mirror)"
                 }
+                Eco::Go => {
+                    "go.mod, go.sum (when the template was warmed); Go is set up as GO explains"
+                }
             };
             s.push_str(&format!("  {}: {line}\n", m.eco.label()));
+        }
+        s
+    }
+
+    /// How to point Go at Granary. Go reads its settings from the
+    /// environment, so no file in the starter holds them.
+    fn go_readme(&self) -> String {
+        let base = plain(self.base_url);
+        let mut s = format!(
+            "GO\n\nGo takes its proxy from the environment. Point it at Granary once:\n\n  go env -w GOPROXY={base}/go GONOPROXY=\n  go env -u GOPRIVATE\n\nGOPROXY lists Granary alone, so a module Granary can't serve is never\nfetched from anywhere else. The checksum database is reached through\nGranary too.\n\n"
+        );
+        if !self.go_nosumdb.is_empty() {
+            // Each prefix on its own, then joined.
+            let list: Vec<String> = self.go_nosumdb.iter().map(|p| plain(p)).collect();
+            s.push_str(&format!(
+                "Some modules are private, so the public checksum database must not be\nasked about them:\n\n  go env -w 'GONOSUMDB={}'\n\n",
+                list.join(",")
+            ));
+        }
+        if self.client_auth {
+            s.push_str(&format!(
+                "Go sends a token only over HTTPS, and reads it from ~/.netrc:\n\n  machine {} login token password YOUR_TOKEN\n\n",
+                plain(self.host())
+            ));
         }
         s
     }
@@ -323,6 +470,12 @@ mod tests {
                 "[toolchain]\nchannel = \"nightly\"\n",
             ),
             ("requirements.txt", "httpx\n"),
+            (
+                "go.mod",
+                "module example.com/mono\n\nrequire github.com/acme/lib v1.0.0\nreplace github.com/acme/lib => ../../etc\nreplace github.com/acme/in => ./in\n",
+            ),
+            ("go.work", "use ../outside\n"),
+            ("svc/go.mod", "require (\n"),
         ]
         .into_iter()
         .map(|(p, t)| (p.to_string(), t.to_string()))
@@ -339,6 +492,7 @@ mod tests {
                 "https://github.com/acme/mono",
                 "0123456789abcdef0123456789abcdef01234567",
             )),
+            go_nosumdb: vec!["github.com/acme".into()],
         };
         let out = unzip(&s.zip().unwrap());
         let mut names: Vec<&str> = out.keys().map(String::as_str).collect();
@@ -352,6 +506,7 @@ mod tests {
                 "team-service/Cargo.toml",
                 "team-service/README.txt",
                 "team-service/crates/core/Cargo.toml",
+                "team-service/go.mod",
                 "team-service/pip.conf",
                 "team-service/requirements.txt",
                 "team-service/web/package-lock.json",
@@ -377,6 +532,23 @@ mod tests {
             readme.contains("web/package-lock.json, web/package.json"),
             "{readme}"
         );
+        // Go files the parsers refuse are left out, and named.
+        assert!(readme.contains("  Go: go.mod\n"), "{readme}");
+        assert!(
+            readme.contains("valid Go files:\n  go.work, svc/go.mod\n"),
+            "{readme}"
+        );
+        // A kept go.mod's replaces outside the repo are named; in-repo ones aren't.
+        assert!(
+            readme.contains(
+                "point outside the repo, so\nthose modules won't build from this folder:\n  go.mod: replace github.com/acme/lib => ../../etc\n"
+            ),
+            "{readme}"
+        );
+        assert!(!readme.contains("acme/in"));
+        // Quoted against shell globbing; a prefix can't hold a quote.
+        assert!(readme.contains("go env -w 'GONOSUMDB=github.com/acme'\n"));
+        assert!(crate::goprivate::check_pattern("example.com/a'b").is_err());
     }
 
     fn starter<'a>(t: &'a TemplateInput, auth: bool, locks: bool) -> Starter<'a> {
@@ -414,6 +586,7 @@ mod tests {
             warmer_granary_url: "http://granary:8080",
             client_auth: auth,
             from_repo: None,
+            go_nosumdb: Vec::new(),
         }
     }
 
@@ -470,6 +643,104 @@ mod tests {
         assert!(f(".mvn/settings.xml").contains("${env.GRANARY_TOKEN}"));
         assert!(f("pip.conf").contains("https://granary.lan/pypi/simple/"));
         assert!(f("README.txt").contains("contains no access token"));
+    }
+
+    #[test]
+    fn outside_replaces_in_repo_starters_are_capped() {
+        let t = template();
+        let mut gomod = String::from("module example.com/m\n");
+        for i in 0..60 {
+            gomod.push_str(&format!("replace example.com/r{i} => /abs/r{i}\n"));
+        }
+        let files: std::collections::BTreeMap<String, String> =
+            [("go.mod".to_string(), gomod)].into_iter().collect();
+        let s = Starter {
+            template: &t,
+            manifests: repo_manifests(&files),
+            lockfiles: HashMap::new(),
+            warmed_at: None,
+            base_url: "https://granary.lan",
+            warmer_granary_url: "http://granary:8080",
+            client_auth: false,
+            from_repo: Some(("https://github.com/acme/m", "0".repeat(40).leak())),
+            go_nosumdb: Vec::new(),
+        };
+        let readme = &unzip(&s.zip().unwrap())["team-service/README.txt"];
+        assert_eq!(readme.matches("  go.mod: replace ").count(), 50, "{readme}");
+        assert!(readme.contains("  and 10 more\n"), "{readme}");
+    }
+
+    #[test]
+    fn go_starters() {
+        let h = "h1:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+        let t = TemplateInput {
+            name: "Go Tool".into(),
+            platforms: default_platforms(),
+            go: "golang.org/x/text@v0.21.0\ngithub.com/google/uuid@latest".into(),
+            ..Default::default()
+        };
+        let versions =
+            HashMap::from([("github.com/google/uuid".to_string(), "v1.6.0".to_string())]);
+        let go_sum = format!(
+            "golang.org/x/text v0.21.0 {h}\nevil.example/x v1.0.0 h1:tampered\ngolang.org/x/text v0.21.0/go.mod {h}\n"
+        );
+        let s = Starter {
+            template: &t,
+            manifests: manifests(&t, &versions).unwrap(),
+            lockfiles: HashMap::from([(
+                "go".to_string(),
+                HashMap::from([
+                    ("go.sum".to_string(), go_sum),
+                    (
+                        "go.mod".to_string(),
+                        "module evil\nreplace x => /etc\n".to_string(),
+                    ),
+                    ("other.txt".to_string(), "?".to_string()),
+                ]),
+            )]),
+            warmed_at: Some(1),
+            base_url: "https://granary.lan",
+            warmer_granary_url: "http://granary:8080",
+            client_auth: true,
+            from_repo: None,
+            go_nosumdb: Vec::new(),
+        };
+        let out = unzip(&s.zip().unwrap());
+        let mut names: Vec<&str> = out.keys().map(String::as_str).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["go-tool/README.txt", "go-tool/go.mod", "go-tool/go.sum"]
+        );
+        // go.mod: the lines, @latest resolved, and nothing else.
+        let m = crate::gomodfile::parse_mod(&out["go-tool/go.mod"]).unwrap();
+        assert_eq!(m.module.as_deref(), Some("go-tool"));
+        assert!(m.replaces.is_empty() && m.skipped.is_empty());
+        let (lines, _) = m.lines();
+        assert_eq!(
+            lines,
+            vec!["golang.org/x/text@v0.21.0", "github.com/google/uuid@v1.6.0"]
+        );
+        // go.sum: validated, the tampered line dropped.
+        let sum = &out["go-tool/go.sum"];
+        assert_eq!(sum.lines().count(), 2);
+        assert!(!sum.contains("evil"));
+        let readme = &out["go-tool/README.txt"];
+        assert!(readme.contains("go env -w GOPROXY=https://granary.lan/go GONOPROXY="));
+        assert!(readme.contains("machine granary.lan login token password YOUR_TOKEN"));
+        assert!(!out.values().any(|v| v.contains("granary:8080")));
+
+        // A go.sum that isn't one at all is left out.
+        let s = Starter {
+            lockfiles: HashMap::from([(
+                "go".to_string(),
+                HashMap::from([("go.sum".to_string(), "x\r\n".to_string())]),
+            )]),
+            ..s
+        };
+        assert!(!unzip(&s.zip().unwrap()).contains_key("go-tool/go.sum"));
+        // Without a version for @latest, no go.mod can be made.
+        assert!(manifests(&t, &HashMap::new()).unwrap_err().contains("uuid"));
     }
 
     #[test]

@@ -1,0 +1,3 @@
+module "a\"b\\"
+require (
+require x v1

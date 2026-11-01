@@ -150,7 +150,7 @@ async fn previews_and_saves_a_workspace_repo() {
     );
     assert_eq!(
         p["counts"],
-        json!({"cargo": 3, "npm": 3, "pypi": 1, "maven": 0})
+        json!({"cargo": 3, "npm": 3, "pypi": 1, "maven": 0, "go": 0})
     );
     let cargo = p["lines"]["cargo"].as_str().unwrap();
     assert!(
@@ -180,7 +180,7 @@ async fn previews_and_saves_a_workspace_repo() {
     assert_eq!(t["tags"], json!(["mono"]));
     assert_eq!(
         t["counts"],
-        json!({"cargo": 3, "npm": 3, "pypi": 1, "maven": 0})
+        json!({"cargo": 3, "npm": 3, "pypi": 1, "maven": 0, "go": 0})
     );
     assert_eq!(t["source"]["url"], "https://github.com/acme/mono");
     assert_eq!(t["source"]["commit"], p["commit"]);

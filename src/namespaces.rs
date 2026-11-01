@@ -46,6 +46,8 @@ pub fn env_var(eco: Eco) -> &'static str {
         Eco::Pypi => "GRANARY_GITEA_PYPI",
         Eco::Maven => "GRANARY_GITEA_MAVEN",
         Eco::Cargo => "GRANARY_GITEA_CARGO",
+        // Not a namespace list: Go's private prefixes live apart.
+        Eco::Go => crate::goprivate::ENV,
     }
 }
 
@@ -117,6 +119,12 @@ pub fn check_rule(eco: Eco, pattern: &str, owner: &str) -> Result<Rule, String> 
             }
             "*".to_string()
         }
+        Eco::Go => {
+            return Err(format!(
+                "Go modules have no Gitea namespaces; private module prefixes are set with {}",
+                crate::goprivate::ENV
+            ));
+        }
     };
     Ok(Rule {
         pattern,
@@ -174,6 +182,7 @@ fn matches(eco: Eco, pattern: &str, name: &str) -> bool {
                     .is_some_and(|rest| rest.starts_with('.'))
         }
         Eco::Cargo => true,
+        Eco::Go => false,
     }
 }
 

@@ -104,6 +104,10 @@ impl Status {
     }
 }
 
+/// The warning for a template whose Go lines were skipped.
+const GO_SKIPPED: &str =
+    "Go modules are not warmed yet; they are cached when a client first asks for them";
+
 /// How a job ended.
 struct Outcome {
     status: Status,
@@ -112,6 +116,9 @@ struct Outcome {
     /// What went differently than asked without failing the job, such as a
     /// lockfile that had to be installed without being used as it was.
     warnings: Vec<String>,
+    /// Something was warmed. A job that had nothing it could warm (only
+    /// Go lines, for now) leaves the template's last warm time alone.
+    warmed: bool,
 }
 
 impl Outcome {
@@ -121,6 +128,7 @@ impl Outcome {
             message: Some(message.into()),
             lockfiles: HashMap::new(),
             warnings: Vec::new(),
+            warmed: true,
         }
     }
 }
@@ -544,9 +552,11 @@ async fn run(st: &AppState, id: i64, cancel: CancellationToken) {
     if outcome.status == Status::Done {
         // The template card shows the latest warm's warnings, or none.
         let _ = sqlx::query(
-            "UPDATE templates SET last_warmed_at = ?, last_warm_warnings = ?
+            "UPDATE templates SET last_warmed_at = CASE WHEN ? THEN ? ELSE last_warmed_at END,
+                last_warm_warnings = ?
              WHERE id = (SELECT template_id FROM jobs WHERE id = ? AND kind = 'template')",
         )
+        .bind(outcome.warmed)
         .bind(now_secs() as i64)
         .bind(&warnings)
         .bind(id)
@@ -585,17 +595,40 @@ async fn run_inner(
     let Some((title, spec)) = row else {
         return Outcome::failed("the job disappeared");
     };
-    let WarmSpec { input: spec, repo } = match serde_json::from_str(&spec) {
+    let WarmSpec {
+        input: mut spec,
+        repo,
+    } = match serde_json::from_str(&spec) {
         Ok(s) => s,
         Err(e) => return Outcome::failed(format!("the job's template could not be read: {e}")),
     };
     log.push(db, &format!("Warming {title}")).await;
+    // The warmer has no Go step yet: say so, and leave the Go lines out.
+    let skipped_go = !spec.deps(Eco::Go).is_empty();
+    if skipped_go {
+        log.push(
+            db,
+            "Go: warming Go modules is not supported yet, so the Go lines were skipped",
+        )
+        .await;
+        spec.go.clear();
+    }
 
     if st.cfg.warmer_url.is_none() {
         return Outcome::failed("warming needs the warmer service (GRANARY_WARMER_URL is not set)");
     }
     if st.cfg.offline {
         return Outcome::failed("offline mode is on, so nothing new can be fetched");
+    }
+    // Only Go lines: nothing to ask the warmer, and no token is made.
+    if skipped_go && repo.is_none() && Eco::ALL.iter().all(|e| spec.deps(*e).is_empty()) {
+        return Outcome {
+            status: Status::Done,
+            message: None,
+            lockfiles: HashMap::new(),
+            warnings: vec![GO_SKIPPED.into()],
+            warmed: false,
+        };
     }
     let budget = match st.cfg.cache_limit {
         Some(limit) => {
@@ -685,6 +718,9 @@ async fn run_inner(
     let mut lockfiles = HashMap::new();
     let mut failures = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    if skipped_go {
+        warnings.push(GO_SKIPPED.into());
+    }
     for step in steps {
         let eco = step.eco();
         let label = step.label();
@@ -733,6 +769,7 @@ async fn run_inner(
                     message: Some("Cancelled while running".into()),
                     lockfiles: HashMap::new(),
                     warnings,
+                    warmed: true,
                 };
             }
             Err(warmer::Stop::Timeout) => {
@@ -759,6 +796,7 @@ async fn run_inner(
             message: None,
             lockfiles,
             warnings,
+            warmed: true,
         }
     } else {
         Outcome {
@@ -766,6 +804,7 @@ async fn run_inner(
             message: Some(failures.join("; ")),
             lockfiles,
             warnings,
+            warmed: true,
         }
     }
 }
@@ -1163,7 +1202,7 @@ pub async fn queue_scheduled(st: &AppState) -> usize {
             title: &t.input.name,
             spec: &t.input,
             repo,
-            private: t.resource(&st.cfg),
+            private: t.resource(&st.cfg, &st.goprivate),
         };
         match enqueue(st, job, &by).await {
             Ok(job) => {
