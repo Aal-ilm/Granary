@@ -842,7 +842,7 @@ fn go_section(
                         "go.sum",
                         format!(
                             "{} lines are not valid go.sum lines and are ignored (the first is line {first})",
-                            s.invalid.len()
+                            s.invalid_count
                         ),
                     );
                 }
@@ -1420,6 +1420,32 @@ dependencies {
         let s = scan(&files(&[("go.work", "use ../elsewhere\n")]), &hosts());
         assert!(s.skipped[0].reason.contains("outside the repo"));
         assert!(s.manifests.is_empty());
+    }
+
+    #[test]
+    fn go_modules_per_repo_are_capped() {
+        let mods = |n: usize| -> BTreeMap<String, String> {
+            (0..n)
+                .map(|i| {
+                    (
+                        format!("m{i:03}/go.mod"),
+                        format!("module example.com/m{i}\nrequire golang.org/x/text v0.21.0\n"),
+                    )
+                })
+                .collect()
+        };
+        let capped = |s: &Scan| {
+            s.skipped
+                .iter()
+                .filter(|k| k.reason.contains("more than"))
+                .count()
+        };
+        let s = scan(&mods(gomodfile::MAX_MODULES), &hosts());
+        assert_eq!(capped(&s), 0);
+        assert_eq!(s.manifests.len(), gomodfile::MAX_MODULES);
+        let s = scan(&mods(gomodfile::MAX_MODULES + 1), &hosts());
+        assert_eq!(capped(&s), 1);
+        assert_eq!(s.manifests.len(), gomodfile::MAX_MODULES);
     }
 
     #[test]

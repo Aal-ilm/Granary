@@ -30,6 +30,37 @@ pub const MAX_USES: usize = 100;
 pub const MAX_MODULES: usize = 200;
 /// Longest Go template line, like every other template line.
 pub const MAX_GO_LINE: usize = 500;
+/// Most directives and block entries of any kind in one file: room for
+/// the requires and replaces, plus a few others.
+pub const MAX_ENTRIES: usize = 2 * MAX_REQUIRES + 100;
+/// Most reasons kept per file for what was left out; the rest are only
+/// counted, in one "and N more" line.
+pub const MAX_SKIPPED: usize = 50;
+
+/// Reasons for what was left out, capped at [`MAX_SKIPPED`]. A reason past
+/// the cap is only counted, never kept.
+#[derive(Default)]
+struct Notes {
+    list: Vec<String>,
+    more: usize,
+}
+
+impl Notes {
+    fn push(&mut self, reason: impl FnOnce() -> String) {
+        if self.list.len() < MAX_SKIPPED {
+            self.list.push(reason());
+        } else {
+            self.more += 1;
+        }
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        if self.more > 0 {
+            self.list.push(format!("and {} more", self.more));
+        }
+        self.list
+    }
+}
 
 // ------------------------------------------------------------------ lexer
 
@@ -180,6 +211,10 @@ fn entries(text: &str) -> Result<Vec<Entry<'_>>, String> {
         if line.toks.is_empty() {
             continue;
         }
+        // Counted before anything is kept for the line.
+        if out.len() + 1 > MAX_ENTRIES {
+            return Err(format!("more than {MAX_ENTRIES} directives"));
+        }
         let parens = line
             .toks
             .iter()
@@ -278,7 +313,10 @@ pub struct GoMod {
     pub toolchain: Option<String>,
     pub requires: Vec<Require>,
     pub replaces: Vec<Replace>,
+    /// At most [`MAX_SKIPPED`] reasons; [`GoMod::lines`] adds the count of
+    /// the rest.
     pub skipped: Vec<String>,
+    pub skipped_more: usize,
 }
 
 /// Whether a replacement is a directory rather than a module path
@@ -327,7 +365,9 @@ fn simple_version(s: &str) -> bool {
 pub fn parse_mod(text: &str) -> Result<GoMod, String> {
     precheck(text, MAX_MOD_BYTES, "go.mod")?;
     let mut m = GoMod::default();
-    let mut replaces = 0usize;
+    let mut notes = Notes::default();
+    // Every attempt counts against the caps, valid or not.
+    let (mut requires, mut replaces) = (0usize, 0usize);
     for e in entries(text)? {
         let no = e.no;
         let args = &e.args;
@@ -350,12 +390,11 @@ pub fn parse_mod(text: &str) -> Result<GoMod, String> {
                     };
                     *slot = Some(v.to_string());
                 }
-                _ => m
-                    .skipped
-                    .push(format!("line {no}: {} is not understood", e.verb)),
+                _ => notes.push(|| format!("line {no}: {} is not understood", e.verb)),
             },
             "require" => {
-                if m.requires.len() + 1 > MAX_REQUIRES {
+                requires += 1;
+                if requires > MAX_REQUIRES {
                     return Err(format!("more than {MAX_REQUIRES} requirements"));
                 }
                 match args.as_slice() {
@@ -367,11 +406,9 @@ pub fn parse_mod(text: &str) -> Result<GoMod, String> {
                                 .comment
                                 .is_some_and(|c| c == "indirect" || c.starts_with("indirect;")),
                         }),
-                        Err(why) => m.skipped.push(format!("{p}@{v}: {why}")),
+                        Err(why) => notes.push(|| format!("{p}@{v}: {why}")),
                     },
-                    _ => m
-                        .skipped
-                        .push(format!("line {no}: usage: require module/path v1.2.3")),
+                    _ => notes.push(|| format!("line {no}: usage: require module/path v1.2.3")),
                 }
             }
             "replace" => {
@@ -381,15 +418,15 @@ pub fn parse_mod(text: &str) -> Result<GoMod, String> {
                 }
                 match replace(no, args) {
                     Ok(r) => m.replaces.push(r),
-                    Err(why) => m.skipped.push(why),
+                    Err(why) => notes.push(|| why),
                 }
             }
             "exclude" | "retract" | "godebug" | "ignore" | "tool" => {}
-            other => m
-                .skipped
-                .push(format!("line {no}: unknown directive {other:?}")),
+            other => notes.push(|| format!("line {no}: unknown directive {other:?}")),
         }
     }
+    m.skipped = notes.list;
+    m.skipped_more = notes.more;
     Ok(m)
 }
 
@@ -438,28 +475,40 @@ impl GoMod {
     /// version; one replaced by a directory is not a Go line.
     pub fn lines(&self) -> (Vec<String>, Vec<String>) {
         let mut lines = Vec::new();
-        let mut skipped = self.skipped.clone();
+        let mut skipped = Notes {
+            list: self.skipped.clone(),
+            more: self.skipped_more,
+        };
+        // By old path, so each requirement is one lookup.
+        let mut by_old: std::collections::HashMap<&str, Vec<&Replace>> =
+            std::collections::HashMap::new();
+        for x in &self.replaces {
+            by_old.entry(x.old.as_str()).or_default().push(x);
+        }
         for r in &self.requires {
-            let rep = self.replaces.iter().find(|x| {
-                x.old == r.path && x.old_version.as_ref().is_none_or(|v| *v == r.version)
+            let rep = by_old.get(r.path.as_str()).and_then(|list| {
+                list.iter()
+                    .find(|x| x.old_version.as_ref().is_none_or(|v| *v == r.version))
             });
             let line = match rep.map(|x| &x.new) {
                 None => format!("{}@{}", r.path, r.version),
                 Some(Target::Module { path, version }) => format!("{path}@{version}"),
                 Some(Target::Dir(d)) => {
-                    skipped.push(format!(
-                        "{}: replaced by the directory {d:?}, which is not a module to fetch",
-                        r.path
-                    ));
+                    skipped.push(|| {
+                        format!(
+                            "{}: replaced by the directory {d:?}, which is not a module to fetch",
+                            r.path
+                        )
+                    });
                     continue;
                 }
             };
             match check_line(&line) {
                 Ok(_) => lines.push(line),
-                Err(why) => skipped.push(format!("{line}: {why}")),
+                Err(why) => skipped.push(|| format!("{line}: {why}")),
             }
         }
-        (lines, skipped)
+        (lines, skipped.finish())
     }
 }
 
@@ -481,7 +530,10 @@ pub struct SumLine {
 #[derive(Clone, Debug, Default)]
 pub struct GoSum {
     pub lines: Vec<SumLine>,
+    /// The first [`MAX_SKIPPED`] invalid lines.
     pub invalid: Vec<(usize, String)>,
+    /// How many lines were invalid in all.
+    pub invalid_count: usize,
 }
 
 fn sum_line(line: &str) -> Result<SumLine, String> {
@@ -533,7 +585,12 @@ pub fn parse_sum(text: &str) -> Result<GoSum, String> {
         }
         match sum_line(line) {
             Ok(l) => s.lines.push(l),
-            Err(why) => s.invalid.push((i + 1, why)),
+            Err(why) => {
+                s.invalid_count += 1;
+                if s.invalid.len() < MAX_SKIPPED {
+                    s.invalid.push((i + 1, why));
+                }
+            }
         }
     }
     Ok(s)
@@ -575,12 +632,15 @@ pub struct GoWork {
 pub fn parse_work(text: &str, dir: &str) -> Result<GoWork, String> {
     precheck(text, MAX_MOD_BYTES, "go.work")?;
     let mut w = GoWork::default();
-    let mut replaces = 0usize;
+    let mut notes = Notes::default();
+    // Every attempt counts against the caps, repeated or not.
+    let (mut uses, mut replaces) = (0usize, 0usize);
     for e in entries(text)? {
         let no = e.no;
         match (e.verb.as_str(), e.args.as_slice()) {
             ("use", [p]) => {
-                if w.uses.len() + 1 > MAX_USES {
+                uses += 1;
+                if uses > MAX_USES {
                     return Err(format!("more than {MAX_USES} use entries"));
                 }
                 let Some(rel) = resolve_in_repo(dir, p) else {
@@ -601,15 +661,14 @@ pub fn parse_work(text: &str, dir: &str) -> Result<GoWork, String> {
                 }
                 match replace(no, args) {
                     Ok(r) => w.replaces.push(r),
-                    Err(why) => w.skipped.push(why),
+                    Err(why) => notes.push(|| why),
                 }
             }
             ("toolchain" | "godebug" | "go", _) => {}
-            (other, _) => w
-                .skipped
-                .push(format!("line {no}: unknown directive {other:?}")),
+            (other, _) => notes.push(|| format!("line {no}: unknown directive {other:?}")),
         }
     }
+    w.skipped = notes.finish();
     Ok(w)
 }
 
@@ -669,7 +728,9 @@ pub mod fuzz {
         };
         assert!(m.requires.len() <= MAX_REQUIRES);
         assert!(m.replaces.len() <= MAX_REQUIRES);
-        let (lines, _) = m.lines();
+        assert!(m.skipped.len() <= MAX_SKIPPED);
+        let (lines, skipped) = m.lines();
+        assert!(skipped.len() <= MAX_SKIPPED + 1);
         assert!(lines.len() <= m.requires.len());
         for l in &lines {
             assert!(l.len() <= MAX_GO_LINE);
@@ -685,7 +746,8 @@ pub mod fuzz {
         let Ok(s) = parse_sum(text) else {
             return;
         };
-        assert!(s.lines.len() + s.invalid.len() <= MAX_SUM_LINES);
+        assert!(s.lines.len() + s.invalid_count <= MAX_SUM_LINES);
+        assert!(s.invalid.len() <= MAX_SKIPPED);
         let again = parse_sum(&s.text()).expect("written go.sum reads back");
         assert!(again.invalid.is_empty());
         assert_eq!(again.lines, s.lines);
@@ -701,6 +763,7 @@ pub mod fuzz {
                 continue;
             };
             assert!(w.uses.len() <= MAX_USES);
+            assert!(w.skipped.len() <= MAX_SKIPPED + 1);
             for u in &w.uses {
                 assert!(!u.starts_with('/') && !u.contains('\\'), "{u:?}");
                 // "" is the repo root.
@@ -915,6 +978,65 @@ mod tests {
     }
 
     #[test]
+    fn malformed_entries_count_and_reasons_are_capped() {
+        let many = |n: usize, line: &str| line.repeat(n);
+        // Malformed requires count against the cap like valid ones.
+        let m = parse_mod(&many(MAX_REQUIRES, "require bad v1\n")).unwrap();
+        assert!(m.requires.is_empty());
+        assert_eq!(m.skipped.len(), MAX_SKIPPED);
+        assert_eq!(m.skipped_more, MAX_REQUIRES - MAX_SKIPPED);
+        let (_, skipped) = m.lines();
+        assert_eq!(skipped.len(), MAX_SKIPPED + 1);
+        assert_eq!(
+            skipped[MAX_SKIPPED],
+            format!("and {} more", MAX_REQUIRES - MAX_SKIPPED)
+        );
+        assert!(parse_mod(&many(MAX_REQUIRES + 1, "require bad v1\n")).is_err());
+        assert!(parse_mod(&many(MAX_REQUIRES + 1, "require x\n")).is_err());
+
+        // Unknown directives: every entry counts, and reasons stop at the cap.
+        let m = parse_mod(&many(MAX_ENTRIES, "frob x\n")).unwrap();
+        assert_eq!(m.skipped.len(), MAX_SKIPPED);
+        assert!(parse_mod(&many(MAX_ENTRIES + 1, "frob x\n")).is_err());
+        let w = parse_work(&many(MAX_ENTRIES, "frob x\n"), "").unwrap();
+        assert_eq!(w.skipped.len(), MAX_SKIPPED + 1);
+        assert!(parse_work(&many(MAX_ENTRIES + 1, "frob x\n"), "").is_err());
+
+        // Replaces, valid or not, in go.mod and go.work.
+        let reps = |n: usize| many(n, "replace bad => ./x\n");
+        assert_eq!(
+            parse_mod(&reps(MAX_REQUIRES)).unwrap().skipped.len(),
+            MAX_SKIPPED
+        );
+        assert!(parse_mod(&reps(MAX_REQUIRES + 1)).is_err());
+        let ok = |n: usize| many(n, "replace a.example/x => ./x\n");
+        assert_eq!(
+            parse_mod(&ok(MAX_REQUIRES)).unwrap().replaces.len(),
+            MAX_REQUIRES
+        );
+        assert!(parse_mod(&ok(MAX_REQUIRES + 1)).is_err());
+        assert_eq!(
+            parse_work(&ok(MAX_REQUIRES), "").unwrap().replaces.len(),
+            MAX_REQUIRES
+        );
+        assert!(parse_work(&ok(MAX_REQUIRES + 1), "").is_err());
+
+        // Repeated uses count too.
+        assert!(parse_work(&many(MAX_USES, "use ./a\n"), "").is_ok());
+        assert!(parse_work(&many(MAX_USES + 1, "use ./a\n"), "").is_err());
+        // go.work size.
+        assert!(parse_work(&"\n".repeat(MAX_MOD_BYTES), "").is_ok());
+        assert!(parse_work(&"\n".repeat(MAX_MOD_BYTES + 1), "").is_err());
+
+        // go.sum: all invalid lines counted, the first few kept.
+        let s = parse_sum(&many(MAX_SUM_LINES, "x\n")).unwrap();
+        assert_eq!(
+            (s.invalid.len(), s.invalid_count),
+            (MAX_SKIPPED, MAX_SUM_LINES)
+        );
+    }
+
+    #[test]
     fn reads_go_sum_lines() {
         let short = STANDARD.encode([0u8; 31]);
         let long = STANDARD.encode([0u8; 33]);
@@ -977,7 +1099,16 @@ mod tests {
         ] {
             assert!(check_line(bad).is_err(), "{bad:?}");
         }
-        let long = format!("example.com/{}@v1.0.0", "a".repeat(MAX_GO_LINE));
-        assert!(check_line(&long).unwrap_err().contains("too long"));
+        let line = |n: usize| {
+            let fixed = "example.com/@v1.0.0".len();
+            format!("example.com/{}@v1.0.0", "a".repeat(n - fixed))
+        };
+        assert_eq!(line(MAX_GO_LINE).len(), MAX_GO_LINE);
+        assert!(check_line(&line(MAX_GO_LINE)).is_ok());
+        assert!(
+            check_line(&line(MAX_GO_LINE + 1))
+                .unwrap_err()
+                .contains("too long")
+        );
     }
 }
