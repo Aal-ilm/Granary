@@ -71,6 +71,29 @@ fn checked_go_sum(text: &str) -> Option<String> {
 /// A go.mod, go.work or go.sum (by file name) that the parsers refuse as a
 /// whole. Such a file from a repo is left out of the starter; README.txt
 /// names it.
+/// The `replace` directives of a valid go.mod or go.work that point at a
+/// directory outside the repo: (old module, target).
+fn escaping_replaces(path: &str, text: &str) -> Vec<(String, String)> {
+    let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let replaces = match name {
+        "go.mod" => crate::gomodfile::parse_mod(text).map(|m| m.replaces),
+        "go.work" => crate::gomodfile::parse_work(text, dir).map(|w| w.replaces),
+        _ => return Vec::new(),
+    }
+    .unwrap_or_default();
+    replaces
+        .into_iter()
+        .filter_map(|r| match r.new {
+            crate::gomodfile::Target::Dir(d)
+                if crate::gomodfile::resolve_in_repo(dir, &d).is_none() =>
+            {
+                Some((r.old, d))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn refused_go_file(path: &str, text: &str) -> bool {
     let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
     match name {
@@ -289,14 +312,31 @@ impl Starter<'_> {
         s.push_str("FILES\n\n");
         if self.from_repo.is_some() {
             let mut refused: Vec<String> = Vec::new();
+            // Kept Go files whose replaces point outside the repo.
+            let mut outside: Vec<String> = Vec::new();
+            let mut outside_more = 0usize;
             for m in &self.manifests {
                 // Each path on its own, so a repo's file name can't add lines.
                 let mut paths: Vec<String> = Vec::new();
                 for (p, text) in &m.files {
                     if m.eco == Eco::Go && refused_go_file(p, text) {
                         refused.push(plain(p));
-                    } else {
-                        paths.push(plain(p));
+                        continue;
+                    }
+                    paths.push(plain(p));
+                    if m.eco == Eco::Go {
+                        for (old, target) in escaping_replaces(p, text) {
+                            if outside.len() < crate::gomodfile::MAX_SKIPPED {
+                                outside.push(format!(
+                                    "{}: replace {} => {}",
+                                    plain(p),
+                                    plain(&old),
+                                    plain(&target)
+                                ));
+                            } else {
+                                outside_more += 1;
+                            }
+                        }
                     }
                 }
                 if !paths.is_empty() {
@@ -307,6 +347,15 @@ impl Starter<'_> {
                 s.push_str(&format!(
                     "\nLeft out because Granary could not read them as valid Go files:\n  {}\n",
                     refused.join(", ")
+                ));
+            }
+            if !outside.is_empty() {
+                if outside_more > 0 {
+                    outside.push(format!("and {outside_more} more"));
+                }
+                s.push_str(&format!(
+                    "\nCheck before use: these replace directives point outside the repo, so\nthose modules won't build from this folder:\n  {}\n",
+                    outside.join("\n  ")
                 ));
             }
             return s;
@@ -423,7 +472,7 @@ mod tests {
             ("requirements.txt", "httpx\n"),
             (
                 "go.mod",
-                "module example.com/mono\n\nrequire github.com/acme/lib v1.0.0\n",
+                "module example.com/mono\n\nrequire github.com/acme/lib v1.0.0\nreplace github.com/acme/lib => ../../etc\nreplace github.com/acme/in => ./in\n",
             ),
             ("go.work", "use ../outside\n"),
             ("svc/go.mod", "require (\n"),
@@ -489,6 +538,14 @@ mod tests {
             readme.contains("valid Go files:\n  go.work, svc/go.mod\n"),
             "{readme}"
         );
+        // A kept go.mod's replaces outside the repo are named; in-repo ones aren't.
+        assert!(
+            readme.contains(
+                "point outside the repo, so\nthose modules won't build from this folder:\n  go.mod: replace github.com/acme/lib => ../../etc\n"
+            ),
+            "{readme}"
+        );
+        assert!(!readme.contains("acme/in"));
         // Quoted against shell globbing; a prefix can't hold a quote.
         assert!(readme.contains("go env -w 'GONOSUMDB=github.com/acme'\n"));
         assert!(crate::goprivate::check_pattern("example.com/a'b").is_err());
@@ -586,6 +643,31 @@ mod tests {
         assert!(f(".mvn/settings.xml").contains("${env.GRANARY_TOKEN}"));
         assert!(f("pip.conf").contains("https://granary.lan/pypi/simple/"));
         assert!(f("README.txt").contains("contains no access token"));
+    }
+
+    #[test]
+    fn outside_replaces_in_repo_starters_are_capped() {
+        let t = template();
+        let mut gomod = String::from("module example.com/m\n");
+        for i in 0..60 {
+            gomod.push_str(&format!("replace example.com/r{i} => /abs/r{i}\n"));
+        }
+        let files: std::collections::BTreeMap<String, String> =
+            [("go.mod".to_string(), gomod)].into_iter().collect();
+        let s = Starter {
+            template: &t,
+            manifests: repo_manifests(&files),
+            lockfiles: HashMap::new(),
+            warmed_at: None,
+            base_url: "https://granary.lan",
+            warmer_granary_url: "http://granary:8080",
+            client_auth: false,
+            from_repo: Some(("https://github.com/acme/m", "0".repeat(40).leak())),
+            go_nosumdb: Vec::new(),
+        };
+        let readme = &unzip(&s.zip().unwrap())["team-service/README.txt"];
+        assert_eq!(readme.matches("  go.mod: replace ").count(), 50, "{readme}");
+        assert!(readme.contains("  and 10 more\n"), "{readme}");
     }
 
     #[test]

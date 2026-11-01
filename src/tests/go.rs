@@ -718,6 +718,10 @@ async fn get_packages_looks_up_and_caches_modules() {
         .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert!(!files.join("v1.1.0").exists() && !files.join("v1.1.0.mod").exists());
+    assert!(
+        !files.join("v1.1.0.info").exists(),
+        "the .info is removed again"
+    );
     // @latest is resolved to a canonical version first (here the cached
     // @latest answer, v1.0.0).
     let (status, _, body) = h

@@ -726,9 +726,9 @@ async fn cache_go(
     version: &str,
 ) -> AppResult<Vec<(&'static str, String)>> {
     gomod::check_path(module).map_err(|e| AppError::bad_request(format!("{module:?}: {e}")))?;
-    if go_refused(st, who, module) {
-        return Err(AppError::not_found());
-    }
+    // Which prefixes are private is itself private: every answer below is
+    // the same for a path someone may not read as for one that doesn't
+    // exist. lookup_go finds nothing for such a path, without fetching.
     let version = if version == "@latest" {
         lookup_go(st, who, module)
             .await?
@@ -743,23 +743,48 @@ async fn cache_go(
         )));
     }
     gomod::check(module, &version).map_err(AppError::bad_request)?;
-    let escver = gomod::escape(&version);
-    for ext in ["mod", "zip"] {
-        if go_file(st, who, module, &format!("{escver}.{ext}"), false)
-            .await?
-            .is_none()
-        {
-            return Err(AppError::new(
-                StatusCode::NOT_FOUND,
-                format!("{module} has no version {version}"),
-            ));
-        }
+    let no_version = || {
+        AppError::new(
+            StatusCode::NOT_FOUND,
+            format!("{module} has no version {version}"),
+        )
+    };
+    // Asked before anything is fetched.
+    if go_refused(st, who, module) {
+        return Err(no_version());
     }
+    let escver = gomod::escape(&version);
     let escmod = gomod::escape(module);
     let (ns, base) = match st.goprivate.route(module) {
         Some(r) => ("go-private", format!("{}/{escmod}", r.source.cache_key())),
         None => ("go", escmod),
     };
+    // .info first: a version that doesn't exist is a plain "no version"
+    // then, before the checksum database is asked about it. If the
+    // version then fails, an .info this call added is removed again, so
+    // nothing of it stays cached.
+    let info_rel = format!("{base}/@v/{escver}.info");
+    let had_info = st.store.has_file(ns, &info_rel).await;
+    let mut result = Ok(());
+    for ext in ["info", "mod", "zip"] {
+        match go_file(st, who, module, &format!("{escver}.{ext}"), false).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                result = Err(no_version());
+                break;
+            }
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        }
+    }
+    if let Err(e) = result {
+        if !had_info {
+            let _ = st.store.delete_file(ns, &info_rel).await;
+        }
+        return Err(e);
+    }
     Ok(vec![
         (ns, format!("{base}/@v/{escver}.mod")),
         (ns, format!("{base}/@v/{escver}")),

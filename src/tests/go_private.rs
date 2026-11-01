@@ -1076,4 +1076,30 @@ async fn get_packages_keeps_private_modules_private() {
     );
     // The public proxy's look-alike was never asked.
     assert_eq!(h.mock.total(), 0);
+
+    // Cache on a private path someone may not read answers exactly like
+    // an unknown public path, so the prefixes stay hidden.
+    let answer = |module: &'static str| {
+        let viewer = viewer.clone();
+        async move {
+            let e = crate::search::cache_one(
+                st,
+                &viewer,
+                crate::templates::lines::Eco::Go,
+                module,
+                "v1.0.0",
+                None,
+            )
+            .await
+            .unwrap_err();
+            (e.status, e.message.replace(module, "MODULE"))
+        }
+    };
+    let private = answer("github.com/acme/tool").await;
+    let public = answer("github.com/other/nope").await;
+    assert_eq!(private, public);
+    assert_eq!(
+        private,
+        (StatusCode::NOT_FOUND, "MODULE has no version v1.0.0".into())
+    );
 }
