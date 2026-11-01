@@ -699,7 +699,7 @@ pub async fn lookup_go(st: &AppState, who: &Principal, name: &str) -> AppResult<
     if versions.is_empty() {
         return Ok(None);
     }
-    versions.sort_by(|a, b| semver_of(b).cmp(&semver_of(a)));
+    versions.sort_by_key(|v| std::cmp::Reverse(semver_of(v)));
     let latest = latest
         .filter(|l| semver_of(l).is_some_and(|s| s.pre.is_empty()))
         .or_else(|| {
