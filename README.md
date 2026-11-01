@@ -625,6 +625,7 @@ or mvn anywhere. Open **Get packages**, pick an ecosystem and search:
 | Cargo | crates.io's web API (`GRANARY_CARGO_API`) |
 | PyPI | Nowhere: PyPI has no search API, so type the exact project name |
 | Maven | search.maven.org (`GRANARY_MAVEN_SEARCH`) |
+| Go | Nowhere: the Go module proxy has no search API, so type the exact module path |
 
 Each result shows the latest version, a description where the registry has
 one, and how many versions Granary already holds. **Cache** asks for a
@@ -635,6 +636,18 @@ against the registry's checksum, exactly as for client downloads. Its
 dependencies are fetched when a client first asks for them, unless you tick
 **With dependencies** (shown when the [warmer](#warming-templates-with-the-warmer)
 is running), which starts a warm job for that one version.
+
+**Go** is looked up by exact module path, such as `golang.org/x/text`,
+through the same proxy path Go clients use (`@v/list` and `@latest`), so
+the answers come from the cache when they can. Nothing you type is sent to
+a search host or to Gitea. A path under a [private
+prefix](#private-go-modules) is looked up only for people who may read
+private modules, and finds nothing for anyone else, before anything is
+fetched. **Cache** fetches the version's `go.mod` and then its zip, both
+checked against the checksum database (or built from the module's own
+source for a private module), exactly as for a client. Only released
+versions (`v1.2.3`) can be cached; branch names and other queries are
+refused. **With dependencies** isn't offered for Go yet.
 
 **Privacy note.** Search sends the text you type to crates.io and
 search.maven.org, which are not otherwise contacted, and to the npm
@@ -658,10 +671,18 @@ per line in each ecosystem's own syntax:
 | npm | `"react": "^19"` |
 | PyPI | `fastapi>=0.115` |
 | Maven | `org.springframework.boot:spring-boot-starter-web:3.4.0` (version optional) |
+| Go | `golang.org/x/text@v0.21.0`, or `golang.org/x/text@latest` |
 
 Only registry packages can be cached, so git, path, file and URL
 dependencies are refused, as are pip options such as `-r` and Maven
-snapshots. Lines starting with `#` are comments. A template also lists the
+snapshots. A Go line is a module path as Go writes it (not case-encoded)
+and either a released version or `@latest`; branch names, short versions
+such as `v1.2` and a misplaced `+incompatible` are refused. A template with
+a Go line under a [private prefix](#private-go-modules) is private content,
+seen only by people who may read private modules, and only they can save
+such a line. The warmer has no Go step yet: warming a template skips its
+Go lines, says so in the job log and finishes with a warning; Go modules
+are cached when a client first asks for them, or from **Get packages**. Lines starting with `#` are comments. A template also lists the
 platforms to cache for (Linux x86-64 and macOS Apple silicon by default) and
 whether Python source distributions are allowed; building an sdist runs the
 package's own code, so templates use wheels only unless you allow them.
@@ -687,8 +708,11 @@ templates, which are stored in `state/granary.db`.
 
 The template editor checks every line as you type and names the line and
 the problem. **Import from manifest** fills a section from a `Cargo.toml`,
-`package.json`, `requirements.txt` or `pom.xml` (uploaded or pasted), and
-lists anything it had to leave out, such as path dependencies. **Export**
+`package.json`, `requirements.txt`, `pom.xml` or `go.mod` (uploaded or
+pasted), and lists anything it had to leave out, such as path
+dependencies. From a `go.mod`, each `require` becomes a Go line; a
+requirement replaced by another module version becomes that version, and
+one replaced by a directory is left out. **Export**
 downloads a template as a TOML file in the same format as the built-ins.
 
 Viewers can see templates and export them; creating, editing, cloning,
@@ -703,7 +727,8 @@ tag or commit. If Granary doesn't have the repo yet it caches it first, with
 the clone's progress shown on the page. It then pins the ref to a commit and
 reads these files there, from the root and up to two levels down:
 `Cargo.toml`, `Cargo.lock`, `package.json`, `package-lock.json`,
-`requirements*.txt`, `pyproject.toml`, `pom.xml` and `build.gradle(.kts)`.
+`requirements*.txt`, `pyproject.toml`, `pom.xml`, `build.gradle(.kts)`,
+`go.mod`, `go.sum` and `go.work`.
 
 - Cargo and npm workspace members are included wherever they are.
   Dependencies that are part of the repo (other workspace members, path
@@ -716,6 +741,14 @@ reads these files there, from the root and up to two levels down:
 - Git dependencies (Cargo `git = ...`, npm `github:` or git URLs, pip
   `name @ git+https://...`) on an allowed host are cached through the git
   cache when the template is saved.
+- Go: each `go.mod`'s requirements become Go lines, without the repo's own
+  modules; the preview shows how many requirements each `go.mod` has.
+  `go.work` members are read within the same two levels; a member deeper
+  down, or one that points outside the repo, is listed as skipped (a
+  workspace that leaves the repo is not read at all). A `replace` pointing
+  at a directory outside the repo is listed too, since warming that module
+  would fail. `go.sum` files are kept as lockfiles, and lines that aren't
+  valid `go.sum` lines are reported and never used.
 
 A preview shows the manifests and lockfiles found, how many packages each
 ecosystem gets, the git dependencies and everything left out, with the
@@ -747,13 +780,18 @@ are replaced too; the name, tags, platforms and schedule stay.
 up to install through your Granary:
 
 - the manifests (`Cargo.toml`, `package.json`, `requirements.txt`,
-  `pom.xml`), for the ecosystems the template uses
+  `pom.xml`, `go.mod`), for the ecosystems the template uses; a `go.mod`
+  requires each Go line, with `@latest` resolved to the latest version
+  when the starter is made
 - the lockfiles from the template's last successful warm, if it has one:
   `Cargo.lock`, `package-lock.json` (with URLs pointing at
   registry.npmjs.org, which npm maps onto whatever registry is configured),
   `requirements.lock.txt` (the versions that were cached) and, for Maven,
-  the `pom.xml` that was warmed, with every version filled in
-- client configuration for this Granary: `.cargo/config.toml` with the
+  the `pom.xml` that was warmed, with every version filled in. A `go.sum`
+  (from a warm or from a repo) is checked line by line first, and only
+  valid lines are kept
+- client configuration for this Granary (for Go, which reads its settings
+  from the environment, README.txt shows the `go env -w` lines): `.cargo/config.toml` with the
   crates.io source replacement, a project `.npmrc` with the registry line,
   a `pip.conf` snippet, and `.mvn/settings.xml` with `.mvn/maven.config`
 - `README.txt`
@@ -1129,6 +1167,18 @@ cargo test           # unit tests, plus end-to-end tests against a mock upstream
 cargo clippy         # lints
 RUST_LOG=granary=debug cargo run
 ```
+
+The parsers for `go.mod`, `go.sum`, `go.work` and Go template lines have
+fuzz targets in `fuzz/` (`go_mod_requires`, `go_sum`, `go_work`,
+`go_line`), a separate crate with its own lockfile. With a nightly
+toolchain and cargo-fuzz installed:
+
+```sh
+cd fuzz && cargo +nightly fuzz run go_sum -- -max_total_time=60
+```
+
+`cargo test` replays the seeds in `fuzz/corpus/` and 10,000 fixed-seed
+mutations of them through the same checks, without a fuzzer.
 
 ## License
 
