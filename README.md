@@ -799,7 +799,10 @@ up to install through your Granary:
 For a [template made from a repo](#templates-from-repos), the starter holds
 the repo's own manifests and lockfiles at their paths, as read at the
 template's commit, instead of generated ones; the repo's own tool settings
-are left out and Granary's client configuration is added.
+are left out and Granary's client configuration is added. A `go.mod` or
+`go.work` that Granary can't read as valid is left out too, and README.txt
+names it. When Go lines fall under a private prefix, README.txt also shows
+the `go env -w GONOSUMDB=...` line for those prefixes.
 
 The zip never contains a token. `.npmrc` and `.mvn/settings.xml` read it
 from the `GRANARY_TOKEN` environment variable, and README.txt explains how
