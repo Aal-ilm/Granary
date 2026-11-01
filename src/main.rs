@@ -9,6 +9,9 @@ mod error;
 mod formats;
 mod gitea;
 mod gomod;
+// Used by the template code in the following changes.
+#[allow(dead_code)]
+mod gomodfile;
 mod goprivate;
 mod gozip;
 mod inventory;
