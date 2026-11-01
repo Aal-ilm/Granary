@@ -86,49 +86,43 @@ async fn handle(
         }
         return Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response());
     }
-    if let Some(escmod) = rest.strip_suffix("/@latest") {
-        let module = module_path(escmod)?;
-        if let Some(route) = st.goprivate.route(&module) {
-            return go_private::serve(
-                &st,
-                go_private::Asker {
-                    who: &who,
-                    headers: &headers,
-                    path: uri.path(),
-                },
-                &module,
-                escmod,
-                "@latest",
-                route,
-            )
-            .await;
-        }
+    let (escmod, file) = match rest.strip_suffix("/@latest") {
+        Some(escmod) => (escmod, "@latest"),
+        None => rest
+            .rsplit_once("/@v/")
+            .ok_or_else(|| missing("not a Go module proxy path"))?,
+    };
+    let module = module_path(escmod)?;
+    let asker = go_private::Asker {
+        who: &who,
+        headers: &headers,
+        path: uri.path(),
+    };
+    module_file(&st, asker, &module, escmod, file).await
+}
+
+/// One file of a module: `@latest`, `list`, or `{version}.{info|mod|zip}`
+/// (case-encoded). The one path for clients and Get packages alike, so
+/// both use the same cache, the same private routing (with the access
+/// policy asked first) and the same checksum verification.
+pub async fn module_file(
+    st: &AppState,
+    asker: go_private::Asker<'_>,
+    module: &str,
+    escmod: &str,
+    file: &str,
+) -> AppResult<Response> {
+    // A private module only ever comes from its own source.
+    if let Some(route) = st.goprivate.route(module) {
+        return go_private::serve(st, asker, module, escmod, file, route).await;
+    }
+    if file == "@latest" {
         let url = format!("{}/{escmod}/@latest", st.cfg.go_upstream);
         let meta = st
             .store
             .meta("go", &format!("{escmod}/@latest"), "raw", &url, "*/*")
             .await?;
         return Ok(([(header::CONTENT_TYPE, "application/json")], meta.body).into_response());
-    }
-    let Some((escmod, file)) = rest.rsplit_once("/@v/") else {
-        return Err(missing("not a Go module proxy path"));
-    };
-    let module = module_path(escmod)?;
-    // A private module only ever comes from its own source.
-    if let Some(route) = st.goprivate.route(&module) {
-        return go_private::serve(
-            &st,
-            go_private::Asker {
-                who: &who,
-                headers: &headers,
-                path: uri.path(),
-            },
-            &module,
-            escmod,
-            file,
-            route,
-        )
-        .await;
     }
     if file == "list" {
         let url = format!("{}/{escmod}/@v/list", st.cfg.go_upstream);
@@ -165,7 +159,7 @@ async fn handle(
             .await?;
         return Ok(([(header::CONTENT_TYPE, "application/json")], meta.body).into_response());
     }
-    gomod::check(&module, &version).map_err(missing)?;
+    gomod::check(module, &version).map_err(missing)?;
     match ext {
         "info" => {
             st.store
@@ -178,8 +172,8 @@ async fn handle(
                 )
                 .await
         }
-        "mod" => verified(&st, escmod, escver, &module, &version, false, &url).await,
-        _ => verified(&st, escmod, escver, &module, &version, true, &url).await,
+        "mod" => verified(st, escmod, escver, module, &version, false, &url).await,
+        _ => verified(st, escmod, escver, module, &version, true, &url).await,
     }
 }
 
