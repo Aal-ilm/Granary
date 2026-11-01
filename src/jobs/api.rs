@@ -183,7 +183,7 @@ async fn warm_template(
         title: &t.input.name,
         spec: &t.input,
         repo,
-        private: t.resource(&st.cfg),
+        private: t.resource(&st.cfg, &st.goprivate),
     };
     let job = super::enqueue(&st, new, &by).await.map_err(db_error)?;
     audit(

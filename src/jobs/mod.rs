@@ -1182,7 +1182,7 @@ pub async fn queue_scheduled(st: &AppState) -> usize {
             title: &t.input.name,
             spec: &t.input,
             repo,
-            private: t.resource(&st.cfg),
+            private: t.resource(&st.cfg, &st.goprivate),
         };
         match enqueue(st, job, &by).await {
             Ok(job) => {

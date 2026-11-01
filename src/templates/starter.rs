@@ -47,6 +47,24 @@ fn is_tool_config(path: &str) -> bool {
     ) || (in_cargo_dir && matches!(name, "config" | "config.toml"))
 }
 
+/// Text for README.txt with control characters (newlines included)
+/// replaced, so one item stays on its line.
+fn plain(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+fn is_go_sum(path: &str) -> bool {
+    path.rsplit('/').next() == Some("go.sum")
+}
+
+/// A go.sum with only its valid lines, or `None` when the file as a whole
+/// isn't one (too large, a NUL or CR, too many lines).
+fn checked_go_sum(text: &str) -> Option<String> {
+    crate::gomodfile::parse_sum(text).ok().map(|s| s.text())
+}
+
 /// A repo template's own manifests and lockfiles, one entry per ecosystem.
 pub fn repo_manifests(files: &std::collections::BTreeMap<String, String>) -> Vec<Manifest> {
     let mut by_eco: Vec<Manifest> = Vec::new();
@@ -61,6 +79,7 @@ pub fn repo_manifests(files: &std::collections::BTreeMap<String, String>) -> Vec
             "pyproject.toml" => Eco::Pypi,
             n if n.starts_with("requirements") && n.ends_with(".txt") => Eco::Pypi,
             "pom.xml" | "build.gradle" | "build.gradle.kts" => Eco::Maven,
+            "go.mod" | "go.sum" | "go.work" => Eco::Go,
             _ => continue,
         };
         match by_eco.iter_mut().find(|m| m.eco == eco) {
@@ -89,6 +108,11 @@ impl Starter<'_> {
                 let text = warmed.unwrap_or(text);
                 let text = if path.ends_with("package-lock.json") {
                     self.portable_npm_lock(text)
+                } else if is_go_sum(path) {
+                    match checked_go_sum(text) {
+                        Some(t) => t,
+                        None => continue,
+                    }
                 } else {
                     text.clone()
                 };
@@ -101,6 +125,12 @@ impl Starter<'_> {
                     }
                     let text = if path == "package-lock.json" {
                         self.portable_npm_lock(text)
+                    } else if m.eco == Eco::Go {
+                        // Only a go.sum, and only its valid lines.
+                        match checked_go_sum(text).filter(|_| path == "go.sum") {
+                            Some(t) => t,
+                            None => continue,
+                        }
                     } else {
                         text.clone()
                     };
@@ -234,10 +264,14 @@ impl Starter<'_> {
         } else {
             s.push_str("This Granary doesn't need an access token for downloads.\n\n");
         }
+        if self.manifests.iter().any(|m| m.eco == Eco::Go) {
+            s.push_str(&self.go_readme());
+        }
         s.push_str("FILES\n\n");
         if self.from_repo.is_some() {
             for m in &self.manifests {
-                let paths: Vec<&str> = m.files.iter().map(|(p, _)| p.as_str()).collect();
+                // Each path on its own, so a repo's file name can't add lines.
+                let paths: Vec<String> = m.files.iter().map(|(p, _)| plain(p)).collect();
                 s.push_str(&format!("  {}: {}\n", m.eco.label(), paths.join(", ")));
             }
             return s;
@@ -254,9 +288,27 @@ impl Starter<'_> {
                 Eco::Maven => {
                     "pom.xml, .mvn/settings.xml and .mvn/maven.config (Granary as Central's mirror)"
                 }
-                Eco::Go => "go.mod",
+                Eco::Go => {
+                    "go.mod, go.sum (when the template was warmed); Go is set up as GO explains"
+                }
             };
             s.push_str(&format!("  {}: {line}\n", m.eco.label()));
+        }
+        s
+    }
+
+    /// How to point Go at Granary. Go reads its settings from the
+    /// environment, so no file in the starter holds them.
+    fn go_readme(&self) -> String {
+        let base = plain(self.base_url);
+        let mut s = format!(
+            "GO\n\nGo takes its proxy from the environment. Point it at Granary once:\n\n  go env -w GOPROXY={base}/go GONOPROXY=\n  go env -u GOPRIVATE\n\nGOPROXY lists Granary alone, so a module Granary can't serve is never\nfetched from anywhere else. The checksum database is reached through\nGranary too.\n\n"
+        );
+        if self.client_auth {
+            s.push_str(&format!(
+                "Go sends a token only over HTTPS, and reads it from ~/.netrc:\n\n  machine {} login token password YOUR_TOKEN\n\n",
+                plain(self.host())
+            ));
         }
         s
     }
@@ -473,6 +525,78 @@ mod tests {
         assert!(f(".mvn/settings.xml").contains("${env.GRANARY_TOKEN}"));
         assert!(f("pip.conf").contains("https://granary.lan/pypi/simple/"));
         assert!(f("README.txt").contains("contains no access token"));
+    }
+
+    #[test]
+    fn go_starters() {
+        let h = "h1:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+        let t = TemplateInput {
+            name: "Go Tool".into(),
+            platforms: default_platforms(),
+            go: "golang.org/x/text@v0.21.0\ngithub.com/google/uuid@latest".into(),
+            ..Default::default()
+        };
+        let versions =
+            HashMap::from([("github.com/google/uuid".to_string(), "v1.6.0".to_string())]);
+        let go_sum = format!(
+            "golang.org/x/text v0.21.0 {h}\nevil.example/x v1.0.0 h1:tampered\ngolang.org/x/text v0.21.0/go.mod {h}\n"
+        );
+        let s = Starter {
+            template: &t,
+            manifests: manifests(&t, &versions).unwrap(),
+            lockfiles: HashMap::from([(
+                "go".to_string(),
+                HashMap::from([
+                    ("go.sum".to_string(), go_sum),
+                    (
+                        "go.mod".to_string(),
+                        "module evil\nreplace x => /etc\n".to_string(),
+                    ),
+                    ("other.txt".to_string(), "?".to_string()),
+                ]),
+            )]),
+            warmed_at: Some(1),
+            base_url: "https://granary.lan",
+            warmer_granary_url: "http://granary:8080",
+            client_auth: true,
+            from_repo: None,
+        };
+        let out = unzip(&s.zip().unwrap());
+        let mut names: Vec<&str> = out.keys().map(String::as_str).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["go-tool/README.txt", "go-tool/go.mod", "go-tool/go.sum"]
+        );
+        // go.mod: the lines, @latest resolved, and nothing else.
+        let m = crate::gomodfile::parse_mod(&out["go-tool/go.mod"]).unwrap();
+        assert_eq!(m.module.as_deref(), Some("go-tool"));
+        assert!(m.replaces.is_empty() && m.skipped.is_empty());
+        let (lines, _) = m.lines();
+        assert_eq!(
+            lines,
+            vec!["golang.org/x/text@v0.21.0", "github.com/google/uuid@v1.6.0"]
+        );
+        // go.sum: validated, the tampered line dropped.
+        let sum = &out["go-tool/go.sum"];
+        assert_eq!(sum.lines().count(), 2);
+        assert!(!sum.contains("evil"));
+        let readme = &out["go-tool/README.txt"];
+        assert!(readme.contains("go env -w GOPROXY=https://granary.lan/go GONOPROXY="));
+        assert!(readme.contains("machine granary.lan login token password YOUR_TOKEN"));
+        assert!(!out.values().any(|v| v.contains("granary:8080")));
+
+        // A go.sum that isn't one at all is left out.
+        let s = Starter {
+            lockfiles: HashMap::from([(
+                "go".to_string(),
+                HashMap::from([("go.sum".to_string(), "x\r\n".to_string())]),
+            )]),
+            ..s
+        };
+        assert!(!unzip(&s.zip().unwrap()).contains_key("go-tool/go.sum"));
+        // Without a version for @latest, no go.mod can be made.
+        assert!(manifests(&t, &HashMap::new()).unwrap_err().contains("uuid"));
     }
 
     #[test]

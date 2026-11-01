@@ -255,8 +255,13 @@ async fn queue_git_deps(st: &AppState, scan: &repo::Scan, by: &JobBy) -> usize {
 
 /// Validate a repo template. With lockfiles to warm from, it may have no
 /// package lines at all (say, a repo whose only dependency is a git one).
-fn check(input: &TemplateInput, scan: &repo::Scan) -> AppResult<()> {
-    if let Some(mut p) = input.validate() {
+fn check(
+    st: &AppState,
+    who: &Principal,
+    input: &TemplateInput,
+    scan: &repo::Scan,
+) -> AppResult<()> {
+    if let Some(mut p) = super::api::problems(st, who, input) {
         if !scan.lockfiles.is_empty() {
             p.fields.retain(|(field, _)| *field != "packages");
         }
@@ -306,7 +311,7 @@ async fn create(
         go: scan.go.clone(),
     };
     input.normalize();
-    check(&input, &scan)?;
+    check(&st, &who, &input, &scan)?;
     if super::name_taken(&st.auth.db, &input.name, None)
         .await
         .map_err(db_error)?
@@ -384,7 +389,7 @@ async fn resync(
     input.maven = scan.maven.clone();
     input.go = scan.go.clone();
     input.normalize();
-    check(&input, &scan)?;
+    check(&st, &who, &input, &scan)?;
     let source = RepoSource {
         commit: body.commit.clone(),
         synced_at: now_secs() as i64,

@@ -162,6 +162,14 @@ pub fn go_mod(
     ))
 }
 
+/// The module path of every Go line listed as `@latest`.
+pub fn latest_go(t: &TemplateInput) -> Vec<String> {
+    t.deps(Eco::Go)
+        .into_iter()
+        .filter_map(|d| d.line.strip_suffix("@latest").map(String::from))
+        .collect()
+}
+
 /// The `group:artifact` of every Maven line without a version.
 pub fn unversioned_maven(t: &TemplateInput) -> Vec<String> {
     t.deps(Eco::Maven)

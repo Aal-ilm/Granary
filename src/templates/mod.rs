@@ -382,11 +382,31 @@ pub struct Template {
 }
 
 impl Template {
-    /// The private content this template comes from, if any.
-    pub fn resource(&self, cfg: &crate::config::Config) -> Option<Resource> {
+    /// The private content this template comes from, if any: a Gitea repo,
+    /// a private template it was cloned from, or a private Go module among
+    /// its lines (decided by the prefixes as they are now).
+    pub fn resource(
+        &self,
+        cfg: &crate::config::Config,
+        gp: &crate::goprivate::GoPrivate,
+    ) -> Option<Resource> {
         self.private
             .clone()
             .or_else(|| self.source.as_ref().and_then(|s| s.resource(cfg)))
+            .or_else(|| self.input.private_go(gp).into_iter().next())
+    }
+}
+
+impl TemplateInput {
+    /// The private Go modules among the lines, as the policy sees them.
+    pub fn private_go(&self, gp: &crate::goprivate::GoPrivate) -> Vec<Resource> {
+        self.deps(Eco::Go)
+            .into_iter()
+            .filter_map(|d| {
+                gp.route(&d.name)
+                    .map(|r| crate::formats::go_private::resource(&d.name, &r.source))
+            })
+            .collect()
     }
 }
 

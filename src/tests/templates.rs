@@ -306,3 +306,80 @@ async fn changes_need_the_csrf_header() {
     let resp = h.app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+/// A template with a private Go line is private content: only those who
+/// may read private modules see it, and saving one needs that access.
+#[tokio::test]
+async fn private_go_lines_make_a_template_private() {
+    let h = Harness::with(super::Opts {
+        go_private: Some("github.com/acme".to_string()),
+        ..super::Opts::default()
+    })
+    .await;
+    let admin = h.login().await;
+    let (status, _, body) = h
+        .send(
+            "POST",
+            "/api/templates",
+            Some(&admin),
+            Some(json!({"name": "Acme Go", "go": "github.com/acme/tool@v1.0.0\ngolang.org/x/text@latest"})),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let id = serde_json::from_slice::<Value>(&body).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let (_, _, body) = h
+        .send(
+            "POST",
+            "/api/templates",
+            Some(&admin),
+            Some(json!({"name": "Public Go", "go": "golang.org/x/text@v0.21.0"})),
+        )
+        .await;
+    let public = serde_json::from_slice::<Value>(&body).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let list = h.api(&admin, "/api/templates").await;
+    assert_eq!(by_name(&list, "Acme Go")["private"], true);
+    assert_eq!(by_name(&list, "Acme Go")["counts"]["go"], 2);
+    assert_eq!(by_name(&list, "Public Go")["private"], false);
+
+    // A viewer without private access: as if it didn't exist.
+    let viewer = h.viewer_login().await;
+    let list = h.api(&viewer, "/api/templates").await;
+    let names: Vec<&str> = list["templates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(!names.contains(&"Acme Go") && names.contains(&"Public Go"));
+    for path in [
+        format!("/api/templates/{id}"),
+        format!("/api/templates/{id}/export"),
+    ] {
+        let (status, _, _) = h.send("GET", &path, Some(&viewer), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+    h.api(&viewer, &format!("/api/templates/{public}")).await;
+
+    // Saving a private line needs access, refused like a lookup that
+    // finds nothing.
+    let input: crate::templates::TemplateInput = serde_json::from_value(
+        json!({"name": "X", "go": "golang.org/x/text@v0.21.0\ngithub.com/acme/tool@v1.0.0"}),
+    )
+    .unwrap();
+    let who = crate::policy::Principal::Anonymous;
+    let p = crate::templates::api::problems(&h.state, &who, &input).unwrap();
+    assert_eq!(p.lines[0].1[0].line, 2);
+    assert_eq!(
+        p.lines[0].1[0].message,
+        "nothing found for github.com/acme/tool"
+    );
+}
