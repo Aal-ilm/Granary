@@ -729,18 +729,15 @@ async fn real_warmer_fetches_cargo_git_dependencies_through_granary() {
         log.iter().any(|l| l.contains("cargo fetch --locked")),
         "{log:#?}"
     );
-    let via = format!(
-        "From {}/git/github.com/acme/gitdep",
-        h.url.as_ref().unwrap()
-    );
-    assert!(
-        log.iter().any(|l| l.starts_with(&via)),
-        "git dependency fetched through Granary: {log:#?}"
-    );
+    // No fallback to an unlocked fetch (that adds a warning), so cargo
+    // fetched the locked commit. That commit exists only in the test
+    // upstream, which the warmer can reach only through Granary, and the
+    // warm cached the deleted dependency again: the fetch went through
+    // Granary. Git's console output isn't checked; newer Cargo hides it.
+    assert_eq!(d["job"]["warnings"], json!([]), "{log:#?}");
     assert!(
         gitdep.exists(),
-        "Granary cached the git dependency again while serving the warm"
+        "git dependency fetched through Granary, which cached it again: {log:#?}"
     );
-    assert_eq!(d["job"]["warnings"], json!([]));
     let _ = child.kill().await;
 }
