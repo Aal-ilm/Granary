@@ -277,8 +277,8 @@ pub(super) fn maven(content: &str) -> Result<Lines, String> {
             .filter(|c| c.is_element() && c.tag_name().name() == "dependency")
         {
             let (Some(g), Some(a)) = (
-                text(child(dep, "groupId")).and_then(&resolve),
-                text(child(dep, "artifactId")).and_then(&resolve),
+                text(child(dep, "groupId")).and_then(resolve),
+                text(child(dep, "artifactId")).and_then(resolve),
             ) else {
                 skipped.push("a dependency with no groupId or artifactId".into());
                 continue;
